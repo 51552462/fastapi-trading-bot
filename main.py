@@ -1,5 +1,3 @@
-# main.py
-
 import json, traceback
 from fastapi import FastAPI, Request
 from bitget_client import place_order
@@ -16,9 +14,11 @@ async def receive_signal(req: Request):
     body = await req.body()
     if not body or body.strip() == b"":
         return {"status": "ignored", "reason": "empty body"}
+
     try:
         data = json.loads(body)
-    except json.JSONDecodeError:
+    except json.JSONDecodeError as e:
+        print(f"🚨 JSON 파싱 실패: {e} | raw: {body}")
         return {"status": "ignored", "reason": "invalid JSON"}
 
     ev  = data.get("type")
@@ -26,17 +26,20 @@ async def receive_signal(req: Request):
     amt = data.get("amount", 1)
     pct = data.get("pct")
 
+    print("📩 Signal received:", data)
+
     try:
         if ev == "entry":
             price = place_order("long", sym, amount_usdt=amt)
             start_tracker(sym, "long", price)
 
-        elif ev in ["stoploss1","stoploss2","liquidation","fail","entry_fail"]:
+        elif ev in ["stoploss1", "stoploss2", "liquidation", "fail", "entry_fail"]:
             close_position(sym)
 
-        elif ev in ["takeprofit1","takeprofit2","takeprofit3","exitByEMA","takeprofit_base"]:
+        elif ev in ["takeprofit1", "takeprofit2", "takeprofit3", "exitByEMA", "takeprofit_base"]:
             frac = (pct or 100) / 100
             close_partial(sym, frac)
+
         else:
             return {"status": "ignored", "event": ev}
 
