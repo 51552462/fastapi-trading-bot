@@ -12,12 +12,10 @@ def health():
 
 @app.post("/signal")
 async def receive_signal(req: Request):
-    # 1) 빈 바디 무시
     body = await req.body()
     if not body or body.strip() == b"":
         return {"status": "ignored", "reason": "empty body"}
 
-    # 2) JSON 파싱
     try:
         data = json.loads(body)
     except json.JSONDecodeError:
@@ -31,14 +29,14 @@ async def receive_signal(req: Request):
 
     try:
         if ev == "entry":
-            # 진입 금액을 항상 10 USD로 고정
+            # 10 USD + 5× 레버리지, Dual Mode Hedge 진입
             price = place_order("long", sym, amount_usdt=10)
             start_tracker(sym, "long", price)
 
-        elif ev in ["stoploss1", "stoploss2", "liquidation", "fail", "entry_fail"]:
+        elif ev in ["stoploss1","stoploss2","liquidation","fail","entry_fail"]:
             close_position(sym)
 
-        elif ev in ["takeprofit1", "takeprofit2", "takeprofit3", "exitByEMA", "takeprofit_base"]:
+        elif ev in ["takeprofit1","takeprofit2","takeprofit3","exitByEMA","takeprofit_base"]:
             frac = (pct or 100) / 100
             close_partial(sym, frac)
 
