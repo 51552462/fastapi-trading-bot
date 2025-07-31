@@ -21,14 +21,15 @@ def place_order(side, symbol, amount_usdt=15, leverage=20):
     ticker = exchange.fetch_ticker(symbol)
     price = ticker["last"]
 
-    # ✅ 정수형 precision 적용
     precision = int(market['precision']['amount'])
     quantity = round((amount_usdt * leverage) / price, precision)
 
-    # ✅ 레버리지 설정 시 정수 변환
-    exchange.set_leverage(int(leverage), symbol)
+    min_amount = market['limits']['amount']['min']
+    if quantity < min_amount:
+        print(f"❌ 주문 생략: {symbol} 수량 {quantity} < 최소 수량 {min_amount}")
+        return {"status": "skipped", "reason": "amount too small"}
 
-    # ✅ 시장가 주문 실행
+    exchange.set_leverage(int(leverage), symbol)
     order = exchange.create_market_order(symbol, side, quantity)
     print(f"📈 {symbol} {side.upper()} 주문 완료: {quantity} @ {price}")
     return order
