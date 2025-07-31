@@ -38,6 +38,9 @@ def place_market_order(symbol, usdt_amount, side, leverage=5):
     path = "/api/mix/v1/order/placeOrder"
     url = BASE_URL + path
 
+    # ✅ symbol 변환
+    symbol = symbol.replace("USDT", "_USDT")
+
     body = {
         "symbol": symbol,
         "marginCoin": "USDT",
@@ -53,6 +56,7 @@ def place_market_order(symbol, usdt_amount, side, leverage=5):
     res = requests.post(url, headers=headers, data=body_json)
     return res.json()
 
+
 def close_all(symbol):
     path = "/api/mix/v1/order/close-position"
     url = BASE_URL + path
@@ -67,6 +71,7 @@ def close_all(symbol):
     return res.json()
 
 def get_last_price(symbol):
-    url = f"https://api.bitget.com/api/spot/v1/market/ticker?symbol={symbol.replace('USDT','_USDT')}"
+    symbol = symbol.replace("USDT", "_USDT")
+    url = f"https://api.bitget.com/api/spot/v1/market/ticker?symbol={symbol}"
     res = requests.get(url)
     return float(res.json()["data"]["close"])
