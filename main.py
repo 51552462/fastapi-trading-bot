@@ -29,7 +29,7 @@ async def receive_signal(req: Request):
 
     try:
         if ev == "entry":
-            # 10 USD + 5× 레버리지, Dual Mode Hedge 진입
+            # 10 USD 고정 진입
             price = place_order("long", sym, amount_usdt=10)
             start_tracker(sym, "long", price)
 
