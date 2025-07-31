@@ -1,56 +1,33 @@
-from bitget_client import exchange, get_market_id
+from bitget_client import exchange
 
-def start_tracker(symbol: str, side: str, entry_price: float):
-    print(f"📈 start_tracker: {side} {symbol} @ {entry_price}")
-    # TODO: 실시간 PnL 모니터링 로직 추가
-
-def close_position(symbol: str):
-    market_id = get_market_id(symbol)
+def close_position(symbol):
     try:
-        balance = exchange.fetch_position(symbol=market_id)
+        market_id = symbol.upper()
+        exchange.load_markets()
+        pos = exchange.fetch_position(symbol=market_id)
+        amt = float(pos["contracts"])
+
+        if amt > 0:
+            exchange.create_order(symbol=market_id, type="market", side="sell", amount=amt)
+            print(f"🔻 close_position: {symbol} 포지션 종료")
+        else:
+            print(f"ℹ️ close_position: {symbol} 포지션 없음, 무시")
     except Exception as e:
-        print(f"⚠️ close_position: 포지션 조회 실패: {e}")
-        return
+        print("❌ close_position 에러:", e)
 
-    contracts = balance.get("contracts") if isinstance(balance, dict) else None
-    if not contracts:
-        print(f"ℹ️ close_position: {symbol} 포지션 없음, 무시")
-        return
 
+def close_partial(symbol, ratio):
     try:
-        qty = float(contracts)
-    except Exception as e:
-        print(f"⚠️ close_position: contracts→float 실패: {e}")
-        return
+        market_id = symbol.upper()
+        exchange.load_markets()
+        pos = exchange.fetch_position(symbol=market_id)
+        amt = float(pos["contracts"])
 
-    try:
-        exchange.create_order(symbol=market_id, type="market", side="sell", amount=qty)
-        print(f"🚪 close_position: {symbol} 전량 청산 qty={qty}")
+        if amt > 0:
+            close_amt = round(amt * ratio, 4)
+            exchange.create_order(symbol=market_id, type="market", side="sell", amount=close_amt)
+            print(f"💠 close_partial: {symbol} {ratio*100:.1f}% 청산 ({close_amt})")
+        else:
+            print(f"ℹ️ close_partial: {symbol} 포지션 없음, 무시")
     except Exception as e:
-        print(f"⚠️ close_position: 주문 실패: {e}")
-
-def close_partial(symbol: str, ratio: float):
-    market_id = get_market_id(symbol)
-    try:
-        balance = exchange.fetch_position(symbol=market_id)
-    except Exception as e:
-        print(f"⚠️ close_partial: 포지션 조회 실패: {e}")
-        return
-
-    contracts = balance.get("contracts") if isinstance(balance, dict) else None
-    if not contracts:
-        print(f"ℹ️ close_partial: {symbol} 포지션 없음, 무시")
-        return
-
-    try:
-        total = float(contracts)
-        amt   = total * ratio
-    except Exception as e:
-        print(f"⚠️ close_partial: float 변환 실패: {e}")
-        return
-
-    try:
-        exchange.create_order(symbol=market_id, type="market", side="sell", amount=amt)
-        print(f"🔪 close_partial: {symbol} 부분 청산 ratio={ratio}, qty={amt}")
-    except Exception as e:
-        print(f"⚠️ close_partial: 주문 실패: {e}")
+        print("❌ close_partial 에러:", e)
