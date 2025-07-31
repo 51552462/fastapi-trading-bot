@@ -1,43 +1,43 @@
 import os
-import uvicorn
-from fastapi import FastAPI, Request
-from bitget_client import place_order
-from position_tracker import close_position, close_partial
+import ccxt
 
-app = FastAPI()
+exchange = ccxt.bitget({
+    "apiKey": os.getenv("BITGET_API_KEY"),
+    "secret": os.getenv("BITGET_API_SECRET"),
+    "password": os.getenv("BITGET_API_PASSWORD"),
+    "enableRateLimit": True,
+    "options": {
+        "defaultType": "swap"
+    }
+})
 
-@app.post("/signal")
-async def receive_signal(request: Request):
-    data = await request.json()
-    print(f"📩 Signal received: {data}")
+exchange.set_sandbox_mode(False)  # 실거래
 
-    try:
-        signal_type = data.get("type")
-        symbol = data.get("symbol")
-        leverage = int(data.get("leverage", 5))
-        amount_usdt = float(data.get("amount", 15))  # 고정 진입 금액
+def place_order(side, symbol, amount_usdt=15, leverage=5):
+    market_id = symbol.upper()
+    exchange.load_markets()
 
-        if signal_type == "entry":
-            price = place_order("long", symbol, amount_usdt=amount_usdt, leverage=leverage)
-            print(f"✅ Entry Order Placed at {price}")
-            return {"status": "ok", "event": "entry"}
+    if market_id not in exchange.markets:
+        raise ValueError(f"{market_id} not found in exchange.markets")
 
-        elif signal_type in ["takeprofit1", "takeprofit2", "takeprofit3"]:
-            pct = int(data.get("pct", 33))  # 분할 익절 비율
-            close_partial(symbol, pct / 100)
-            return {"status": "ok", "event": signal_type}
+    market = exchange.market(market_id)
 
-        elif signal_type in ["stoploss", "liquidation"]:
-            close_position(symbol)
-            return {"status": "ok", "event": signal_type}
+    # 레버리지 설정
+    exchange.set_leverage(leverage, market_id)
 
-        else:
-            return {"status": "error", "detail": "Unknown signal type"}
+    # 현재가 조회
+    ticker = exchange.fetch_ticker(market_id)
+    mark_price = ticker["last"]
 
-    except Exception as e:
-        print("🚨 처리 중 예외:", e)
-        return {"status": "error", "detail": str(e)}
+    # 수량 계산
+    quantity = amount_usdt * leverage / mark_price
+    min_qty = float(market["limits"]["amount"]["min"])
 
+    if quantity < min_qty:
+        print(f"⚠️ place_order: qty={quantity:.6f} < min_qty={min_qty} → 스킵")
+        return None
 
-if __name__ == "__main__":
-    uvicorn.run("main:app", host="0.0.0.0", port=10000)
+    quantity = exchange.amount_to_precision(market_id, quantity)
+    order = exchange.create_order(symbol=market_id, type="market", side=side, amount=quantity)
+    print(f"🚀 start_tracker: {side} {market_id} @ {mark_price}")
+    return mark_price
