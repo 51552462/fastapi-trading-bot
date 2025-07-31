@@ -6,15 +6,15 @@ load_dotenv()
 DRY_RUN = os.getenv("DRY_RUN", "false").lower() == "true"
 
 exchange = ccxt.bitget({
-    "apiKey":       os.getenv("BITGET_API_KEY"),
-    "secret":       os.getenv("BITGET_API_SECRET"),
-    "password":     os.getenv("BITGET_API_PASSWORD"),
+    "apiKey":          os.getenv("BITGET_API_KEY"),
+    "secret":          os.getenv("BITGET_API_SECRET"),
+    "password":        os.getenv("BITGET_API_PASSWORD"),
     "enableRateLimit": True,
-    "timeout":      30000,
+    "timeout":         30000,
     "options": {
         "defaultType":         "swap",
         "defaultMarginMode":   "isolated",
-        "defaultPositionMode": "dual_mode",      # ← Dual Mode(Hedge) 활성화
+        "defaultPositionMode": "dual_mode",      # Dual/Hedge 모드
         "adjustForTimeDifference": True,
     },
 })
@@ -46,7 +46,7 @@ def place_order(order_type: str, symbol: str, amount_usdt: float = 10) -> float:
     """
     mid = get_market_id(symbol)
 
-    # on-demand markets 로드
+    # on-demand markets load
     if mid not in exchange.markets:
         exchange.load_markets()
     if mid not in exchange.markets:
@@ -55,36 +55,41 @@ def place_order(order_type: str, symbol: str, amount_usdt: float = 10) -> float:
     # 현재가 조회
     mark_price = exchange.fetch_ticker(mid)["last"]
 
-    # Dry-Run 모드: 페이크 리턴
+    # Dry-Run
     if DRY_RUN:
         print(f"[DRY_RUN] {order_type}@{mid}, USD={amount_usdt}, price={mark_price}")
         return mark_price
 
-    # 1) Dual Mode 보장
+    # ① Dual Mode 재확인
     try:
         exchange.set_position_mode("both_side", mid)
     except Exception as e:
         print(f"⚠️ set_position_mode 실패: {e}")
 
-    # 2) 레버리지 5배
+    # ② 레버리지 설정
     exchange.set_leverage(5, mid)
 
-    # 3) 수량 계산 & min_qty 보정
-    market   = exchange.markets[mid]
-    min_qty  = market["limits"]["amount"]["min"]
-    raw_qty  = amount_usdt / mark_price
-    qty_str  = exchange.amount_to_precision(mid, raw_qty)  # CCXT 정밀도 처리
-    qty      = float(qty_str)
+    # ③ 수량 계산 & precision/최소수량 처리
+    market  = exchange.markets[mid]
+    min_qty = market["limits"]["amount"]["min"]
+    raw_qty = amount_usdt / mark_price
+
+    try:
+        # precision 반영 + 최소수량 검사(내부에서 에러 나면 except로)
+        qty_str = exchange.amount_to_precision(mid, raw_qty)
+        qty     = float(qty_str)
+    except Exception as e:
+        print(f"⚠️ amount_to_precision 에러: {e} → qty를 min_qty({min_qty})로 보정")
+        qty = min_qty
+
     if qty < min_qty:
         print(f"⚠️ place_order: qty={qty} < min_qty={min_qty} → 보정 to {min_qty}")
         qty = min_qty
 
-    # 4) 주문 파라미터 준비
-    side = "buy" if order_type == "long" else "sell"
-    # Dual Mode 에서는 positionSide 로 롱/숏 지정
+    # ④ 시장가 주문 (Dual Mode: positionSide 파라미터)
+    side   = "buy" if order_type == "long" else "sell"
     params = {"positionSide": "long" if order_type=="long" else "short"}
 
-    # 5) 시장가 주문
     order = exchange.create_order(
         symbol=mid,
         type="market",
