@@ -1,10 +1,8 @@
 import os, time, hmac, hashlib, base64, requests, json
 from dotenv import load_dotenv
 
-# 환경변수 로드
 load_dotenv()
 
-# Bitget API 기본 설정
 BASE_URL = "https://api.bitget.com"
 API_KEY = os.getenv("BITGET_API_KEY")
 API_SECRET = os.getenv("BITGET_API_SECRET")
@@ -32,33 +30,31 @@ def _headers(method, path, body=""):
         "Content-Type": "application/json"
     }
 
-def set_one_way_mode():
-    path = "/api/v2/mix/account/set-position-mode"
-    url = BASE_URL + path
-    body = {
-        "productType": "USDT-FUTURES",
-        "posMode": "one_way_mode"
-    }
-    body_json = json.dumps(body)
-    headers = _headers("POST", path, body_json)
-    res = requests.post(url, headers=headers, data=body_json)
-    print("단일 모드 설정 응답:", res.json())
-    return res.json()
-
 def place_market_order(symbol, usdt_amount, side, leverage=5):
     path = "/api/mix/v1/order/placeOrder"
     url = BASE_URL + path
     symbol_conv = convert_symbol(symbol)
+    price_url = f"{BASE_URL}/api/mix/v1/market/ticker?symbol={symbol_conv}"
+    price_res = requests.get(price_url).json()
+    last_price = float(price_res["data"]["last"])
+    qty = round(usdt_amount / last_price, 6)
+
+    # 최소 수량 필터: Bitget 기본 최소 단위 기준 (예: 0.001 이상)
+    if qty < 0.001:
+        print(f"⚠️ 최소 주문 수량 미달 → {qty}, 주문 생략")
+        return {"code": "SKIP", "msg": "below min qty"}
+
     body = {
         "symbol": symbol_conv,
         "marginCoin": "USDT",
-        "size": str(usdt_amount),
+        "size": str(qty),
         "side": "open_long" if side == "buy" else "open_short",
         "orderType": "market",
         "holdMode": "single_hold",
         "leverage": str(leverage)
     }
     body_json = json.dumps(body)
+    print("📤 Bitget 최종 주문 요청:", body)
     headers = _headers("POST", path, body_json)
     res = requests.post(url, headers=headers, data=body_json)
     return res.json()
