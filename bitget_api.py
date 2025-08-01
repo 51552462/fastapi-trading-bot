@@ -50,6 +50,7 @@ def place_market_order(symbol, usdt_amount, side, leverage=5):
         "size": str(usdt_amount),
         "side": "open_long" if side == "buy" else "open_short",
         "orderType": "market",
+        "positionMode": "single",
         "leverage": str(leverage)
     }
 
