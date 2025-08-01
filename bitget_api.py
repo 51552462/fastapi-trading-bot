@@ -10,13 +10,12 @@ from dotenv import load_dotenv
 load_dotenv()
 
 BASE_URL = "https://api.bitget.com"
-
 API_KEY = os.getenv("BITGET_API_KEY")
 API_SECRET = os.getenv("BITGET_API_SECRET")
 API_PASSPHRASE = os.getenv("BITGET_API_PASSWORD")
 
 def convert_symbol(symbol: str) -> str:
-    # Ensure it becomes like BTCUSDT_UMCBL
+    # Normalize to USDT-M futures format
     return symbol.upper().replace("/", "").replace("_", "") + "_UMCBL"
 
 def _timestamp():
@@ -41,9 +40,7 @@ def _headers(method, path, body=""):
 def place_market_order(symbol, usdt_amount, side, leverage=5):
     path = "/api/mix/v1/order/placeOrder"
     url = BASE_URL + path
-
     symbol = convert_symbol(symbol)
-
     body = {
         "symbol": symbol,
         "marginCoin": "USDT",
@@ -53,7 +50,6 @@ def place_market_order(symbol, usdt_amount, side, leverage=5):
         "positionMode": "single",
         "leverage": str(leverage)
     }
-
     body_json = json.dumps(body)
     headers = _headers("POST", path, body_json)
     res = requests.post(url, headers=headers, data=body_json)
@@ -63,11 +59,7 @@ def close_all(symbol):
     path = "/api/mix/v1/order/close-position"
     url = BASE_URL + path
     symbol = convert_symbol(symbol)
-
-    body = {
-        "symbol": symbol,
-        "marginCoin": "USDT"
-    }
+    body = {"symbol": symbol, "marginCoin": "USDT"}
     body_json = json.dumps(body)
     headers = _headers("POST", path, body_json)
     res = requests.post(url, headers=headers, data=body_json)
