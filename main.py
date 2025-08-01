@@ -2,14 +2,13 @@ import uvicorn
 import asyncio
 from fastapi import FastAPI, Request
 from trader import enter_position, take_partial_profit, stoploss, check_loss_and_exit
-from bitget_api import set_one_way_mode  # ✅ 단일모드 설정 함수 가져오기
 
 app = FastAPI()
 
 @app.post("/signal")
 async def receive_signal(request: Request):
     data = await request.json()
-    print(f"📩 시그널 수신: {data}")
+    print(f"\n📩 시그널 수신: {data}")
     try:
         signal_type = data.get("type")
         symbol = data.get("symbol", "").upper()
@@ -33,7 +32,6 @@ async def receive_signal(request: Request):
 
 @app.on_event("startup")
 async def startup_event():
-    set_one_way_mode()  # ✅ 서버 시작 시 단 1회만 호출
     asyncio.create_task(loss_monitor_loop())
 
 async def loss_monitor_loop():
