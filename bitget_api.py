@@ -16,7 +16,8 @@ API_SECRET = os.getenv("BITGET_API_SECRET")
 API_PASSPHRASE = os.getenv("BITGET_API_PASSWORD")
 
 def convert_symbol(symbol: str) -> str:
-    return symbol.upper() + "_UMCBL"
+    # Ensure it becomes like BTCUSDT_UMCBL
+    return symbol.upper().replace("/", "").replace("_", "") + "_UMCBL"
 
 def _timestamp():
     return str(int(time.time() * 1000))
