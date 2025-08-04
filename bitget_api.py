@@ -9,6 +9,7 @@ API_SECRET = os.getenv("BITGET_API_SECRET")
 API_PASSPHRASE = os.getenv("BITGET_API_PASSWORD")
 
 def convert_symbol(symbol: str) -> str:
+    # 모든 심볼을 _UMCBL 선물 마켓으로 변환
     return symbol.upper().replace("/", "").replace("_", "") + "_UMCBL"
 
 def _timestamp():
@@ -42,15 +43,17 @@ def place_market_order(symbol, usdt_amount, side, leverage=5):
     qty = round(usdt_amount / last_price, 6)
 
     if qty < 0.001:
-        print(f"⚠️ 최소 주문 수량 미달 → {qty}, 주문 생략")
+        print(f"⚠️ 최소 주문 수량 미달 → {qty} USDT, 주문 생략")
         return {"code": "SKIP", "msg": "below min qty"}
 
-    # ✅ 최종 확정된 주문 구조 (One-way 모드용)
+    # One-way 모드(single_hold)용 side 값
+    order_side = "buy_single" if side == "buy" else "sell_single"
+
     body = {
         "symbol": symbol_conv,
         "marginCoin": "USDT",
         "size": str(qty),
-        "side": "buy" if side == "buy" else "sell",
+        "side": order_side,
         "orderType": "market",
         "leverage": str(leverage)
     }
