@@ -35,7 +35,6 @@ def place_market_order(symbol, usdt_amount, side, leverage=5):
     url = BASE_URL + path
     symbol_conv = convert_symbol(symbol)
 
-    # 시세 조회 → 수량 계산
     price_url = f"{BASE_URL}/api/mix/v1/market/ticker?symbol={symbol_conv}"
     price_res = requests.get(price_url).json()
     last_price = float(price_res["data"]["last"])
@@ -49,10 +48,10 @@ def place_market_order(symbol, usdt_amount, side, leverage=5):
         "symbol": symbol_conv,
         "marginCoin": "USDT",
         "size": str(qty),
-        "side": "buy" if side == "buy" else "sell",   # ✅ Bitget 공식 방식
+        "side": "open_long" if side == "buy" else "open_short",  # ✅ 공식 구조
+        "tradeSide": "open",                                     # ✅ 핵심 파라미터
         "orderType": "market",
         "leverage": str(leverage)
-        # ❌ holdMode 제거
     }
 
     body_json = json.dumps(body)
