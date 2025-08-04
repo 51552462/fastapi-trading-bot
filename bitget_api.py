@@ -39,7 +39,6 @@ def place_market_order(symbol, usdt_amount, side, leverage=5):
     last_price = float(price_res["data"]["last"])
     qty = round(usdt_amount / last_price, 6)
 
-    # 최소 수량 필터: Bitget 기본 최소 단위 기준 (예: 0.001 이상)
     if qty < 0.001:
         print(f"⚠️ 최소 주문 수량 미달 → {qty}, 주문 생략")
         return {"code": "SKIP", "msg": "below min qty"}
@@ -48,10 +47,10 @@ def place_market_order(symbol, usdt_amount, side, leverage=5):
         "symbol": symbol_conv,
         "marginCoin": "USDT",
         "size": str(qty),
-        "side": "open_long" if side == "buy" else "open_short",
+        "side": "buy" if side == "buy" else "sell",    # ✅ 수정된 side
         "orderType": "market",
-        "holdMode": "single_hold",
         "leverage": str(leverage)
+        # "holdMode": "single_hold" ❌ 제거
     }
     body_json = json.dumps(body)
     print("📤 Bitget 최종 주문 요청:", body)
