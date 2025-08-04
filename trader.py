@@ -1,5 +1,6 @@
 from bitget_api import place_market_order, close_all, get_last_price
 
+# 현재 진입 포지션 기록용
 position_data = {}
 
 def enter_position(symbol, usdt_amount):
