@@ -35,6 +35,7 @@ def place_market_order(symbol, usdt_amount, side, leverage=5):
     url = BASE_URL + path
     symbol_conv = convert_symbol(symbol)
 
+    # 현재가 기반 수량 계산
     price_url = f"{BASE_URL}/api/mix/v1/market/ticker?symbol={symbol_conv}"
     price_res = requests.get(price_url).json()
     last_price = float(price_res["data"]["last"])
@@ -44,12 +45,12 @@ def place_market_order(symbol, usdt_amount, side, leverage=5):
         print(f"⚠️ 최소 주문 수량 미달 → {qty}, 주문 생략")
         return {"code": "SKIP", "msg": "below min qty"}
 
+    # ✅ 최종 확정된 주문 구조 (One-way 모드용)
     body = {
         "symbol": symbol_conv,
         "marginCoin": "USDT",
         "size": str(qty),
-        "side": "open_long" if side == "buy" else "open_short",  # ✅ 공식 구조
-        "tradeSide": "open",                                     # ✅ 핵심 파라미터
+        "side": "buy" if side == "buy" else "sell",
         "orderType": "market",
         "leverage": str(leverage)
     }
