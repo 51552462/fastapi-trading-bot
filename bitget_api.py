@@ -47,10 +47,10 @@ def place_market_order(symbol, usdt_amount, side, leverage=5):
         "symbol": symbol_conv,
         "marginCoin": "USDT",
         "size": str(qty),
-        "side": "buy" if side == "buy" else "sell",    # ✅ 수정된 side
+        "side": "open_long" if side == "buy" else "open_short",  # ✅ 단일모드용
         "orderType": "market",
+        "holdMode": "single_hold",                                # ✅ 반드시 포함
         "leverage": str(leverage)
-        # "holdMode": "single_hold" ❌ 제거
     }
     body_json = json.dumps(body)
     print("📤 Bitget 최종 주문 요청:", body)
