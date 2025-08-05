@@ -1,38 +1,55 @@
-import uvicorn
-import asyncio
+# main.py
+
+import uvicorn, asyncio
 from fastapi import FastAPI, Request
+from json import JSONDecodeError
 from trader import enter_position, take_partial_profit, stoploss, check_loss_and_exit
 
 app = FastAPI()
 
 @app.post("/signal")
 async def receive_signal(request: Request):
-    data = await request.json()
+    # 1) 빈 바디나 잘못된 JSON 무시
+    try:
+        data = await request.json()
+    except JSONDecodeError:
+        print("⚠️ /signal: 빈 또는 잘못된 JSON 바디 수신 → 무시")
+        return {"status": "ok", "detail": "no payload"}
+
     print(f"\n📩 시그널 수신: {data}")
     try:
         signal_type = data.get("type")
         symbol      = data.get("symbol", "").upper()
         amount      = float(data.get("amount", 0))
-        pct         = int(data.get("pct", 0)) / 100
+        pct         = float(data.get("pct", 0)) / 100
 
         if signal_type == "entry":
-            price = enter_position(symbol, amount)
-            return {"status": "ok", "entry_price": price}
-
-        elif signal_type in ["takeprofit1", "takeprofit2", "takeprofit3"]:
-            take_partial_profit(symbol, pct)
-            return {"status": "ok", "event": signal_type}
+            enter_position(symbol, amount)
 
         elif signal_type in ["stoploss", "liquidation"]:
             stoploss(symbol)
-            return {"status": "ok", "event": signal_type}
+
+        elif signal_type == "takeprofit1":
+            take_partial_profit(symbol, 0.30)
+
+        elif signal_type == "takeprofit2":
+            take_partial_profit(symbol, 0.40)
+
+        elif signal_type == "takeprofit3":
+            take_partial_profit(symbol, 0.30)
+
+        elif signal_type == "takeprofit_full":
+            take_partial_profit(symbol, 1.00)
 
         else:
-            return {"status": "error", "message": f"Unknown signal type: {signal_type}"}
+            print(f"❓ 알 수 없는 시그널 타입: {signal_type}")
+
+        return {"status": "ok"}
 
     except Exception as e:
-        print(f"❌ 예외 발생: {e}")
+        print(f"❌ /signal 처리 예외: {e}")
         return {"status": "error", "detail": str(e)}
+
 
 @app.on_event("startup")
 async def startup_event():
@@ -40,15 +57,15 @@ async def startup_event():
 
 async def loss_monitor_loop():
     """
-    1초마다 모든 포지션에 대해 현재가를 조회해
-    진입가 대비 90% 이하이면 stoploss() 호출
+    1초마다 실시간 가격 체크 → 진입가 대비 90% 이하 시 stoploss()
     """
     while True:
         try:
             check_loss_and_exit()
         except Exception as e:
-            print(f"❌ 손절 감시 중 오류: {e}")
+            print(f"❌ 손절 감시 오류: {e}")
         await asyncio.sleep(1)
+
 
 if __name__ == "__main__":
     uvicorn.run("main:app", host="0.0.0.0", port=10000)
