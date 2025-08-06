@@ -54,9 +54,11 @@ def take_partial_profit(symbol: str, pct: float = 0.3):
         )
         send_telegram(msg)
 
-        if remaining <= 0:
+        # 💡 전체 종료 조건
+        if remaining <= 0 or pct >= 1.0:
             send_telegram(f"📕 *Position Closed* {symbol}")
             position_data.pop(symbol, None)
+
     else:
         send_telegram(f"❌ TakeProfit{int(pct*100)} 실패 {symbol}: {resp}")
 
@@ -70,10 +72,8 @@ def stoploss(symbol: str):
     resp = close_all(symbol)
     print(f"🛑 손절 응답: {resp}")
 
-    # 포지션 기록 제거
     position_data.pop(symbol, None)
 
-    # 손익 계산 & 텔레그램 리포트
     try:
         exit_price  = get_last_price(symbol)
         profit_pct  = (exit_price / entry_price - 1) * 100 if entry_price else 0
@@ -92,9 +92,6 @@ def stoploss(symbol: str):
     return resp
 
 def check_loss_and_exit():
-    """
-    실시간 현재가 조회 후, 진입가 대비 90% 이하(–10%)면 즉시 stoploss()
-    """
     for symbol, info in list(position_data.items()):
         entry_price   = info["entry_price"]
         current_price = get_last_price(symbol)
