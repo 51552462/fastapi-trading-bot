@@ -9,7 +9,6 @@ app = FastAPI()
 
 @app.post("/signal")
 async def receive_signal(request: Request):
-    # 1) 빈 바디나 잘못된 JSON 무시
     try:
         data = await request.json()
     except JSONDecodeError:
@@ -21,25 +20,29 @@ async def receive_signal(request: Request):
         signal_type = data.get("type")
         symbol      = data.get("symbol", "").upper()
         amount      = float(data.get("amount", 0))
-        pct         = float(data.get("pct", 0)) / 100
+
+        # ✅ 분할 익절 시그널 매핑 (tp3은 전량 종료!)
+        pct_map = {
+            "tp1": 0.30,
+            "tp2": 0.40,
+            "tp3": 1.00,  # ← 전체 종료로 변경
+            "takeprofit1": 0.30,
+            "takeprofit2": 0.40,
+            "takeprofit3": 1.00,
+            "takeprofit_full": 1.00
+        }
+
+        # ✅ 손절 시그널 확장
+        stoploss_set = {"stoploss", "sl1", "sl2", "liquidation", "liq"}
 
         if signal_type == "entry":
             enter_position(symbol, amount)
 
-        elif signal_type in ["stoploss", "liquidation"]:
+        elif signal_type in stoploss_set:
             stoploss(symbol)
 
-        elif signal_type == "takeprofit1":
-            take_partial_profit(symbol, 0.30)
-
-        elif signal_type == "takeprofit2":
-            take_partial_profit(symbol, 0.40)
-
-        elif signal_type == "takeprofit3":
-            take_partial_profit(symbol, 0.30)
-
-        elif signal_type == "takeprofit_full":
-            take_partial_profit(symbol, 1.00)
+        elif signal_type in pct_map:
+            take_partial_profit(symbol, pct_map[signal_type])
 
         else:
             print(f"❓ 알 수 없는 시그널 타입: {signal_type}")
@@ -49,7 +52,6 @@ async def receive_signal(request: Request):
     except Exception as e:
         print(f"❌ /signal 처리 예외: {e}")
         return {"status": "error", "detail": str(e)}
-
 
 @app.on_event("startup")
 async def startup_event():
@@ -65,7 +67,6 @@ async def loss_monitor_loop():
         except Exception as e:
             print(f"❌ 손절 감시 오류: {e}")
         await asyncio.sleep(1)
-
 
 if __name__ == "__main__":
     uvicorn.run("main:app", host="0.0.0.0", port=10000)
