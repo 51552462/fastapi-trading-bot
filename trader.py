@@ -1,9 +1,9 @@
 # trader.py
 
-from bitget_api import place_market_order, close_all, get_last_price
+from bitget_api import place_market_order, get_last_price
 from telegram_bot import send_telegram
 
-# key: BTCUSDT_long, BTCUSDT_short 등으로 구분
+# 롱/숏 포지션 저장: 예) BTCUSDT_long, BTCUSDT_short
 position_data = {}
 
 def enter_position(symbol: str, usdt_amount: float, side: str = "long"):
@@ -50,9 +50,8 @@ def take_partial_profit(symbol: str, pct: float = 0.3, side: str = "long"):
         data["usdt_amount"]  = remaining
         data["exit_stage"]  += 1
 
-        emoji = "🤑" if side == "long" else "📕"
         msg = (
-            f"{emoji} *TakeProfit{int(pct*100)} {side.upper()}* {symbol}\n"
+            f"🤑 *TakeProfit{int(pct*100)} {side.upper()}* {symbol}\n"
             f"• 청산량: {close_usdt} USDT\n"
             f"• 남은 USDT: {remaining:.6f}"
         )
@@ -71,7 +70,13 @@ def stoploss(symbol: str, side: str = "long"):
     entry_price = info.get("entry_price")
     usdt_amount = info.get("usdt_amount")
 
-    resp = close_all(symbol)
+    if not info:
+        send_telegram(f"❌ StopLoss 실패: {key} 포지션 없음")
+        return
+
+    # 반대 주문으로 포지션 종료
+    close_side = "sell" if side == "long" else "buy"
+    resp = place_market_order(symbol, usdt_amount, side=close_side, leverage=5)
     print(f"🛑 손절 응답: {resp}")
     position_data.pop(key, None)
 
