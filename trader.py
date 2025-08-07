@@ -3,7 +3,6 @@
 from bitget_api import place_market_order, get_last_price
 from telegram_bot import send_telegram
 
-# 롱/숏 포지션 저장: 예) BTCUSDT_long, BTCUSDT_short
 position_data = {}
 
 def enter_position(symbol: str, usdt_amount: float, side: str = "long"):
@@ -47,8 +46,8 @@ def take_partial_profit(symbol: str, pct: float = 0.3, side: str = "long"):
 
     if resp.get("code") == "00000":
         remaining = total_usdt - close_usdt
-        data["usdt_amount"]  = remaining
-        data["exit_stage"]  += 1
+        data["usdt_amount"] = remaining
+        data["exit_stage"] += 1
 
         msg = (
             f"🤑 *TakeProfit{int(pct*100)} {side.upper()}* {symbol}\n"
@@ -57,7 +56,7 @@ def take_partial_profit(symbol: str, pct: float = 0.3, side: str = "long"):
         )
         send_telegram(msg)
 
-        if remaining <= 0 or pct >= 1.0:
+        if remaining <= 0.01 or pct >= 1.0 or data["exit_stage"] >= 3:
             send_telegram(f"📕 *Position Closed* {key}")
             position_data.pop(key, None)
     else:
@@ -65,8 +64,8 @@ def take_partial_profit(symbol: str, pct: float = 0.3, side: str = "long"):
     return resp
 
 def stoploss(symbol: str, side: str = "long"):
-    key         = f"{symbol}_{side}"
-    info        = position_data.get(key, {})
+    key = f"{symbol}_{side}"
+    info = position_data.get(key, {})
     entry_price = info.get("entry_price")
     usdt_amount = info.get("usdt_amount")
 
@@ -74,9 +73,12 @@ def stoploss(symbol: str, side: str = "long"):
         send_telegram(f"❌ StopLoss 실패: {key} 포지션 없음")
         return
 
-    # 반대 주문으로 포지션 종료
     close_side = "sell" if side == "long" else "buy"
-    resp = place_market_order(symbol, usdt_amount, side=close_side, leverage=5)
+    close_usdt = round(usdt_amount, 6)
+    if close_usdt < 1:
+        close_usdt = 1.01  # 최소 수량 보정
+
+    resp = place_market_order(symbol, close_usdt, side=close_side, leverage=5)
     print(f"🛑 손절 응답: {resp}")
     position_data.pop(key, None)
 
