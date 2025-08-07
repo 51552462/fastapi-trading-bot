@@ -8,14 +8,13 @@ from trader import (
     take_partial_profit,
     stoploss,
     check_loss_and_exit,
-    position_data,    # 중복 진입 방지를 위해 import
+    position_data,
 )
 
 app = FastAPI()
 
 @app.post("/signal")
 async def receive_signal(request: Request):
-    # 1) 빈 바디나 잘못된 JSON 무시
     try:
         data = await request.json()
     except JSONDecodeError:
@@ -27,18 +26,17 @@ async def receive_signal(request: Request):
         signal_type = data.get("type")
         symbol      = data.get("symbol", "").upper()
         amount      = float(data.get("amount", 0))
+        side        = data.get("side", "long").lower()
 
-        # ——————————————————————————————
-        # 1) 진입 중복 방지
+        pos_key = f"{symbol}_{side}"
+
         if signal_type == "entry":
-            if symbol in position_data:
-                print(f"⚠️ 중복 진입 스킵: {symbol} 이미 포지션 보유 중")
+            if pos_key in position_data:
+                print(f"⚠️ 중복 진입 스킵: {pos_key} 이미 포지션 보유 중")
             else:
-                enter_position(symbol, amount)
+                enter_position(symbol, amount, side)
             return {"status": "ok"}
 
-        # ——————————————————————————————
-        # 2) 분할 익절 매핑 (tp3·emaExit은 100% 종료)
         pct_map = {
             "tp1": 0.30,
             "tp2": 0.40,
@@ -47,20 +45,21 @@ async def receive_signal(request: Request):
             "takeprofit2": 0.40,
             "takeprofit3": 1.00,
             "takeprofit_full": 1.00,
-            "emaExit":  1.00    # EMA 기준 전체 종료 시그널
+            "emaExit":  1.00
         }
         if signal_type in pct_map:
-            take_partial_profit(symbol, pct_map[signal_type])
+            take_partial_profit(symbol, pct_map[signal_type], side)
             return {"status": "ok"}
 
-        # ——————————————————————————————
-        # 3) 손절 시그널 확장
-        stoploss_set = {"stoploss", "sl1", "sl2", "liquidation", "liq"}
+        stoploss_set = {"stoploss", "sl1", "sl2", "liquidation", "liq", "failCut"}
         if signal_type in stoploss_set:
-            stoploss(symbol)
+            stoploss(symbol, side)
             return {"status": "ok"}
 
-        # ——————————————————————————————
+        if signal_type == "tailTouch":
+            print(f"📎 꼬리터치 알림 수신: {symbol} ({side}) → 알림만 처리")
+            return {"status": "ok"}
+
         print(f"❓ 알 수 없는 시그널 타입: {signal_type}")
         return {"status": "ok"}
 
@@ -73,9 +72,6 @@ async def startup_event():
     asyncio.create_task(loss_monitor_loop())
 
 async def loss_monitor_loop():
-    """
-    1초마다 실시간 가격 체크 → 진입가 대비 90% 이하(롱) 혹은 10% 이상(숏) 시 손절()
-    """
     while True:
         try:
             check_loss_and_exit()
@@ -85,4 +81,3 @@ async def loss_monitor_loop():
 
 if __name__ == "__main__":
     uvicorn.run("main:app", host="0.0.0.0", port=10000)
-
