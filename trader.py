@@ -1,6 +1,8 @@
+# trader.py
 from bitget_api import place_market_order, close_all, get_last_price
 from telegram_bot import send_telegram
 
+# 메모리상 포지션 상태
 position_data = {}
 
 def enter_position(symbol: str, usdt_amount: float, side: str="long"):
@@ -40,6 +42,7 @@ def take_partial_profit(symbol: str, pct: float, side: str="long"):
     else:
         send_telegram(f"❌ TakeProfit 실패 {key}: {resp}")
 
+    # 3차 익절 후 강제 전체 종료
     if pct >= 1.0 or data["exit_stage"] >= 3:
         close_resp = close_all(symbol)
         if close_resp.get("code") == "00000":
@@ -52,6 +55,7 @@ def close_position(symbol: str, side: str="long", reason: str=""):
     key = f"{symbol}_{side}"
     print(f"🧪 [DEBUG] close_position 호출됨: {key}")
 
+    # position_data에 없어도 강제 종료 시도
     if key not in position_data:
         print(f"⚠️ [DEBUG] position_data에 {key} 없음 → 강제 Bitget 포지션 종료 시도")
         resp = close_all(symbol)
@@ -61,6 +65,7 @@ def close_position(symbol: str, side: str="long", reason: str=""):
             send_telegram(f"❌ 강제 Close 실패 ({reason}) {key} → {resp}")
         return
 
+    # 정상 종료 흐름
     resp = close_all(symbol)
     if resp.get("code") == "00000":
         send_telegram(f"🛑 Close({reason}) {side.upper()} {symbol} → {resp}")
