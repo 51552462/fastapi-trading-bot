@@ -1,15 +1,17 @@
+# bitget_api.py
 import os, time, hmac, hashlib, base64, requests, json
 from dotenv import load_dotenv
 
 load_dotenv()
 
-BASE_URL = "https://api.bitget.com"
-API_KEY = os.getenv("BITGET_API_KEY")
-API_SECRET = os.getenv("BITGET_API_SECRET")
+BASE_URL     = "https://api.bitget.com"
+API_KEY      = os.getenv("BITGET_API_KEY")
+API_SECRET   = os.getenv("BITGET_API_SECRET")
 API_PASSPHRASE = os.getenv("BITGET_API_PASSWORD")
 
 def convert_symbol(symbol: str) -> str:
-    return symbol.upper().replace("/", "").replace("_", "") + "_UMCBL"
+    # v2 API 에서는 심볼에 UMCBL, _ 붙이지 않고 'BTCUSDT' 형태로 보냅니다.
+    return symbol.upper().replace("_UMCBL", "").replace("_", "")
 
 def _timestamp():
     return str(int(time.time() * 1000))
@@ -20,20 +22,20 @@ def _sign(method, path, timestamp, body=""):
     return base64.b64encode(signature).decode()
 
 def _headers(method, path, body=""):
-    ts = _timestamp()
+    ts   = _timestamp()
     sign = _sign(method, path, ts, body)
     return {
-        "ACCESS-KEY": API_KEY,
-        "ACCESS-SIGN": sign,
+        "ACCESS-KEY":       API_KEY,
+        "ACCESS-SIGN":      sign,
         "ACCESS-TIMESTAMP": ts,
         "ACCESS-PASSPHRASE": API_PASSPHRASE,
-        "Content-Type": "application/json"
+        "Content-Type":     "application/json"
     }
 
 def place_market_order(symbol, usdt_amount, side, leverage=5):
     path = "/api/mix/v1/order/placeOrder"
-    url = BASE_URL + path
-    symbol_conv = convert_symbol(symbol)
+    url  = BASE_URL + path
+    symbol_conv = symbol.upper().replace("/", "").replace("_", "") + "_UMCBL"
 
     # 현재가 기반 수량 계산
     price_url = f"{BASE_URL}/api/mix/v1/market/ticker?symbol={symbol_conv}"
@@ -47,46 +49,41 @@ def place_market_order(symbol, usdt_amount, side, leverage=5):
 
     order_side = "buy_single" if side == "buy" else "sell_single"
     body = {
-        "symbol": symbol_conv,
+        "symbol":     symbol_conv,
         "marginCoin": "USDT",
-        "size": str(qty),
-        "side": order_side,
-        "orderType": "market",
-        "leverage": str(leverage)
+        "size":       str(qty),
+        "side":       order_side,
+        "orderType":  "market",
+        "leverage":   str(leverage)
     }
     body_json = json.dumps(body)
+
     print("📤 Bitget 최종 주문 요청:", body)
     headers = _headers("POST", path, body_json)
     res = requests.post(url, headers=headers, data=body_json)
-    print(f"📥 place_market_order 응답 → status: {res.status_code}, body: {res.text}")
+    print(f"📥 place_market_order 응답 → {res.status_code}, {res.text}")
     return res.json()
 
 def close_all(symbol):
-    # ★ 수정된 경로: position/closePosition (404 방지)
-    path = "/api/mix/v1/position/closePosition"
-    url = BASE_URL + path
+    # v2 Flash Close Position API 사용 (/api/v2/mix/order/close-positions) :contentReference[oaicite:0]{index=0}
+    path = "/api/v2/mix/order/close-positions"
+    url  = BASE_URL + path
     symbol_conv = convert_symbol(symbol)
     body = {
-        "symbol": symbol_conv,
-        "marginCoin": "USDT"
+        "symbol":      symbol_conv,
+        "productType": "USDT-FUTURES"
+        # one-way 모드: holdSide 생략해도 전체 포지션 종료
     }
     body_json = json.dumps(body)
-    headers = _headers("POST", path, body_json)
 
     # 디버깅 로그
     print(f"📤 close_all 요청 → URL: {url}, body: {body}")
-
-    try:
-        res = requests.post(url, headers=headers, data=body_json)
-    except Exception as e:
-        print(f"❌ close_all 예외 → {e}")
-        raise
-
-    print(f"📥 close_all 응답 → status: {res.status_code}, body: {res.text}")
+    res = requests.post(url, headers=_headers("POST", path, body_json), data=body_json)
+    print(f"📥 close_all 응답 → {res.status_code}, {res.text}")
     return res.json()
 
 def get_last_price(symbol):
-    symbol_conv = convert_symbol(symbol)
-    url = f"{BASE_URL}/api/mix/v1/market/ticker?symbol={symbol_conv}"
+    symbol_conv = symbol.upper().replace("_UMCBL", "").replace("_", "")
+    url = f"{BASE_URL}/api/mix/v1/market/ticker?symbol={symbol_conv}_UMCBL"
     res = requests.get(url)
     return float(res.json()["data"]["last"])
