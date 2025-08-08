@@ -51,13 +51,19 @@ def take_partial_profit(symbol: str, pct: float, side: str="long"):
 def close_position(symbol: str, side: str="long", reason: str=""):
     key = f"{symbol}_{side}"
     print(f"🧪 [DEBUG] close_position 호출됨: {key}")
+
     if key not in position_data:
-        print(f"❌ [DEBUG] position_data에 {key} 없음")
-        send_telegram(f"❌ Close 실패: {key} 없음")
+        print(f"⚠️ [DEBUG] position_data에 {key} 없음 → 강제 Bitget 포지션 종료 시도")
+        resp = close_all(symbol)
+        if resp.get("code") == "00000":
+            send_telegram(f"🛑 Close({reason}) {side.upper()} {symbol} → {resp} (position_data 없음)")
+        else:
+            send_telegram(f"❌ 강제 Close 실패 ({reason}) {key} → {resp}")
         return
+
     resp = close_all(symbol)
     if resp.get("code") == "00000":
-        send_telegram(f"🚗 Close({reason}) {side.upper()} {symbol} → {resp}")
+        send_telegram(f"🛑 Close({reason}) {side.upper()} {symbol} → {resp}")
         position_data.pop(key, None)
     else:
         send_telegram(f"❌ Close 실패 ({reason}) {key}: {resp}")
