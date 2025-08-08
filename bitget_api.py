@@ -1,3 +1,4 @@
+# bitget_api.py
 import os, time, hmac, hashlib, base64, requests, json
 from dotenv import load_dotenv
 
@@ -9,7 +10,6 @@ API_SECRET = os.getenv("BITGET_API_SECRET")
 API_PASSPHRASE = os.getenv("BITGET_API_PASSWORD")
 
 def convert_symbol(symbol: str) -> str:
-    # 모든 심볼을 _UMCBL 선물 마켓으로 변환
     return symbol.upper().replace("/", "").replace("_", "") + "_UMCBL"
 
 def _timestamp():
@@ -46,9 +46,7 @@ def place_market_order(symbol, usdt_amount, side, leverage=5):
         print(f"⚠️ 최소 주문 수량 미달 → {qty} USDT, 주문 생략")
         return {"code": "SKIP", "msg": "below min qty"}
 
-    # One-way 모드(single_hold)용 side 값
     order_side = "buy_single" if side == "buy" else "sell_single"
-
     body = {
         "symbol": symbol_conv,
         "marginCoin": "USDT",
@@ -57,11 +55,11 @@ def place_market_order(symbol, usdt_amount, side, leverage=5):
         "orderType": "market",
         "leverage": str(leverage)
     }
-
     body_json = json.dumps(body)
     print("📤 Bitget 최종 주문 요청:", body)
     headers = _headers("POST", path, body_json)
     res = requests.post(url, headers=headers, data=body_json)
+    print(f"📥 place_market_order 응답 → status: {res.status_code}, body: {res.text}")
     return res.json()
 
 def close_all(symbol):
@@ -74,7 +72,17 @@ def close_all(symbol):
     }
     body_json = json.dumps(body)
     headers = _headers("POST", path, body_json)
-    res = requests.post(url, headers=headers, data=body_json)
+
+    # --- 디버깅 로그 추가 ---
+    print(f"📤 close_all 요청 → URL: {url}, body: {body}")
+
+    try:
+        res = requests.post(url, headers=headers, data=body_json)
+    except Exception as e:
+        print(f"❌ close_all 예외 → {e}")
+        raise
+
+    print(f"📥 close_all 응답 → status: {res.status_code}, body: {res.text}")
     return res.json()
 
 def get_last_price(symbol):
