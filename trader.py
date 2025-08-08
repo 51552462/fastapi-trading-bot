@@ -56,7 +56,8 @@ def take_partial_profit(symbol: str, pct: float = 0.3, side: str = "long"):
         )
         send_telegram(msg)
 
-        if remaining <= 0.01 or pct >= 1.0 or data["exit_stage"] >= 3:
+        # 💥 강제 종료 조건 (tp3, emaExit, sl 직후 등 포함)
+        if pct >= 1.0 or remaining <= 0.01 or data["exit_stage"] >= 3:
             send_telegram(f"📕 *Position Closed* {key}")
             position_data.pop(key, None)
     else:
@@ -74,10 +75,9 @@ def stoploss(symbol: str, side: str = "long"):
         return
 
     close_side = "sell" if side == "long" else "buy"
-    close_usdt = round(usdt_amount, 6)
-    if close_usdt < 1:
-        close_usdt = 1.01  # 최소 수량 보정
 
+    # 💥 확실하게 전체 포지션 종료: 매우 큰 금액으로 청산 (Bitget는 초과 주문 무시함)
+    close_usdt = 999999
     resp = place_market_order(symbol, close_usdt, side=close_side, leverage=5)
     print(f"🛑 손절 응답: {resp}")
     position_data.pop(key, None)
