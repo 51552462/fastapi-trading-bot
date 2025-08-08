@@ -1,4 +1,3 @@
-# bitget_api.py
 import os, time, hmac, hashlib, base64, requests, json
 from dotenv import load_dotenv
 
@@ -63,7 +62,8 @@ def place_market_order(symbol, usdt_amount, side, leverage=5):
     return res.json()
 
 def close_all(symbol):
-    path = "/api/mix/v1/order/close-position"
+    # ★ 수정된 경로: position/closePosition (404 방지)
+    path = "/api/mix/v1/position/closePosition"
     url = BASE_URL + path
     symbol_conv = convert_symbol(symbol)
     body = {
@@ -73,7 +73,7 @@ def close_all(symbol):
     body_json = json.dumps(body)
     headers = _headers("POST", path, body_json)
 
-    # --- 디버깅 로그 추가 ---
+    # 디버깅 로그
     print(f"📤 close_all 요청 → URL: {url}, body: {body}")
 
     try:
