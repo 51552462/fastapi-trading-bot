@@ -1,60 +1,59 @@
-import uvicorn, asyncio, json, re
+import os, uvicorn, asyncio, json, re
 from fastapi import FastAPI, Request
-from json import JSONDecodeError
+from datetime import datetime
+from zoneinfo import ZoneInfo
 from trader import (
     enter_position,
     take_partial_profit,
     close_position,
     check_loss_and_exit,
     position_data,
+    send_daily_summary_and_reset,  # 일일 요약 사용 안 하면 trader에서 제거하고 이 라인도 지우세요
 )
-from telegram_bot import send_telegram  # 선택: 초기 디버깅용
+# from telegram_bot import send_telegram  # 필요시 임시 디버깅용
 
 app = FastAPI()
+KST = ZoneInfo("Asia/Seoul")
+DEBUG = os.getenv("DEBUG", "0") == "1"
 
 def _robust_parse(raw: bytes):
-    """
-    TradingView는 종종 text/plain으로 JSON 문자열을 보냄.
-    1) 우선 json.loads 시도
-    2) 실패하면 양끝 큰따옴표 제거 후 재시도
-    3) 실패하면 중괄호 {...} 부분만 추출해서 재시도
-    """
+    """text/plain, 따옴표로 감싼 JSON, 문자열 내부 {...}까지 최대한 파싱"""
     txt = raw.decode("utf-8", errors="ignore").strip()
-    # 1) 그대로 시도
+    # 1) 그대로
     try:
         return json.loads(txt)
     except Exception:
         pass
-    # 2) 감싸진 따옴표 제거 (예: "\"{...}\"")
+    # 2) 양끝 따옴표 제거 후
     if (txt.startswith('"') and txt.endswith('"')) or (txt.startswith("'") and txt.endswith("'")):
         thin = txt[1:-1]
         try:
             return json.loads(thin)
         except Exception:
-            txt = thin  # 다음 단계에서 활용
-    # 3) 중괄호 블록 추출
+            txt = thin
+    # 3) 본문에서 중괄호 블록만 추출
     m = re.search(r'\{.*\}', txt, flags=re.S)
     if m:
         try:
             return json.loads(m.group(0))
         except Exception:
             pass
-    # 실패 시 None
     return None
 
-@app.post("/signal")
-async def receive_signal(request: Request):
+async def _handle_signal(request: Request):
     raw = await request.body()
-    print("🔎 RAW:", raw.decode("utf-8", errors="ignore"))  # 반드시 확인
+    if DEBUG:
+        print("🔎 RAW:", raw.decode("utf-8", errors="ignore"))
 
     data = _robust_parse(raw)
     if not data:
-        print("⚠️ 페이로드 파싱 실패 (headers:", dict(request.headers), ")")
-        # 초기 디버깅용 푸시(원하면 주석처리)
-        # send_telegram("⚠️ TV Webhook parse fail\n" + raw.decode("utf-8","ignore")[:500])
+        if DEBUG:
+            print("⚠️ 페이로드 파싱 실패 (headers:", dict(request.headers), ")")
         return {"status":"ok","detail":"parse_fail"}
 
-    print("📩 시그널 수신:", data)
+    if DEBUG:
+        print("📩 시그널 수신:", data)
+
     t    = str(data.get("type", "")).strip()
     sym  = str(data.get("symbol", "")).upper().replace("PERP","").replace("_","")
     amt  = float(data.get("amount", 0) or 0)
@@ -65,7 +64,7 @@ async def receive_signal(request: Request):
         if key not in position_data:
             enter_position(sym, amt, side)
         else:
-            print("⚠️ 중복 진입 스킵:", key)
+            if DEBUG: print("⚠️ 중복 진입 스킵:", key)
         return {"status":"ok"}
 
     if t in {"tp1","tp2"}:
@@ -78,19 +77,30 @@ async def receive_signal(request: Request):
         return {"status":"ok"}
 
     if t == "tailTouch":
-        print("📎 꼬리터치 (no action):", key)
+        if DEBUG: print("📎 꼬리터치 (no action):", key)
         return {"status":"ok"}
 
-    print("❓ 알 수 없는 시그널:", t)
+    if DEBUG: print("❓ 알 수 없는 시그널:", t)
     return {"status":"ok"}
 
-@app.get("/ping")
-async def ping():
-    return {"ok": True}
+# TV가 루트로 보내도 처리되도록 허용
+@app.post("/")
+async def receive_root(request: Request):
+    return await _handle_signal(request)
+
+@app.post("/signal")
+async def receive_signal(request: Request):
+    return await _handle_signal(request)
+
+# 헬스체크/브라우저 확인
+@app.get("/")
+async def root_ok():
+    return {"ok": True, "msg": "fastapi-trading-bot alive", "endpoint": "/signal"}
 
 @app.on_event("startup")
 async def startup_event():
     asyncio.create_task(loss_monitor_loop())
+    asyncio.create_task(daily_summary_loop())
 
 async def loss_monitor_loop():
     while True:
@@ -98,6 +108,21 @@ async def loss_monitor_loop():
             check_loss_and_exit()
         except Exception as e:
             print("❌ 손절 감시 오류:", e)
+        await asyncio.sleep(1)
+
+async def daily_summary_loop():
+    # KST 23:59에 일일 요약 전송 (trader.send_daily_summary_and_reset 사용)
+    while True:
+        try:
+            now = datetime.now(KST)
+            if now.hour == 23 and now.minute == 59:
+                try:
+                    send_daily_summary_and_reset()
+                except Exception as e:
+                    print("❌ 일일 요약 전송 오류:", e)
+                await asyncio.sleep(60)  # 중복 방지
+        except Exception as e:
+            print("❌ 일일 요약 루프 오류:", e)
         await asyncio.sleep(1)
 
 if __name__ == "__main__":
