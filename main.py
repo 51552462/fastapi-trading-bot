@@ -1,32 +1,64 @@
-import uvicorn, asyncio
+import uvicorn, asyncio, json, re
 from fastapi import FastAPI, Request
 from json import JSONDecodeError
-from datetime import datetime
-from zoneinfo import ZoneInfo
 from trader import (
     enter_position,
     take_partial_profit,
     close_position,
     check_loss_and_exit,
     position_data,
-    send_daily_summary_and_reset,
 )
+from telegram_bot import send_telegram  # 선택: 초기 디버깅용
 
 app = FastAPI()
-KST = ZoneInfo("Asia/Seoul")
+
+def _robust_parse(raw: bytes):
+    """
+    TradingView는 종종 text/plain으로 JSON 문자열을 보냄.
+    1) 우선 json.loads 시도
+    2) 실패하면 양끝 큰따옴표 제거 후 재시도
+    3) 실패하면 중괄호 {...} 부분만 추출해서 재시도
+    """
+    txt = raw.decode("utf-8", errors="ignore").strip()
+    # 1) 그대로 시도
+    try:
+        return json.loads(txt)
+    except Exception:
+        pass
+    # 2) 감싸진 따옴표 제거 (예: "\"{...}\"")
+    if (txt.startswith('"') and txt.endswith('"')) or (txt.startswith("'") and txt.endswith("'")):
+        thin = txt[1:-1]
+        try:
+            return json.loads(thin)
+        except Exception:
+            txt = thin  # 다음 단계에서 활용
+    # 3) 중괄호 블록 추출
+    m = re.search(r'\{.*\}', txt, flags=re.S)
+    if m:
+        try:
+            return json.loads(m.group(0))
+        except Exception:
+            pass
+    # 실패 시 None
+    return None
 
 @app.post("/signal")
 async def receive_signal(request: Request):
-    try:
-        data = await request.json()
-    except JSONDecodeError:
-        return {"status":"ok","detail":"no payload"}
+    raw = await request.body()
+    print("🔎 RAW:", raw.decode("utf-8", errors="ignore"))  # 반드시 확인
+
+    data = _robust_parse(raw)
+    if not data:
+        print("⚠️ 페이로드 파싱 실패 (headers:", dict(request.headers), ")")
+        # 초기 디버깅용 푸시(원하면 주석처리)
+        # send_telegram("⚠️ TV Webhook parse fail\n" + raw.decode("utf-8","ignore")[:500])
+        return {"status":"ok","detail":"parse_fail"}
 
     print("📩 시그널 수신:", data)
-    t    = data.get("type", "")
-    sym  = data.get("symbol", "").upper()
-    amt  = float(data.get("amount", 0))
-    side = data.get("side", "long").lower()
+    t    = str(data.get("type", "")).strip()
+    sym  = str(data.get("symbol", "")).upper().replace("PERP","").replace("_","")
+    amt  = float(data.get("amount", 0) or 0)
+    side = str(data.get("side", "long")).lower()
     key  = f"{sym}_{side}"
 
     if t == "entry":
@@ -41,7 +73,6 @@ async def receive_signal(request: Request):
         take_partial_profit(sym, pct, side)
         return {"status":"ok"}
 
-    # tp3나 각종 손절/종료 시그널은 전부 최종 청산
     if t in {"tp3","sl1","sl2","failCut","emaExit","stoploss","liquidation"}:
         close_position(sym, side, t)
         return {"status":"ok"}
@@ -50,18 +81,16 @@ async def receive_signal(request: Request):
         print("📎 꼬리터치 (no action):", key)
         return {"status":"ok"}
 
-    if t == "dailySummaryNow":
-        # 수동으로 즉시 요약 전송하고 리셋 (원하면 사용)
-        send_daily_summary_and_reset()
-        return {"status":"ok"}
-
     print("❓ 알 수 없는 시그널:", t)
     return {"status":"ok"}
+
+@app.get("/ping")
+async def ping():
+    return {"ok": True}
 
 @app.on_event("startup")
 async def startup_event():
     asyncio.create_task(loss_monitor_loop())
-    asyncio.create_task(daily_summary_loop())
 
 async def loss_monitor_loop():
     while True:
@@ -69,19 +98,6 @@ async def loss_monitor_loop():
             check_loss_and_exit()
         except Exception as e:
             print("❌ 손절 감시 오류:", e)
-        await asyncio.sleep(1)
-
-async def daily_summary_loop():
-    # KST 23:59에 일일 요약 전송
-    while True:
-        try:
-            now = datetime.now(KST)
-            if now.hour == 23 and now.minute == 59:
-                send_daily_summary_and_reset()
-                # 같은 분 중복 전송 방지
-                await asyncio.sleep(60)
-        except Exception as e:
-            print("❌ 일일 요약 루프 오류:", e)
         await asyncio.sleep(1)
 
 if __name__ == "__main__":
