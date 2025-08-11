@@ -1,12 +1,11 @@
-# bitget_api.py
 import os, time, hmac, hashlib, base64, requests, json
 from dotenv import load_dotenv
 
 load_dotenv()
 
-BASE_URL     = "https://api.bitget.com"
-API_KEY      = os.getenv("BITGET_API_KEY")
-API_SECRET   = os.getenv("BITGET_API_SECRET")
+BASE_URL       = "https://api.bitget.com"
+API_KEY        = os.getenv("BITGET_API_KEY")
+API_SECRET     = os.getenv("BITGET_API_SECRET")
 API_PASSPHRASE = os.getenv("BITGET_API_PASSWORD")
 
 def convert_symbol(symbol: str) -> str:
@@ -25,11 +24,11 @@ def _headers(method, path, body=""):
     ts   = _timestamp()
     sign = _sign(method, path, ts, body)
     return {
-        "ACCESS-KEY":       API_KEY,
-        "ACCESS-SIGN":      sign,
-        "ACCESS-TIMESTAMP": ts,
+        "ACCESS-KEY":        API_KEY,
+        "ACCESS-SIGN":       sign,
+        "ACCESS-TIMESTAMP":  ts,
         "ACCESS-PASSPHRASE": API_PASSPHRASE,
-        "Content-Type":     "application/json"
+        "Content-Type":      "application/json"
     }
 
 def place_market_order(symbol, usdt_amount, side, leverage=5):
@@ -65,7 +64,7 @@ def place_market_order(symbol, usdt_amount, side, leverage=5):
     return res.json()
 
 def close_all(symbol):
-    # v2 Flash Close Position API 사용 (/api/v2/mix/order/close-positions) :contentReference[oaicite:0]{index=0}
+    # v2 Flash Close Position API 사용 (/api/v2/mix/order/close-positions)
     path = "/api/v2/mix/order/close-positions"
     url  = BASE_URL + path
     symbol_conv = convert_symbol(symbol)
@@ -76,7 +75,6 @@ def close_all(symbol):
     }
     body_json = json.dumps(body)
 
-    # 디버깅 로그
     print(f"📤 close_all 요청 → URL: {url}, body: {body}")
     res = requests.post(url, headers=_headers("POST", path, body_json), data=body_json)
     print(f"📥 close_all 응답 → {res.status_code}, {res.text}")
