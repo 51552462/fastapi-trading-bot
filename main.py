@@ -1,15 +1,19 @@
 import uvicorn, asyncio
 from fastapi import FastAPI, Request
 from json import JSONDecodeError
+from datetime import datetime
+from zoneinfo import ZoneInfo
 from trader import (
     enter_position,
     take_partial_profit,
     close_position,
     check_loss_and_exit,
     position_data,
+    send_daily_summary_and_reset,
 )
 
 app = FastAPI()
+KST = ZoneInfo("Asia/Seoul")
 
 @app.post("/signal")
 async def receive_signal(request: Request):
@@ -37,6 +41,7 @@ async def receive_signal(request: Request):
         take_partial_profit(sym, pct, side)
         return {"status":"ok"}
 
+    # tp3나 각종 손절/종료 시그널은 전부 최종 청산
     if t in {"tp3","sl1","sl2","failCut","emaExit","stoploss","liquidation"}:
         close_position(sym, side, t)
         return {"status":"ok"}
@@ -45,12 +50,18 @@ async def receive_signal(request: Request):
         print("📎 꼬리터치 (no action):", key)
         return {"status":"ok"}
 
+    if t == "dailySummaryNow":
+        # 수동으로 즉시 요약 전송하고 리셋 (원하면 사용)
+        send_daily_summary_and_reset()
+        return {"status":"ok"}
+
     print("❓ 알 수 없는 시그널:", t)
     return {"status":"ok"}
 
 @app.on_event("startup")
 async def startup_event():
     asyncio.create_task(loss_monitor_loop())
+    asyncio.create_task(daily_summary_loop())
 
 async def loss_monitor_loop():
     while True:
@@ -58,6 +69,19 @@ async def loss_monitor_loop():
             check_loss_and_exit()
         except Exception as e:
             print("❌ 손절 감시 오류:", e)
+        await asyncio.sleep(1)
+
+async def daily_summary_loop():
+    # KST 23:59에 일일 요약 전송
+    while True:
+        try:
+            now = datetime.now(KST)
+            if now.hour == 23 and now.minute == 59:
+                send_daily_summary_and_reset()
+                # 같은 분 중복 전송 방지
+                await asyncio.sleep(60)
+        except Exception as e:
+            print("❌ 일일 요약 루프 오류:", e)
         await asyncio.sleep(1)
 
 if __name__ == "__main__":
