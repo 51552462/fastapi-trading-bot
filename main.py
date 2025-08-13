@@ -1,9 +1,5 @@
 from fastapi import FastAPI, Request
-from trader import (
-    enter_position, take_partial_profit, close_position,
-    check_loss_and_exit, position_data,
-    sync_open_positions, send_daily_summary
-)
+from trader import (enter_position, take_partial_profit, close_position,check_loss_and_exit, position_data,sync_open_positions, send_daily_summary)
 import threading, time, re
 
 app = FastAPI()
@@ -107,3 +103,4 @@ def _daily_report_loop():
 threading.Thread(target=_watchdog_roe,   daemon=True).start()
 threading.Thread(target=_sync_loop,      daemon=True).start()
 threading.Thread(target=_daily_report_loop, daemon=True).start()
+
