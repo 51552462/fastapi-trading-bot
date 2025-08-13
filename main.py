@@ -1,14 +1,22 @@
 from fastapi import FastAPI, Request
-from trader import (enter_position, take_partial_profit, close_position,check_loss_and_exit, position_data,sync_open_positions, send_daily_summary)
-import threading, time, re
+from trader import (
+    enter_position, take_partial_profit, close_position,
+    check_loss_and_exit, position_data,
+    sync_open_positions, send_daily_summary
+)
+from bitget_api import convert_symbol
+import threading, time, os
 
 app = FastAPI()
 
-DEFAULT_AMOUNT = 15.0             # Pine에서 amount 주면 그 값 사용
-TP_PCT = {"tp1": 0.30, "tp2": 0.40}  # tp3는 전체 종료
+DEFAULT_AMOUNT = 15.0
+TP_PCT = {"tp1": 0.30, "tp2": 0.40}
+
+# ROE 감시 주기(초)
+WATCHDOG_SEC = float(os.getenv("WATCHDOG_SEC", "1"))
 
 def _norm_symbol(s: str) -> str:
-    return re.sub(r'[^A-Za-z0-9]', '', (s or "")).upper()
+    return convert_symbol(s)
 
 def _infer_side(symbol: str, side_in: str):
     side = (side_in or "").lower()
@@ -18,7 +26,7 @@ def _infer_side(symbol: str, side_in: str):
     has_short = f"{symbol}_short" in position_data
     if has_long ^ has_short:
         return "long" if has_long else "short"
-    return "long"  # 보수적으로
+    return "long"
 
 @app.post("/signal")
 async def signal(request: Request):
@@ -49,24 +57,20 @@ async def signal(request: Request):
 def health():
     return {"ok": True, "positions": list(position_data.keys())}
 
-# ──────────────────────────────────────────
-# 백그라운드 루프들 (재시작 자동복구 + ROE 감시 + 일일 리포트)
-# ──────────────────────────────────────────
+# ── background loops: ROE 감시 / 재시작 복구 / 일일 리포트 ────────────────
 def _watchdog_roe():
     while True:
         try:
             check_loss_and_exit()
         except Exception as e:
             print("watchdog_roe error:", e)
-        time.sleep(5)
+        time.sleep(max(0.5, WATCHDOG_SEC))
 
 def _sync_loop():
-    # 시작 직후 1회 즉시 동기화
     try:
         sync_open_positions()
     except Exception as e:
         print("initial sync error:", e)
-    # 이후 주기적 동기화
     while True:
         try:
             sync_open_positions()
@@ -75,32 +79,24 @@ def _sync_loop():
         time.sleep(60)
 
 def _seconds_until_kst(hour: int, minute: int) -> int:
-    # 현재 UTC epoch +9h → KST 기준 다음 hour:minute 까지 남은 초
     now_utc = int(time.time())
     now_kst = now_utc + 9*3600
-    tm = time.gmtime(now_kst)
-    target_kst = int(time.mktime((tm.tm_year, tm.tm_mon, tm.tm_mday, hour, minute, 0, 0, 0, -1)))  # this treats as local; we already shifted
-    # 위 mktime은 로컬기준이라 오차 → 그냥 직접 계산
     today_kst = (now_kst // 86400) * 86400
     target_kst = today_kst + hour*3600 + minute*60
     if target_kst <= now_kst:
         target_kst += 86400
-    return (target_kst - now_kst)
+    return target_kst - now_kst
 
 def _daily_report_loop():
-    # 매일 23:59(KST) 전송
     while True:
         try:
-            sec = _seconds_until_kst(23, 59)
-            time.sleep(max(5, sec))
+            time.sleep(max(5, _seconds_until_kst(23, 59)))
             send_daily_summary()
-            # 다음 날까지 대기
-            time.sleep(65)  # 1분 버퍼
+            time.sleep(65)
         except Exception as e:
             print("daily_report error:", e)
             time.sleep(60)
 
-threading.Thread(target=_watchdog_roe,   daemon=True).start()
-threading.Thread(target=_sync_loop,      daemon=True).start()
-threading.Thread(target=_daily_report_loop, daemon=True).start()
-
+threading.Thread(target=_watchdog_roe,     daemon=True).start()
+threading.Thread(target=_sync_loop,        daemon=True).start()
+threading.Thread(target=_daily_report_loop,daemon=True).start()
