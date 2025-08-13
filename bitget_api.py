@@ -27,15 +27,11 @@ def _headers(method: str, path_with_query: str, body: str = "") -> Dict[str, str
     }
 
 def convert_symbol(sym: str) -> str:
-    # "BTCUSDT.P", "BTC/USDT", "btc_usdt" 등 → "BTCUSDT"
-    s = re.sub(r'[^A-Za-z0-9]', '', sym).upper()
-    # Bitget 심볼 뒤에 붙는 _UMCBL 제거
-    s = s.replace("_UMCBL", "")
+    s = re.sub(r'[^A-Za-z0-9]', '', str(sym or "").upper())
+    s = re.sub(r'(UMCBL|CMCBL|DMCBL)$', '', s)  # 접미사 제거
     return s
 
-# ───────────────────────────
-# Public Ticker (미서명)
-# ───────────────────────────
+# ── Public ticker ─────────────────────────────────────────────────────────────
 def _safe_last_price(symbol: str):
     symbol_conv = convert_symbol(symbol) + "_UMCBL"
     url = f"{BASE_URL}/api/mix/v1/market/ticker?symbol={symbol_conv}"
@@ -53,72 +49,75 @@ def _safe_last_price(symbol: str):
 def get_last_price(symbol: str):
     return _safe_last_price(symbol)
 
-# ───────────────────────────
-# Private: Market Order
-# ───────────────────────────
+# ── Private order helpers ────────────────────────────────────────────────────
 def place_market_order(symbol, usdt_amount, side, leverage=5, reduce_only=False):
-    """side: 'buy' or 'sell'  (reduce_only=True면 감소주문)"""
+    """USDT 금액 기준 시장가. side: 'buy'|'sell'."""
     symbol_conv = convert_symbol(symbol) + "_UMCBL"
-    last_price = _safe_last_price(symbol)
-    if not last_price:
+    last = _safe_last_price(symbol)
+    if not last:
         return {"code": "LOCAL_TICKER_FAIL", "msg": "ticker_none"}
-
-    qty = round(usdt_amount / last_price, 6)
+    qty = round(usdt_amount / last, 6)
     if qty <= 0:
         return {"code": "LOCAL_BAD_QTY", "msg": f"qty {qty}"}
-
     path = "/api/mix/v1/order/placeOrder"
-    path_with_query = path
-    order_side = "buy_single" if side == "buy" else "sell_single"
-
     body = {
         "symbol":     symbol_conv,
         "marginCoin": "USDT",
         "size":       str(qty),
-        "side":       order_side,
+        "side":       "buy_single" if side == "buy" else "sell_single",
         "orderType":  "market",
         "leverage":   str(leverage),
-        "reduceOnly": True if reduce_only else False
+        "reduceOnly": bool(reduce_only),
     }
-    body_json = json.dumps(body)
-
-    print("📤 Bitget 요청:", body)
+    bj = json.dumps(body)
     try:
-        res = requests.post(BASE_URL + path, headers=_headers("POST", path_with_query, body_json), data=body_json, timeout=15)
+        res = requests.post(BASE_URL + path, headers=_headers("POST", path, bj), data=bj, timeout=15)
         print(f"📥 Bitget 응답 {res.status_code}: {res.text}")
         return res.json()
     except Exception as e:
-        print(f"❌ Bitget 예외: {e}")
+        print("❌ Bitget 예외:", e)
         return {"code": "LOCAL_EXCEPTION", "msg": str(e)}
 
-# ───────────────────────────
-# Private: Open Positions Sync
-# ───────────────────────────
+def place_reduce_by_size(symbol, size, side, leverage=5):
+    """현재 수량(size) 그대로 감소(종료) 주문. side: 포지션 방향('long'|'short')."""
+    symbol_conv = convert_symbol(symbol) + "_UMCBL"
+    # long을 닫을 때는 sell, short를 닫을 때는 buy
+    order_side = "sell_single" if side == "long" else "buy_single"
+    path = "/api/mix/v1/order/placeOrder"
+    body = {
+        "symbol":     symbol_conv,
+        "marginCoin": "USDT",
+        "size":       str(size),
+        "side":       order_side,
+        "orderType":  "market",
+        "leverage":   str(leverage),
+        "reduceOnly": True,
+    }
+    bj = json.dumps(body)
+    try:
+        res = requests.post(BASE_URL + path, headers=_headers("POST", path, bj), data=bj, timeout=15)
+        print(f"📥 Bitget 응답 {res.status_code}: {res.text}")
+        return res.json()
+    except Exception as e:
+        print("❌ Bitget 예외:", e)
+        return {"code": "LOCAL_EXCEPTION", "msg": str(e)}
+
+# ── Private positions ────────────────────────────────────────────────────────
 def get_open_positions() -> List[Dict]:
-    """
-    Bitget Perp(UMCBL) 전체 오픈 포지션 반환.
-    결과 예시: [{"symbol":"BTCUSDT","side":"long","size":0.05,"entry_price":64000.0}, ...]
-    """
     query = "productType=umcbl&marginCoin=USDT"
     path = "/api/mix/v1/position/allPosition"
-    path_with_query = f"{path}?{query}"
-    url = f"{BASE_URL}{path}?{query}"
-
+    url  = f"{BASE_URL}{path}?{query}"
     try:
-        res = requests.get(url, headers=_headers("GET", path_with_query, ""), timeout=10)
+        res = requests.get(url, headers=_headers("GET", f"{path}?{query}", ""), timeout=10)
         j = res.json()
         out = []
         if not j or j.get("code") not in ("00000", "0"):
             print(f"❌ get_open_positions 응답 이상: {j}")
             return out
-
-        data = j.get("data") or []
-        for pos in data:
+        for pos in (j.get("data") or []):
             try:
                 sym = convert_symbol(pos.get("symbol", ""))
-                # holdSide: "long" or "short"
                 side = (pos.get("holdSide") or "").lower()
-                # 총 수량(계약 사이즈)
                 size = float(pos.get("total") or pos.get("available") or 0)
                 entry_price = float(pos.get("openAvgPrice") or pos.get("averageOpenPrice") or pos.get("avgOpenPrice") or 0)
                 if sym and side in ("long", "short") and size > 0 and entry_price > 0:
