@@ -1,12 +1,9 @@
 from typing import Dict, Optional
-from bitget_api import (
-    convert_symbol, get_last_price, get_open_positions,
-    place_market_order, place_reduce_by_size, get_symbol_spec, round_down_step
-)
+from bitget_api import (convert_symbol, get_last_price, get_open_positions,place_market_order, place_reduce_by_size, get_symbol_spec, round_down_step)
 import json, os, time, threading, random
 
 try:
-    from telegram_bot import send_telegram
+    from telegram_bot import send_telegram   # 텔레그램은 그대로 사용
 except Exception:
     def send_telegram(msg: str): print("[TG]", msg)
 
@@ -110,6 +107,24 @@ def enter_position(symbol: str, usdt_amount: float, side: str="long"):
 
     send_telegram(f"❌ ENTRY 최종 실패 {key}: 재시도 3회 모두 실패")
 
+def reduce_by_contracts(symbol: str, side: str, contracts: float):
+    """TV 원시 알림(contracts 포함)용: 지정 수량만큼 reduceOnly."""
+    symbol = convert_symbol(symbol)
+    if contracts <= 0:
+        send_telegram(f"⚠️ reduce_by_contracts 스킵: size<=0 {symbol}_{side}")
+        return
+    resp = place_reduce_by_size(symbol, contracts, side, leverage=LEVERAGE)
+    exit_price = get_last_price(symbol)
+    if resp.get("code")=="00000" and exit_price is not None:
+        p = _get_remote(symbol, side)  # 남은 포지션 확인(통계엔 근사만 기록)
+        entry_price = (p or {}).get("entry_price", exit_price)
+        notional = entry_price * contracts
+        pnl = _pnl_usdt(entry_price, exit_price, notional, side)
+        record_pnl(symbol, pnl)
+        send_telegram(f"🧮 PARTIAL (contracts) {side.upper()} {symbol}\n• Exit: {exit_price:.8f}\n• Size: {contracts}\n• Realized: {pnl:+.2f} USDT")
+    else:
+        send_telegram(f"❌ reduce_by_contracts 실패 {symbol}_{side}: {resp}")
+
 def take_partial_profit(symbol: str, pct: float, side: str="long"):
     symbol = convert_symbol(symbol)
     key=f"{symbol}_{side}"
@@ -130,11 +145,10 @@ def take_partial_profit(symbol: str, pct: float, side: str="long"):
         resp = place_reduce_by_size(symbol, cut_size, side, leverage=LEVERAGE)
         exit_price = get_last_price(symbol)
         if resp.get("code")=="00000" and exit_price is not None:
-            # 통계는 근사: entry*pct*size * (price diff / entry)
             notional = p["entry_price"] * cut_size
             pnl = _pnl_usdt(p["entry_price"], exit_price, notional, side)
             record_pnl(symbol, pnl)
-            send_telegram(f"🤑 TP(remote) {int(pct*100)}% {side.upper()} {symbol}\n• Exit: {exit_price:.8f}\n• Size: {cut_size}\n• Realized: {pnl:+.2f} USDT")
+            send_telegram(f"🤑 TP(remote) {int(pct*100)}% {side.UPPER()} {symbol}\n• Exit: {exit_price:.8f}\n• Size: {cut_size}\n• Realized: {pnl:+.2f} USDT")
         else:
             send_telegram(f"❌ TP(remote) 실패 {key}: {resp}")
         return
