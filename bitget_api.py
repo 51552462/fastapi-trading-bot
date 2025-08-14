@@ -7,6 +7,7 @@ API_KEY        = os.getenv("BITGET_API_KEY", "")
 API_SECRET     = os.getenv("BITGET_API_SECRET", "")
 API_PASSPHRASE = os.getenv("BITGET_API_PASSWORD", "")
 
+# ── auth/sign ───────────────────────────────────────────────────────────────
 def _ts() -> str:
     return str(int(time.time() * 1000))
 
@@ -28,6 +29,7 @@ def _headers(method: str, path_with_query: str, body: str = "") -> Dict[str, str
 
 # ── symbol normalize ─────────────────────────────────────────────────────────
 def convert_symbol(sym: str) -> str:
+    """예: btc/usdt_umcbl → BTCUSDT"""
     s = re.sub(r'[^A-Za-z0-9]', '', str(sym or "").upper())
     s = re.sub(r'(UMCBL|CMCBL|DMCBL)$', '', s)
     return s
@@ -68,8 +70,7 @@ def _refresh_symbols_cache():
         m = {}
         for it in data:
             sym = convert_symbol(it.get("symbol") or (it.get("baseCoin","")+it.get("quoteCoin","")))
-            if not sym:
-                continue
+            if not sym: continue
             min_qty = float(it.get("minTradeNum") or it.get("minTradeAmount") or 0)
             step    = float(it.get("sizeStep")    or it.get("lotSize")        or 0)
             m[sym]  = {"min_qty": min_qty, "step": step}
@@ -79,7 +80,7 @@ def _refresh_symbols_cache():
         print("⚠️ symbols cache refresh fail:", e)
 
 def get_symbol_spec(symbol: str):
-    if time.time() - _SYMBOLS_CACHE["ts"] > 600:
+    if time.time() - _SYMBOLS_CACHE["ts"] > 600:  # 10분 캐시
         _refresh_symbols_cache()
     return _SYMBOLS_CACHE["data"].get(convert_symbol(symbol), {"min_qty": 0.0, "step": 0.0})
 
@@ -91,6 +92,7 @@ def round_down_step(qty: float, step: float) -> float:
 
 # ── place orders ─────────────────────────────────────────────────────────────
 def place_market_order(symbol, usdt_amount, side, leverage=5, reduce_only=False):
+    """USDT 명목 금액으로 시장가 주문(side: buy/sell)"""
     symbol_conv = convert_symbol(symbol) + "_UMCBL"
     last = get_last_price(symbol)
     if not last:
@@ -121,6 +123,7 @@ def place_market_order(symbol, usdt_amount, side, leverage=5, reduce_only=False)
         return {"code": "LOCAL_EXCEPTION", "msg": str(e)}
 
 def place_reduce_by_size(symbol, size, pos_side, leverage=5):
+    """현재 거래소 수량(size) 기준 reduceOnly 시장가 청산"""
     symbol_conv = convert_symbol(symbol) + "_UMCBL"
     order_side = "sell_single" if pos_side == "long" else "buy_single"
     path = "/api/mix/v1/order/placeOrder"
@@ -142,7 +145,9 @@ def place_reduce_by_size(symbol, size, pos_side, leverage=5):
         print("❌ Bitget 예외:", e)
         return {"code": "LOCAL_EXCEPTION", "msg": str(e)}
 
-# ── positions (robust) ──────────────────────────────────────────────────────
+# ── positions (robust + 429 캐시/쿨다운) ────────────────────────────────────
+_POS_CACHE = {"data": [], "ts": 0.0, "cooldown_until": 0.0}
+
 def _fetch_positions(query: str) -> List[Dict]:
     path = "/api/mix/v1/position/allPosition"
     url  = f"{BASE_URL}{path}?{query}"
@@ -162,15 +167,17 @@ def _fetch_positions(query: str) -> List[Dict]:
         raw = raw.get("positions") or raw.get("list") or []
 
     out: List[Dict] = []
-    def _f(x): 
+    def _f(x):
         try: return float(x)
         except: return 0.0
 
     for pos in raw:
         sym  = convert_symbol(pos.get("symbol") or pos.get("instId") or "")
         side = (pos.get("holdSide") or pos.get("side") or pos.get("position") or "").lower()
-        size = _f(pos.get("total") or pos.get("available") or pos.get("holdAmount") or pos.get("availableAmount") or pos.get("size") or pos.get("contracts"))
-        entry= _f(pos.get("openAvgPrice") or pos.get("averageOpenPrice") or pos.get("avgOpenPrice") or pos.get("entryPrice") or pos.get("avgPrice"))
+        size = _f(pos.get("total") or pos.get("available") or pos.get("holdAmount")
+                  or pos.get("availableAmount") or pos.get("size") or pos.get("contracts"))
+        entry= _f(pos.get("openAvgPrice") or pos.get("averageOpenPrice") or pos.get("avgOpenPrice")
+                  or pos.get("entryPrice") or pos.get("avgPrice"))
         if sym and side in ("long", "short") and size>0 and entry>0:
             out.append({"symbol": sym, "side": side, "size": size, "entry_price": entry})
         for k in ("long","short"):
@@ -183,8 +190,23 @@ def _fetch_positions(query: str) -> List[Dict]:
     return out
 
 def get_open_positions() -> List[Dict]:
+    now = time.time()
+    if now < _POS_CACHE.get("cooldown_until", 0):
+        return _POS_CACHE["data"]
+
     merged = {}
     for q in ("productType=umcbl&marginCoin=USDT", "productType=umcbl"):
         for p in _fetch_positions(q):
             merged[f"{p['symbol']}_{p['side']}"] = p
-    return list(merged.values())
+
+    if merged:
+        out = list(merged.values())
+        _POS_CACHE["data"] = out
+        _POS_CACHE["ts"] = now
+        _POS_CACHE["cooldown_until"] = 0.0
+        return out
+
+    print("⚠️ get_open_positions: 사용 가능한 응답 없음 → 캐시 반환")
+    if _POS_CACHE["data"]:
+        _POS_CACHE["cooldown_until"] = now + 90  # 90초 쿨다운
+    return _POS_CACHE["data"]
