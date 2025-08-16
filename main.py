@@ -3,12 +3,7 @@ from collections import deque
 from typing import Dict, Any
 from fastapi import FastAPI, Request, BackgroundTasks
 
-from trader import (
-    enter_position,
-    take_partial_profit,
-    close_position,
-    reduce_by_contracts,
-)
+from trader import (enter_position,take_partial_profit,close_position,reduce_by_contracts,)
 from telegram_bot import send_telegram
 from bitget_api import convert_symbol, get_open_positions
 
@@ -56,11 +51,7 @@ def _handle_signal(data: Dict[str, Any]):
         return
 
     # 레거시 키 보정
-    legacy = {
-        "tp_1": "tp1", "tp_2": "tp2", "tp_3": "tp3",
-        "sl_1": "sl1", "sl_2": "sl2",
-        "ema_exit": "emaExit", "failcut": "failCut",
-    }
+    legacy = {"tp_1": "tp1", "tp_2": "tp2", "tp_3": "tp3","sl_1": "sl1", "sl_2": "sl2","ema_exit": "emaExit", "failcut": "failCut",}
     typ = legacy.get(typ.lower(), typ)
 
     if typ == "entry":
@@ -98,11 +89,7 @@ async def signal(req: Request, background_tasks: BackgroundTasks):
     _DEDUP[dk] = now
 
     # 2) 수신 로그
-    INGRESS_LOG.append({
-        "ts": now,
-        "ip": (req.client.host if req and req.client else "?"),
-        "data": data
-    })
+    INGRESS_LOG.append({"ts": now,"ip": (req.client.host if req and req.client else "?"),"data": data})
 
     # 3) 백그라운드 처리
     background_tasks.add_task(_handle_signal, data)
@@ -129,3 +116,4 @@ def on_startup():
         send_telegram("✅ FastAPI up (background handler ready)")
     except Exception:
         pass
+
