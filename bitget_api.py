@@ -1,5 +1,5 @@
-import os, time, json, hmac, hashlib, base64, requests, re, math
-from typing import List, Dict
+import os, time, json, hmac, hashlib, base64, requests, math
+from typing import Dict, List, Optional
 
 BASE_URL = "https://api.bitget.com"
 
@@ -7,159 +7,149 @@ API_KEY        = os.getenv("BITGET_API_KEY", "")
 API_SECRET     = os.getenv("BITGET_API_SECRET", "")
 API_PASSPHRASE = os.getenv("BITGET_API_PASSWORD", "")
 
-# ── auth/sign ───────────────────────────────────────────────────────────────
+# ── Auth (Bitget: HMAC-SHA256 → base64) ───────────────────────
 def _ts() -> str:
     return str(int(time.time() * 1000))
 
-def _sign(timestamp: str, method: str, path_with_query: str, body: str = "") -> str:
-    raw = timestamp + method.upper() + path_with_query + body
-    digest = hmac.new(API_SECRET.encode(), raw.encode(), hashlib.sha256).digest()
+def _sign(ts: str, method: str, path_with_query: str, body: str = "") -> str:
+    prehash = ts + method.upper() + path_with_query + body
+    digest  = hmac.new(API_SECRET.encode(), prehash.encode(), hashlib.sha256).digest()
     return base64.b64encode(digest).decode()
 
 def _headers(method: str, path_with_query: str, body: str = "") -> Dict[str, str]:
     ts = _ts()
-    return {
-        "ACCESS-KEY": API_KEY,
-        "ACCESS-SIGN": _sign(ts, method, path_with_query, body),
-        "ACCESS-TIMESTAMP": ts,
-        "ACCESS-PASSPHRASE": API_PASSPHRASE,
-        "Content-Type": "application/json",
-        "locale": "en-US",
-    }
+    return {"ACCESS-KEY": API_KEY,"ACCESS-SIGN": _sign(ts, method, path_with_query, body),"ACCESS-TIMESTAMP": ts,"ACCESS-PASSPHRASE": API_PASSPHRASE,"Content-Type": "application/json","locale": "en-US",}
 
-# ── symbol normalize ─────────────────────────────────────────────────────────
+# ── Symbol helpers ─────────────────────────────────────────────
 def convert_symbol(sym: str) -> str:
-    """예: btc/usdt_umcbl → BTCUSDT"""
-    s = re.sub(r'[^A-Za-z0-9]', '', str(sym or "").upper())
-    s = re.sub(r'(UMCBL|CMCBL|DMCBL)$', '', s)
+    s = (sym or "").upper().replace("/", "").replace("-", "").replace("_", "")
+    if s.endswith("PERP"):
+        s = s[:-4]
     return s
 
-# ── public ticker (retries) ─────────────────────────────────────────────────
-def _safe_last_price(symbol: str):
-    symbol_conv = convert_symbol(symbol) + "_UMCBL"
-    url = f"{BASE_URL}/api/mix/v1/market/ticker?symbol={symbol_conv}"
-    r = requests.get(url, timeout=10)
-    j = r.json()
-    if j and j.get("data") and "last" in j["data"]:
-        return float(j["data"]["last"])
-    return None
+def _mix_symbol(sym: str) -> str:
+    return f"{convert_symbol(sym)}_UMCBL"
 
-def get_last_price(symbol: str, retries: int = 3, sleep_base: float = 0.15):
-    last = None
+# ── Market: last price ────────────────────────────────────────
+def get_last_price(symbol: str, retries: int = 3, sleep_base: float = 0.15) -> Optional[float]:
+    url = f"{BASE_URL}/api/mix/v1/market/ticker?symbol={_mix_symbol(symbol)}"
     for i in range(retries):
         try:
-            last = _safe_last_price(symbol)
-            if last is not None:
-                return last
+            r = requests.get(url, timeout=10)
+            j = r.json()
+            if j and j.get("data") and j["data"].get("last") is not None:
+                return float(j["data"]["last"])
         except Exception:
             pass
         time.sleep(sleep_base * (2 ** i))
-    print(f"❌ Ticker 실패 {convert_symbol(symbol)}_UMCBL")
+    print(f"❌ Ticker 실패: {_mix_symbol(symbol)}")
     return None
 
-# ── symbol spec cache (minQty/step) ─────────────────────────────────────────
-_SYMBOLS_CACHE = {"ts": 0, "data": {}}
+# ── Symbol spec cache (sizeStep / minQty) ─────────────────────
+_SYMBOLS_CACHE = {"ts": 0.0, "data": {}}
 
 def _refresh_symbols_cache():
     path = "/api/mix/v1/public/symbols"
-    url  = f"{BASE_URL}{path}?productType=umcbl"
+    q    = "productType=umcbl"
     try:
-        r = requests.get(url, headers=_headers("GET", f"{path}?productType=umcbl", ""), timeout=10)
+        r = requests.get(f"{BASE_URL}{path}?{q}", headers=_headers("GET", f"{path}?{q}", ""), timeout=12)
         j = r.json()
-        data = j.get("data") or []
+        arr = j.get("data") or []
         m = {}
-        for it in data:
-            sym = convert_symbol(it.get("symbol") or (it.get("baseCoin","")+it.get("quoteCoin","")))
-            if not sym: continue
-            min_qty = float(it.get("minTradeNum") or it.get("minTradeAmount") or 0)
-            step    = float(it.get("sizeStep")    or it.get("lotSize")        or 0)
-            m[sym]  = {"min_qty": min_qty, "step": step}
-        _SYMBOLS_CACHE["ts"] = time.time()
+        for it in arr:
+            sym_full = (it.get("symbol") or "")
+            if not sym_full.endswith("_UMCBL"):
+                continue
+            sym_core   = sym_full.replace("_UMCBL", "")
+            size_scale = int(it.get("sizeScale") or 0)
+            size_step  = 10 ** (-size_scale) if size_scale >= 0 else 0.001
+            min_qty    = float(it.get("minTradeNum") or it.get("minOrderSize") or 0.0)
+            m[sym_core] = {"sizeStep": size_step, "minQty": min_qty}
         _SYMBOLS_CACHE["data"] = m
+        _SYMBOLS_CACHE["ts"]   = time.time()
     except Exception as e:
-        print("⚠️ symbols cache refresh fail:", e)
+        print("❌ 심볼 캐시 갱신 실패:", e)
 
-def get_symbol_spec(symbol: str):
-    if time.time() - _SYMBOLS_CACHE["ts"] > 600:  # 10분 캐시
+def get_symbol_spec(symbol: str) -> Dict[str, float]:
+    now = time.time()
+    if now - _SYMBOLS_CACHE["ts"] > 600 or not _SYMBOLS_CACHE["data"]:
         _refresh_symbols_cache()
-    return _SYMBOLS_CACHE["data"].get(convert_symbol(symbol), {"min_qty": 0.0, "step": 0.0})
+    sym  = convert_symbol(symbol)
+    spec = _SYMBOLS_CACHE["data"].get(sym)
+    if not spec:
+        spec = {"sizeStep": 0.001, "minQty": 0.001}
+        _SYMBOLS_CACHE["data"][sym] = spec
+    return spec
 
 def round_down_step(qty: float, step: float) -> float:
-    if not step or step <= 0:
+    if step <= 0:
         return round(qty, 6)
     k = math.floor(qty / step)
     return round(k * step, 6)
 
-# ── place orders ─────────────────────────────────────────────────────────────
-def place_market_order(symbol, usdt_amount, side, leverage=5, reduce_only=False):
-    """USDT 명목 금액으로 시장가 주문(side: buy/sell)"""
-    symbol_conv = convert_symbol(symbol) + "_UMCBL"
+# ── Orders ────────────────────────────────────────────────────
+def place_market_order(symbol: str, usdt_amount: float, side: str, leverage: float = 5, reduce_only: bool = False) -> Dict:
+    """usdt_amount → 시장가 수량 환산 후 주문. side='buy'|'sell'"""
     last = get_last_price(symbol)
     if not last:
         return {"code": "LOCAL_TICKER_FAIL", "msg": "ticker_none"}
 
     spec = get_symbol_spec(symbol)
-    qty  = round_down_step(usdt_amount / last, float(spec.get("step", 0.0)))
+    qty  = round_down_step(usdt_amount / last, float(spec.get("sizeStep", 0.001)))
     if qty <= 0:
         return {"code": "LOCAL_BAD_QTY", "msg": f"qty {qty}"}
+    if qty < float(spec.get("minQty", 0.0)):
+        need = float(spec.get("minQty")) * last
+        return {"code": "LOCAL_MIN_QTY", "msg": f"need≈{need:.6f}USDT", "qty": qty}
 
     path = "/api/mix/v1/order/placeOrder"
-    body = {
-        "symbol":     symbol_conv,
-        "marginCoin": "USDT",
-        "size":       str(qty),
-        "side":       "buy_single" if side == "buy" else "sell_single",
-        "orderType":  "market",
-        "leverage":   str(leverage),
-        "reduceOnly": bool(reduce_only),
-    }
+    body = {"symbol":     _mix_symbol(symbol),"marginCoin": "USDT","size":       str(qty),"side":       "buy_single" if side == "buy" else "sell_single","orderType":  "market","leverage":   str(leverage),"reduceOnly": bool(reduce_only),}
     bj = json.dumps(body)
     try:
         res = requests.post(BASE_URL + path, headers=_headers("POST", path, bj), data=bj, timeout=15)
-        print(f"📥 Bitget 응답 {res.status_code}: {res.text}")
+        if res.status_code != 200:
+            return {"code": f"HTTP_{res.status_code}", "msg": res.text}
         return res.json()
     except Exception as e:
-        print("❌ Bitget 예외:", e)
         return {"code": "LOCAL_EXCEPTION", "msg": str(e)}
 
-def place_reduce_by_size(symbol, size, pos_side, leverage=5):
-    """현재 거래소 수량(size) 기준 reduceOnly 시장가 청산"""
-    symbol_conv = convert_symbol(symbol) + "_UMCBL"
-    order_side = "sell_single" if pos_side == "long" else "buy_single"
+def place_reduce_by_size(symbol: str, size: float, side: str) -> Dict:
+    """size 계약 수량을 reduceOnly 시장가로 청산. side='long'→sell_single, 'short'→buy_single"""
+    size = float(size)
+    if size <= 0:
+        return {"code": "LOCAL_BAD_QTY", "msg": "size<=0"}
+
+    step = float(get_symbol_spec(symbol).get("sizeStep", 0.001))
+    size = round_down_step(size, step)
+    if size <= 0:
+        return {"code": "LOCAL_STEP_ZERO", "msg": "after_step=0"}
+
     path = "/api/mix/v1/order/placeOrder"
-    body = {
-        "symbol":     symbol_conv,
-        "marginCoin": "USDT",
-        "size":       str(size),
-        "side":       order_side,
-        "orderType":  "market",
-        "leverage":   str(leverage),
-        "reduceOnly": True,
-    }
+    body = {"symbol":     _mix_symbol(symbol),"marginCoin": "USDT","size":       str(size),"side":       "sell_single" if side.lower() == "long" else "buy_single","orderType":  "market","reduceOnly": True,}
     bj = json.dumps(body)
     try:
         res = requests.post(BASE_URL + path, headers=_headers("POST", path, bj), data=bj, timeout=15)
-        print(f"📥 Bitget 응답 {res.status_code}: {res.text}")
+        if res.status_code != 200:
+            return {"code": f"HTTP_{res.status_code}", "msg": res.text}
         return res.json()
     except Exception as e:
-        print("❌ Bitget 예외:", e)
         return {"code": "LOCAL_EXCEPTION", "msg": str(e)}
 
-# ── positions (robust + 429 캐시/쿨다운) ────────────────────────────────────
+# ── Positions ────────────────────────────────────────────────
 _POS_CACHE = {"data": [], "ts": 0.0, "cooldown_until": 0.0}
 
-def _fetch_positions(query: str) -> List[Dict]:
+def _fetch_positions() -> List[Dict]:
     path = "/api/mix/v1/position/allPosition"
-    url  = f"{BASE_URL}{path}?{query}"
+    q    = "productType=umcbl"
     try:
-        res = requests.get(url, headers=_headers("GET", f"{path}?{query}", ""), timeout=10)
+        res = requests.get(f"{BASE_URL}{path}?{q}", headers=_headers("GET", f"{path}?{q}", ""), timeout=12)
         j = res.json()
     except Exception as e:
-        print("❌ get_open_positions 예외:", e)
+        print("❌ position fetch 예외:", e)
         return []
 
     if not j or j.get("code") not in ("00000", "0"):
-        print(f"❌ get_open_positions 응답 이상: {j}")
+        print("❌ position 응답 이상:", j)
         return []
 
     raw = j.get("data") or []
@@ -167,46 +157,34 @@ def _fetch_positions(query: str) -> List[Dict]:
         raw = raw.get("positions") or raw.get("list") or []
 
     out: List[Dict] = []
-    def _f(x):
+    def ffloat(x):
         try: return float(x)
         except: return 0.0
 
-    for pos in raw:
-        sym  = convert_symbol(pos.get("symbol") or pos.get("instId") or "")
-        side = (pos.get("holdSide") or pos.get("side") or pos.get("position") or "").lower()
-        size = _f(pos.get("total") or pos.get("available") or pos.get("holdAmount")
-                  or pos.get("availableAmount") or pos.get("size") or pos.get("contracts"))
-        entry= _f(pos.get("openAvgPrice") or pos.get("averageOpenPrice") or pos.get("avgOpenPrice")
-                  or pos.get("entryPrice") or pos.get("avgPrice"))
-        if sym and side in ("long", "short") and size>0 and entry>0:
-            out.append({"symbol": sym, "side": side, "size": size, "entry_price": entry})
-        for k in ("long","short"):
-            if isinstance(pos.get(k), dict):
-                sub=pos[k]
-                s=_f(sub.get("total") or sub.get("available") or sub.get("size") or sub.get("contracts"))
-                e=_f(sub.get("openAvgPrice") or sub.get("averageOpenPrice") or sub.get("avgOpenPrice") or sub.get("entryPrice") or entry)
-                if sym and s>0 and e>0:
-                    out.append({"symbol": sym, "side": k, "size": s, "entry_price": e})
+    for it in raw:
+        sym_full = it.get("symbol") or ""
+        if not sym_full.endswith("_UMCBL"):
+            continue
+        sym_core = sym_full.replace("_UMCBL", "")
+        hold     = (it.get("holdSide") or it.get("side") or "").lower()  # long | short
+        sz       = ffloat(it.get("total") or it.get("available") or it.get("size"))
+        avg      = ffloat(it.get("averageOpenPrice") or it.get("avgOpenPrice") or it.get("entryPrice"))
+        if sz > 0 and hold in ("long", "short"):
+            out.append({"symbol": sym_core, "side": hold, "size": sz, "entry_price": avg})
     return out
 
 def get_open_positions() -> List[Dict]:
     now = time.time()
-    if now < _POS_CACHE.get("cooldown_until", 0):
+    if now < _POS_CACHE["cooldown_until"] and _POS_CACHE["data"]:
         return _POS_CACHE["data"]
-
-    merged = {}
-    for q in ("productType=umcbl&marginCoin=USDT", "productType=umcbl"):
-        for p in _fetch_positions(q):
-            merged[f"{p['symbol']}_{p['side']}"] = p
-
-    if merged:
-        out = list(merged.values())
-        _POS_CACHE["data"] = out
+    res = _fetch_positions()
+    if res:
+        _POS_CACHE["data"] = res
         _POS_CACHE["ts"] = now
         _POS_CACHE["cooldown_until"] = 0.0
-        return out
-
-    print("⚠️ get_open_positions: 사용 가능한 응답 없음 → 캐시 반환")
+        return res
+    # 실패 시 캐시 반환 + 쿨다운
     if _POS_CACHE["data"]:
-        _POS_CACHE["cooldown_until"] = now + 90  # 90초 쿨다운
+        _POS_CACHE["cooldown_until"] = now + 90
+        print("⚠️ position 새 조회 실패 → 캐시 반환(90s 쿨다운)")
     return _POS_CACHE["data"]
