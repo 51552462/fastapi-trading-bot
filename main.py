@@ -5,21 +5,19 @@ from fastapi import FastAPI, Request
 
 from trader import (
     enter_position, take_partial_profit, close_position, reduce_by_contracts,
-    start_watchdogs, start_reconciler
+    start_watchdogs, start_reconciler, get_pending_snapshot
 )
 from telegram_bot import send_telegram
 from bitget_api import convert_symbol, get_open_positions
 
-# ── Config ─────────────────────────────────────────────────────
 DEFAULT_AMOUNT = float(os.getenv("DEFAULT_AMOUNT", "15"))
 LEVERAGE       = float(os.getenv("LEVERAGE", "5"))
-DEDUP_TTL      = float(os.getenv("DEDUP_TTL", "15"))   # payload 해시 TTL
-BIZDEDUP_TTL   = float(os.getenv("BIZDEDUP_TTL", "3")) # type:symbol:side TTL
+DEDUP_TTL      = float(os.getenv("DEDUP_TTL", "15"))
+BIZDEDUP_TTL   = float(os.getenv("BIZDEDUP_TTL", "3"))
 
 WORKERS        = int(os.getenv("WORKERS", "6"))
 QUEUE_MAX      = int(os.getenv("QUEUE_MAX", "2000"))
 
-# ── App/Infra ──────────────────────────────────────────────────
 app = FastAPI()
 
 INGRESS_LOG: deque = deque(maxlen=200)
@@ -36,14 +34,11 @@ def _biz_key(typ: str, symbol: str, side: str) -> str:
 
 def _infer_side(side: str, default: str = "long") -> str:
     s = (side or "").strip().lower()
-    if s in ("long", "short"):
-        return s
-    return default
+    return s if s in ("long", "short") else default
 
 def _norm_symbol(sym: str) -> str:
     return convert_symbol(sym)
 
-# ── Core handler ───────────────────────────────────────────────
 def _handle_signal(data: Dict[str, Any]):
     typ    = (data.get("type") or "").strip()
     symbol = _norm_symbol(data.get("symbol", ""))
@@ -56,7 +51,6 @@ def _handle_signal(data: Dict[str, Any]):
         send_telegram("⚠️ symbol 없음: " + json.dumps(data))
         return
 
-    # 레거시 키 보정
     legacy = {
         "tp_1": "tp1", "tp_2": "tp2", "tp_3": "tp3",
         "sl_1": "sl1", "sl_2": "sl2",
@@ -64,7 +58,6 @@ def _handle_signal(data: Dict[str, Any]):
     }
     typ = legacy.get(typ.lower(), typ)
 
-    # 업무 키 중복 제거 (짧은 TTL)
     now = time.time()
     bk = _biz_key(typ, symbol, side)
     tprev = _BIZDEDUP.get(bk, 0.0)
@@ -107,7 +100,6 @@ def _worker_loop(idx: int):
         finally:
             _task_q.task_done()
 
-# ── Endpoints ──────────────────────────────────────────────────
 @app.post("/signal")
 async def signal(req: Request):
     data = await req.json()
@@ -156,13 +148,15 @@ def config():
         "WORKERS": WORKERS, "QUEUE_MAX": QUEUE_MAX,
     }
 
+@app.get("/pending")
+def pending():
+    return get_pending_snapshot()
+
 @app.on_event("startup")
 def on_startup():
-    # 워커 시작
     for i in range(WORKERS):
         t = threading.Thread(target=_worker_loop, args=(i,), daemon=True, name=f"signal-worker-{i}")
         t.start()
-    # 긴급 스탑 워치독 + 1분 리컨실러 시작
     start_watchdogs()
     start_reconciler()
     try:
