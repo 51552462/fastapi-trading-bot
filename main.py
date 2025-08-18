@@ -1,31 +1,38 @@
-import os, time, json, hashlib
+import os, time, json, hashlib, threading, queue
 from collections import deque
 from typing import Dict, Any
-from fastapi import FastAPI, Request, BackgroundTasks
+from fastapi import FastAPI, Request
 
-from trader import (enter_position,take_partial_profit,close_position,reduce_by_contracts,)
+from trader import (
+    enter_position, take_partial_profit, close_position, reduce_by_contracts,
+    start_watchdogs, start_reconciler
+)
 from telegram_bot import send_telegram
 from bitget_api import convert_symbol, get_open_positions
 
 # ── Config ─────────────────────────────────────────────────────
 DEFAULT_AMOUNT = float(os.getenv("DEFAULT_AMOUNT", "15"))
 LEVERAGE       = float(os.getenv("LEVERAGE", "5"))
-DEDUP_TTL      = float(os.getenv("DEDUP_TTL", "15"))  # seconds
-TP1_PCT        = float(os.getenv("TP1_PCT", "0.30"))
-TP2_PCT        = float(os.getenv("TP2_PCT", "0.40"))
-TP3_PCT        = float(os.getenv("TP3_PCT", "0.30"))
+DEDUP_TTL      = float(os.getenv("DEDUP_TTL", "15"))   # payload 해시 TTL
+BIZDEDUP_TTL   = float(os.getenv("BIZDEDUP_TTL", "3")) # type:symbol:side TTL
+
+WORKERS        = int(os.getenv("WORKERS", "6"))
+QUEUE_MAX      = int(os.getenv("QUEUE_MAX", "2000"))
 
 # ── App/Infra ──────────────────────────────────────────────────
 app = FastAPI()
 
-INGRESS_LOG: deque = deque(maxlen=200)   # 최근 수신 로그
-_DEDUP: Dict[str, float] = {}            # payload 해시 → ts
+INGRESS_LOG: deque = deque(maxlen=200)
+_DEDUP: Dict[str, float] = {}
+_BIZDEDUP: Dict[str, float] = {}
 
+_task_q: "queue.Queue[Dict[str, Any]]" = queue.Queue(maxsize=QUEUE_MAX)
 
 def _dedup_key(d: Dict[str, Any]) -> str:
-    # JSON 정규화 후 해시
     return hashlib.sha1(json.dumps(d, sort_keys=True).encode()).hexdigest()
 
+def _biz_key(typ: str, symbol: str, side: str) -> str:
+    return f"{typ}:{symbol}:{side}"
 
 def _infer_side(side: str, default: str = "long") -> str:
     s = (side or "").strip().lower()
@@ -33,11 +40,10 @@ def _infer_side(side: str, default: str = "long") -> str:
         return s
     return default
 
-
 def _norm_symbol(sym: str) -> str:
     return convert_symbol(sym)
 
-# ── Core handler (백그라운드 실행) ─────────────────────────────
+# ── Core handler ───────────────────────────────────────────────
 def _handle_signal(data: Dict[str, Any]):
     typ    = (data.get("type") or "").strip()
     symbol = _norm_symbol(data.get("symbol", ""))
@@ -51,14 +57,28 @@ def _handle_signal(data: Dict[str, Any]):
         return
 
     # 레거시 키 보정
-    legacy = {"tp_1": "tp1", "tp_2": "tp2", "tp_3": "tp3","sl_1": "sl1", "sl_2": "sl2","ema_exit": "emaExit", "failcut": "failCut",}
+    legacy = {
+        "tp_1": "tp1", "tp_2": "tp2", "tp_3": "tp3",
+        "sl_1": "sl1", "sl_2": "sl2",
+        "ema_exit": "emaExit", "failcut": "failCut",
+    }
     typ = legacy.get(typ.lower(), typ)
+
+    # 업무 키 중복 제거 (짧은 TTL)
+    now = time.time()
+    bk = _biz_key(typ, symbol, side)
+    tprev = _BIZDEDUP.get(bk, 0.0)
+    if now - tprev < BIZDEDUP_TTL:
+        return
+    _BIZDEDUP[bk] = now
 
     if typ == "entry":
         enter_position(symbol, amount, side=side, leverage=leverage); return
 
     if typ in ("tp1", "tp2", "tp3"):
-        pct = TP1_PCT if typ == "tp1" else TP2_PCT if typ == "tp2" else TP3_PCT
+        pct = float(os.getenv("TP1_PCT", "0.30")) if typ == "tp1" else \
+              float(os.getenv("TP2_PCT", "0.40")) if typ == "tp2" else \
+              float(os.getenv("TP3_PCT", "0.30"))
         take_partial_profit(symbol, pct, side=side); return
 
     if typ in ("sl1", "sl2", "failCut", "emaExit", "liquidation", "fullExit", "close", "exit"):
@@ -70,50 +90,82 @@ def _handle_signal(data: Dict[str, Any]):
             reduce_by_contracts(symbol, contracts, side=side)
         return
 
-    # 주문이 아닌 정보성 알림은 무시
     if typ in ("tailTouch", "info", "debug"):
         return
 
     send_telegram("❓ 알 수 없는 신호: " + json.dumps(data))
 
+def _worker_loop(idx: int):
+    while True:
+        try:
+            data = _task_q.get()
+            if data is None:
+                continue
+            _handle_signal(data)
+        except Exception as e:
+            print(f"[worker-{idx}] error:", e)
+        finally:
+            _task_q.task_done()
+
 # ── Endpoints ──────────────────────────────────────────────────
 @app.post("/signal")
-async def signal(req: Request, background_tasks: BackgroundTasks):
+async def signal(req: Request):
     data = await req.json()
     now  = time.time()
 
-    # 1) Dedup within TTL
     dk = _dedup_key(data)
     if dk in _DEDUP and now - _DEDUP[dk] < DEDUP_TTL:
         return {"ok": True, "dedup": True}
     _DEDUP[dk] = now
 
-    # 2) 수신 로그
-    INGRESS_LOG.append({"ts": now,"ip": (req.client.host if req and req.client else "?"),"data": data})
+    INGRESS_LOG.append({
+        "ts": now,
+        "ip": (req.client.host if req and req.client else "?"),
+        "data": data
+    })
 
-    # 3) 백그라운드 처리
-    background_tasks.add_task(_handle_signal, data)
+    try:
+        _task_q.put_nowait(data)
+    except queue.Full:
+        send_telegram("⚠️ queue full → drop signal: " + json.dumps(data))
+        return {"ok": False, "queued": False, "reason": "queue_full"}
 
-    # 4) 즉시 ACK
-    return {"ok": True, "queued": True}
+    return {"ok": True, "queued": True, "qsize": _task_q.qsize()}
 
 @app.get("/health")
 def health():
-    return {"ok": True, "ingress": len(INGRESS_LOG)}
+    return {"ok": True, "ingress": len(INGRESS_LOG), "queue": _task_q.qsize(), "workers": WORKERS}
 
 @app.get("/ingress")
 def ingress():
-    # 최근 30건만 노출
     return list(INGRESS_LOG)[-30:]
 
 @app.get("/positions")
 def positions():
     return {"positions": get_open_positions()}
 
+@app.get("/queue")
+def queue_size():
+    return {"size": _task_q.qsize(), "max": QUEUE_MAX}
+
+@app.get("/config")
+def config():
+    return {
+        "DEFAULT_AMOUNT": DEFAULT_AMOUNT, "LEVERAGE": LEVERAGE,
+        "DEDUP_TTL": DEDUP_TTL, "BIZDEDUP_TTL": BIZDEDUP_TTL,
+        "WORKERS": WORKERS, "QUEUE_MAX": QUEUE_MAX,
+    }
+
 @app.on_event("startup")
 def on_startup():
+    # 워커 시작
+    for i in range(WORKERS):
+        t = threading.Thread(target=_worker_loop, args=(i,), daemon=True, name=f"signal-worker-{i}")
+        t.start()
+    # 긴급 스탑 워치독 + 1분 리컨실러 시작
+    start_watchdogs()
+    start_reconciler()
     try:
-        send_telegram("✅ FastAPI up (background handler ready)")
+        send_telegram("✅ FastAPI up (workers + watchdog + reconciler)")
     except Exception:
         pass
-
