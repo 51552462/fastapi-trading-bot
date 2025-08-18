@@ -1,3 +1,4 @@
+# trader.py
 import os, time, threading
 from typing import Dict, Optional
 
@@ -262,6 +263,24 @@ def close_position(symbol: str, side: str = "long", reason: str = "manual"):
                 f"• Exit: {exit_price}\n• Size: {size}\n• Realized≈ {realized:+.2f} USDT"
             )
         # 실패는 리컨실러에서 재시도
+
+def reduce_by_contracts(symbol: str, contracts: float, side: str = "long"):
+    """고정 계약수만큼 reduceOnly 시장가로 즉시 감축."""
+    symbol = convert_symbol(symbol)
+    side   = (side or "long").lower()
+    key    = _key(symbol, side)
+
+    with _lock_for(key):
+        step = float(get_symbol_spec(symbol).get("sizeStep", 0.001))
+        qty  = round_down_step(float(contracts), step)
+        if qty <= 0:
+            send_telegram(f"⚠️ reduceByContracts 스킵: step 미달 {key}")
+            return
+        resp = place_reduce_by_size(symbol, qty, side)
+        if str(resp.get("code", "")) == "00000":
+            send_telegram(f"🔻 Reduce {qty} {side.upper()} {symbol}")
+        else:
+            send_telegram(f"❌ Reduce 실패 {key} → {resp}")
 
 # ── Emergency watchdog (PnL 손실률 기준 -10%) ────────────────
 def _watchdog_loop():
