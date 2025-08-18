@@ -7,6 +7,16 @@ API_KEY        = os.getenv("BITGET_API_KEY", "")
 API_SECRET     = os.getenv("BITGET_API_SECRET", "")
 API_PASSPHRASE = os.getenv("BITGET_API_PASSWORD", "")
 
+# ── Simple rate-limit guard (best-effort) ─────────────────────
+_last_call = {}
+def _rl(key: str, min_interval: float = 0.08):
+    now = time.time()
+    prev = _last_call.get(key, 0.0)
+    wait = min_interval - (now - prev)
+    if wait > 0:
+        time.sleep(wait)
+    _last_call[key] = time.time()
+
 # ── Auth (Bitget: HMAC-SHA256 → base64) ───────────────────────
 def _ts() -> str:
     return str(int(time.time() * 1000))
@@ -18,7 +28,14 @@ def _sign(ts: str, method: str, path_with_query: str, body: str = "") -> str:
 
 def _headers(method: str, path_with_query: str, body: str = "") -> Dict[str, str]:
     ts = _ts()
-    return {"ACCESS-KEY": API_KEY,"ACCESS-SIGN": _sign(ts, method, path_with_query, body),"ACCESS-TIMESTAMP": ts,"ACCESS-PASSPHRASE": API_PASSPHRASE,"Content-Type": "application/json","locale": "en-US",}
+    return {
+        "ACCESS-KEY": API_KEY,
+        "ACCESS-SIGN": _sign(ts, method, path_with_query, body),
+        "ACCESS-TIMESTAMP": ts,
+        "ACCESS-PASSPHRASE": API_PASSPHRASE,
+        "Content-Type": "application/json",
+        "locale": "en-US",
+    }
 
 # ── Symbol helpers ─────────────────────────────────────────────
 def convert_symbol(sym: str) -> str:
@@ -35,6 +52,7 @@ def get_last_price(symbol: str, retries: int = 3, sleep_base: float = 0.15) -> O
     url = f"{BASE_URL}/api/mix/v1/market/ticker?symbol={_mix_symbol(symbol)}"
     for i in range(retries):
         try:
+            _rl("ticker", 0.06)
             r = requests.get(url, timeout=10)
             j = r.json()
             if j and j.get("data") and j["data"].get("last") is not None:
@@ -52,6 +70,7 @@ def _refresh_symbols_cache():
     path = "/api/mix/v1/public/symbols"
     q    = "productType=umcbl"
     try:
+        _rl("symbols", 0.15)
         r = requests.get(f"{BASE_URL}{path}?{q}", headers=_headers("GET", f"{path}?{q}", ""), timeout=12)
         j = r.json()
         arr = j.get("data") or []
@@ -103,9 +122,18 @@ def place_market_order(symbol: str, usdt_amount: float, side: str, leverage: flo
         return {"code": "LOCAL_MIN_QTY", "msg": f"need≈{need:.6f}USDT", "qty": qty}
 
     path = "/api/mix/v1/order/placeOrder"
-    body = {"symbol":     _mix_symbol(symbol),"marginCoin": "USDT","size":       str(qty),"side":       "buy_single" if side == "buy" else "sell_single","orderType":  "market","leverage":   str(leverage),"reduceOnly": bool(reduce_only),}
+    body = {
+        "symbol":     _mix_symbol(symbol),
+        "marginCoin": "USDT",
+        "size":       str(qty),
+        "side":       "buy_single" if side == "buy" else "sell_single",
+        "orderType":  "market",
+        "leverage":   str(leverage),
+        "reduceOnly": bool(reduce_only),
+    }
     bj = json.dumps(body)
     try:
+        _rl("order", 0.12)
         res = requests.post(BASE_URL + path, headers=_headers("POST", path, bj), data=bj, timeout=15)
         if res.status_code != 200:
             return {"code": f"HTTP_{res.status_code}", "msg": res.text}
@@ -125,9 +153,17 @@ def place_reduce_by_size(symbol: str, size: float, side: str) -> Dict:
         return {"code": "LOCAL_STEP_ZERO", "msg": "after_step=0"}
 
     path = "/api/mix/v1/order/placeOrder"
-    body = {"symbol":     _mix_symbol(symbol),"marginCoin": "USDT","size":       str(size),"side":       "sell_single" if side.lower() == "long" else "buy_single","orderType":  "market","reduceOnly": True,}
+    body = {
+        "symbol":     _mix_symbol(symbol),
+        "marginCoin": "USDT",
+        "size":       str(size),
+        "side":       "sell_single" if side.lower() == "long" else "buy_single",
+        "orderType":  "market",
+        "reduceOnly": True,
+    }
     bj = json.dumps(body)
     try:
+        _rl("order", 0.12)
         res = requests.post(BASE_URL + path, headers=_headers("POST", path, bj), data=bj, timeout=15)
         if res.status_code != 200:
             return {"code": f"HTTP_{res.status_code}", "msg": res.text}
@@ -142,6 +178,7 @@ def _fetch_positions() -> List[Dict]:
     path = "/api/mix/v1/position/allPosition"
     q    = "productType=umcbl"
     try:
+        _rl("positions", 0.10)
         res = requests.get(f"{BASE_URL}{path}?{q}", headers=_headers("GET", f"{path}?{q}", ""), timeout=12)
         j = res.json()
     except Exception as e:
