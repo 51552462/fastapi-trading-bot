@@ -1,4 +1,5 @@
-import os, time, json, hmac, hashlib, base64, requests, math
+# bitget_api.py
+import os, time, json, hmac, hashlib, base64, requests, math, random
 from typing import Dict, List, Optional
 
 BASE_URL = "https://api.bitget.com"
@@ -37,30 +38,88 @@ def _headers(method: str, path_with_query: str, body: str = "") -> Dict[str, str
         "locale": "en-US",
     }
 
+# ── Optional symbol aliases (TradingView ↔ Bitget 선물 심볼 불일치 보정) ──
+ALIASES: Dict[str, str] = {
+    # 예시) "KAIAUSDT": "KLAYUSDT",
+}
+
 # ── Symbol helpers ─────────────────────────────────────────────
 def convert_symbol(sym: str) -> str:
     s = (sym or "").upper().replace("/", "").replace("-", "").replace("_", "")
     if s.endswith("PERP"):
         s = s[:-4]
-    return s
+    return ALIASES.get(s, s)
 
 def _mix_symbol(sym: str) -> str:
     return f"{convert_symbol(sym)}_UMCBL"
 
-# ── Market: last price ────────────────────────────────────────
-def get_last_price(symbol: str, retries: int = 3, sleep_base: float = 0.15) -> Optional[float]:
-    url = f"{BASE_URL}/api/mix/v1/market/ticker?symbol={_mix_symbol(symbol)}"
+# ── Ticker cache & fallbacks ──────────────────────────────────
+_TICKER_CACHE: Dict[str, tuple] = {}  # { "BTCUSDT": (ts, price) }
+TICKER_TTL   = float(os.getenv("TICKER_TTL", "2.5"))            # seconds
+STRICT_TICKER = os.getenv("STRICT_TICKER", "0") == "1"          # 1 → 폴백 금지
+
+def _depth_midprice(symbol: str) -> Optional[float]:
+    """ticker 비거나 에러일 때 오더북 최우선 호가로 미드프라이스 산출."""
+    path = "/api/mix/v1/market/depth"
+    q = f"symbol={_mix_symbol(symbol)}&limit=5"
+    try:
+        _rl("depth", 0.08)
+        r = requests.get(f"{BASE_URL}{path}?{q}", timeout=10)
+        j = r.json()
+        d = j.get("data") or {}
+        asks = d.get("asks") or d.get("ask") or []
+        bids = d.get("bids") or d.get("bid") or []
+        if asks and bids:
+            best_ask = float(asks[0][0])
+            best_bid = float(bids[0][0])
+            if best_ask > 0 and best_bid > 0:
+                return (best_ask + best_bid) / 2.0
+    except Exception:
+        pass
+    return None
+
+def get_last_price(symbol: str, retries: int = 6, sleep_base: float = 0.20) -> Optional[float]:
+    """USDT-M 선물(UMCBL) last 가격. 실패 시: 오더북 미드프라이스 → 캐시 폴백(엄격모드 해제 시)"""
+    sym = convert_symbol(symbol)
+
+    # 1) 캐시 히트
+    c = _TICKER_CACHE.get(sym)
+    now = time.time()
+    if c and now - c[0] <= TICKER_TTL:
+        return float(c[1])
+
+    url = f"{BASE_URL}/api/mix/v1/market/ticker?symbol={_mix_symbol(sym)}"
+
     for i in range(retries):
         try:
             _rl("ticker", 0.06)
             r = requests.get(url, timeout=10)
+            if r.status_code != 200:
+                time.sleep(sleep_base * (2 ** i) + random.uniform(0, 0.1))
+                continue
             j = r.json()
-            if j and j.get("data") and j["data"].get("last") is not None:
-                return float(j["data"]["last"])
+            data = j.get("data")
+            if data and data.get("last") is not None:
+                px = float(data["last"])
+                if px > 0:
+                    _TICKER_CACHE[sym] = (time.time(), px)
+                    return px
+            # ticker 비면 오더북 미드프라이스 폴백
+            alt = _depth_midprice(sym)
+            if alt and alt > 0:
+                _TICKER_CACHE[sym] = (time.time(), alt)
+                return alt
         except Exception:
             pass
-        time.sleep(sleep_base * (2 ** i))
-    print(f"❌ Ticker 실패: {_mix_symbol(symbol)}")
+        time.sleep(sleep_base * (2 ** i) + random.uniform(0, 0.1))
+
+    # 2) 최종 실패 → 캐시 폴백(엄격모드가 아니면)
+    if not STRICT_TICKER:
+        c = _TICKER_CACHE.get(sym)
+        if c:
+            return float(c[1])
+
+    print(f"❌ Ticker 실패(최종): {_mix_symbol(sym)}")
     return None
 
 # ── Symbol spec cache (sizeStep / minQty) ─────────────────────
@@ -174,6 +233,10 @@ def place_reduce_by_size(symbol: str, size: float, side: str) -> Dict:
 # ── Positions ────────────────────────────────────────────────
 _POS_CACHE = {"data": [], "ts": 0.0, "cooldown_until": 0.0}
 
+def _ffloat(x):
+    try: return float(x)
+    except: return 0.0
+
 def _fetch_positions() -> List[Dict]:
     path = "/api/mix/v1/position/allPosition"
     q    = "productType=umcbl"
@@ -194,18 +257,14 @@ def _fetch_positions() -> List[Dict]:
         raw = raw.get("positions") or raw.get("list") or []
 
     out: List[Dict] = []
-    def ffloat(x):
-        try: return float(x)
-        except: return 0.0
-
     for it in raw:
         sym_full = it.get("symbol") or ""
         if not sym_full.endswith("_UMCBL"):
             continue
         sym_core = sym_full.replace("_UMCBL", "")
         hold     = (it.get("holdSide") or it.get("side") or "").lower()  # long | short
-        sz       = ffloat(it.get("total") or it.get("available") or it.get("size"))
-        avg      = ffloat(it.get("averageOpenPrice") or it.get("avgOpenPrice") or it.get("entryPrice"))
+        sz       = _ffloat(it.get("total") or it.get("available") or it.get("size"))
+        avg      = _ffloat(it.get("averageOpenPrice") or it.get("avgOpenPrice") or it.get("entryPrice"))
         if sz > 0 and hold in ("long", "short"):
             out.append({"symbol": sym_core, "side": hold, "size": sz, "entry_price": avg})
     return out
