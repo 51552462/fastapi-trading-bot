@@ -40,24 +40,21 @@ def _infer_side(side: str, default: str = "long") -> str:
     return s if s in ("long", "short") else default
 
 def _norm_symbol(sym: str) -> str:
-    return convert_symbol(sym)
+    s = (sym or "").upper().replace("/", "").replace("-", "").replace("_", "")
+    if s.endswith("PERP"): s = s[:-4]
+    return s
 
-# ── tolerant parser (JSON / raw text / form payload) ───────────
 async def _parse_any(req: Request) -> Dict[str, Any]:
-    # 1) JSON 시도
+    # 1) JSON
     try:
-        return await req.json()
+        j = await req.json()
+        if isinstance(j, dict): return j
     except Exception:
         pass
-    # 2) raw body → JSON 재시도(따옴표 보정)
+    # 2) 쿼리스트링
     try:
-        raw = (await req.body()).decode(errors="ignore").strip()
-        if raw:
-            try:
-                return json.loads(raw)
-            except Exception:
-                fixed = raw.replace("'", '"')
-                return json.loads(fixed)
+        q = dict(req.query_params)
+        if q: return q
     except Exception:
         pass
     # 3) form(payload=...) 처리
@@ -100,6 +97,7 @@ def _handle_signal(data: Dict[str, Any]):
         "tp_1": "tp1", "tp_2": "tp2", "tp_3": "tp3",
         "sl_1": "sl1", "sl_2": "sl2",
         "ema_exit": "emaExit", "failcut": "failCut",
+        "stoploss": "close",  # ← 추가: stoploss도 종료로 매핑
     }
     typ = legacy.get(typ.lower(), typ)
 
@@ -126,7 +124,7 @@ def _handle_signal(data: Dict[str, Any]):
               float(os.getenv("TP3_PCT", "0.30"))
         take_partial_profit(symbol, pct, side=side); return
 
-    if typ in ("sl1", "sl2", "failCut", "emaExit", "liquidation", "fullExit", "close", "exit"):
+    if typ in ("sl1", "sl2", "failCut", "emaExit", "liquidation", "fullExit", "close", "exit", "stoploss"):
         close_position(symbol, side=side, reason=typ); return
 
     if typ == "reduceByContracts":
@@ -152,7 +150,7 @@ def _worker_loop(idx: int):
         finally:
             _task_q.task_done()
 
-# ── 공통 수신 엔드포인트 로직 ─────────────────────────────────
+# ── 공통 수신 엔드포인트 로직 ──────────────────────────
 async def _ingest(req: Request):
     now = time.time()
     try:
@@ -168,69 +166,45 @@ async def _ingest(req: Request):
     INGRESS_LOG.append({
         "ts": now,
         "ip": (req.client.host if req and req.client else "?"),
-        "data": data
+        "raw": data,
     })
-
     try:
         _task_q.put_nowait(data)
     except queue.Full:
-        send_telegram("⚠️ queue full → drop signal: " + json.dumps(data))
-        return {"ok": False, "queued": False, "reason": "queue_full"}
+        return {"ok": False, "error": "queue_full"}
 
-    return {"ok": True, "queued": True, "qsize": _task_q.qsize()}
-
-# ── Endpoints (호환 경로 3개 + 루트/헬스) ──────────────────────
-@app.get("/")
-def root():
     return {"ok": True}
 
+# ── Routes ────────────────────────────────────────────────────
 @app.post("/signal")
 async def signal(req: Request):
     return await _ingest(req)
 
-@app.post("/webhook")
-async def webhook(req: Request):
-    return await _ingest(req)
-
-@app.post("/alert")
-async def alert(req: Request):
+@app.post("/tv")  # TradingView에서 이쪽으로도 보낼 수 있게 별칭
+async def tv(req: Request):
     return await _ingest(req)
 
 @app.get("/health")
-def health():
-    return {"ok": True, "ingress": len(INGRESS_LOG), "queue": _task_q.qsize(), "workers": WORKERS}
+async def health():
+    try:
+        arr = get_open_positions()
+        return {"ok": True, "positions": arr}
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
 
 @app.get("/ingress")
-def ingress():
-    return list(INGRESS_LOG)[-30:]
-
-@app.get("/positions")
-def positions():
-    return {"positions": get_open_positions()}
-
-@app.get("/queue")
-def queue_size():
-    return {"size": _task_q.qsize(), "max": QUEUE_MAX}
-
-@app.get("/config")
-def config():
-    return {
-        "DEFAULT_AMOUNT": DEFAULT_AMOUNT, "LEVERAGE": LEVERAGE,
-        "DEDUP_TTL": DEDUP_TTL, "BIZDEDUP_TTL": BIZDEDUP_TTL,
-        "WORKERS": WORKERS, "QUEUE_MAX": QUEUE_MAX,
-        "LOG_INGRESS": LOG_INGRESS,
-    }
+async def ingress():
+    return list(INGRESS_LOG)
 
 @app.get("/pending")
-def pending():
+async def pending():
     return get_pending_snapshot()
 
-# ── Startup ────────────────────────────────────────────────────
-@app.on_event("startup")
-def on_startup():
+# ── Startup ───────────────────────────────────────────────────
+def _start():
     # 워커 시작
-    for i in range(WORKERS):
-        t = threading.Thread(target=_worker_loop, args=(i,), daemon=True, name=f"signal-worker-{i}")
+    for i in range(max(1, WORKERS)):
+        t = threading.Thread(target=_worker_loop, args=(i,), daemon=True)
         t.start()
     # 긴급 스탑 워치독 + 리컨실러 시작
     start_watchdogs()
