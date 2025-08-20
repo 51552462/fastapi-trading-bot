@@ -1,17 +1,16 @@
-# bitget_api.py – stable minimal client for Bitget USDT-M Perp (UMCBL)
+# bitget_api.py – Bitget USDT‑M Perp (UMCBL) 안정 클라이언트
 import os, time, json, hmac, hashlib, base64, requests, math, threading
 from typing import Dict, List, Optional
 
 BASE_URL = os.getenv("BITGET_BASE_URL", "https://api.bitget.com")
-
 API_KEY        = os.getenv("BITGET_API_KEY", "")
 API_SECRET     = os.getenv("BITGET_API_SECRET", "")
 API_PASSPHRASE = os.getenv("BITGET_API_PASSWORD", "")
 
-MARGIN_COIN    = os.getenv("MARGIN_COIN", "USDT")
-PRODUCT_TYPE   = "umcbl"   # USDT-M perpetual
+PRODUCT_TYPE = "umcbl"   # USDT-M perpetual
+MARGIN_COIN  = os.getenv("MARGIN_COIN", "USDT")
 
-# ---- simple rate limiter -----------------------------------------------------
+# ── 간단 레이트리미트 ─────────────────────────────────────────
 _last_call: Dict[str, float] = {}
 def _rl(key: str, min_interval: float = 0.08):
     now = time.time()
@@ -22,7 +21,6 @@ def _rl(key: str, min_interval: float = 0.08):
     _last_call[key] = time.time()
 
 def _ts() -> str:
-    # Bitget requires millisecond timestamp string
     return str(int(time.time() * 1000))
 
 def _sign(ts: str, method: str, path_with_query: str, body: str = "") -> str:
@@ -42,7 +40,6 @@ def _headers(method: str, path_with_query: str, body: str = "") -> Dict[str, str
     }
 
 def _req(method: str, path: str, params: Optional[Dict] = None, body: Optional[Dict] = None, auth: bool = False):
-    """Low level HTTP request helper."""
     params = params or {}
     body   = body or {}
     if method.upper() == "GET":
@@ -50,28 +47,23 @@ def _req(method: str, path: str, params: Optional[Dict] = None, body: Optional[D
         path_with_query = path + (("?" + q) if q else "")
         headers = _headers(method, path_with_query, "") if auth else {"Content-Type":"application/json"}
         _rl(path, 0.08)
-        resp = requests.get(BASE_URL + path_with_query, headers=headers, timeout=10)
+        r = requests.get(BASE_URL + path_with_query, headers=headers, timeout=10)
     else:
         q = "&".join([f"{k}={v}" for k, v in params.items()]) if params else ""
         path_with_query = path + (("?" + q) if q else "")
         payload = json.dumps(body) if body else ""
         headers = _headers(method, path_with_query, payload) if auth else {"Content-Type":"application/json"}
         _rl(path, 0.08)
-        resp = requests.post(BASE_URL + path_with_query, data=payload, headers=headers, timeout=10)
-    resp.raise_for_status()
-    return resp.json()
+        r = requests.post(BASE_URL + path_with_query, data=payload, headers=headers, timeout=10)
+    r.raise_for_status()
+    return r.json()
 
-# ---- symbol helpers ----------------------------------------------------------
-ALIASES: Dict[str, str] = {
-    # user may add overrides via env like "ALIASES=ETHUSDT:ETHUSDT"
-}
+# ── 심볼 정규화 ────────────────────────────────────────────────
+ALIASES: Dict[str, str] = {}
+
 def convert_symbol(sym: str) -> str:
-    """
-    Normalize TradingView symbols like 'BINANCE:IMXUSDT.P', 'BTCUSDT', 'BTC/USDT', 'BTCUSDT_PERP'
-    to canonical 'IMXUSDT' / 'BTCUSDT'.
-    """
     s = (sym or "").upper().strip()
-    if ":" in s:
+    if ":" in s:  # 예: BINANCE:IMXUSDT.P
         s = s.split(":", 1)[1]
     s = s.replace("/", "").replace("-", "").replace("_", "")
     if s.endswith(".P"):
@@ -83,9 +75,9 @@ def convert_symbol(sym: str) -> str:
 def _mix_symbol(sym: str) -> str:
     return f"{convert_symbol(sym)}_UMCBL"
 
-# ---- ticker & market data ----------------------------------------------------
+# ── Ticker / Depth(mid) 캐시 ──────────────────────────────────
 _TICKER_CACHE: Dict[str, tuple] = {}  # sym -> (ts, price)
-TICKER_TTL   = float(os.getenv("TICKER_TTL", "1.2"))
+TICKER_TTL    = float(os.getenv("TICKER_TTL", "1.2"))
 STRICT_TICKER = os.getenv("STRICT_TICKER", "0") == "1"
 
 def _depth_midprice(sym: str) -> Optional[float]:
@@ -106,7 +98,6 @@ def get_last_price(sym: str) -> Optional[float]:
     if c and (time.time() - c[0] <= TICKER_TTL):
         return float(c[1])
 
-    # try ticker then fall back to depth mid
     for i in range(2):
         try:
             r = _req("GET", "/api/mix/v1/market/ticker", {"symbol": _mix_symbol(sym)})
@@ -116,7 +107,7 @@ def get_last_price(sym: str) -> Optional[float]:
                     _TICKER_CACHE[sym] = (time.time(), px)
                     return px
         except Exception:
-            time.sleep(0.2 * (i+1))
+            time.sleep(0.2 * (i + 1))
 
     alt = _depth_midprice(sym)
     if alt and alt > 0:
@@ -127,7 +118,7 @@ def get_last_price(sym: str) -> Optional[float]:
         return float(c[1])
     return None
 
-# ---- contract spec cache -----------------------------------------------------
+# ── 컨트랙트 스펙 ─────────────────────────────────────────────
 _SPEC_CACHE: Dict[str, Dict] = {}
 _SPEC_LOCK = threading.Lock()
 _SPEC_TS   = 0.0
@@ -167,7 +158,7 @@ def round_down_step(value: float, step: float) -> float:
         return value
     return math.floor(float(value) / step) * step
 
-# ---- position cache with self-heal ------------------------------------------
+# ── 포지션 캐시 (멈춤 방지) ───────────────────────────────────
 _POS_CACHE = {"data": [], "ts": 0.0, "cooldown_until": 0.0}
 POS_FAIL_COOLDOWN_SEC = float(os.getenv("POS_FAIL_COOLDOWN_SEC", "6"))
 POS_MAX_STALE_SEC     = float(os.getenv("POS_MAX_STALE_SEC", "20"))
@@ -178,7 +169,6 @@ def _fetch_positions() -> List[Dict]:
         if r.get("msg") == "success":
             arr = []
             for it in r.get("data") or []:
-                # Bitget returns both long/short entries, normalize
                 size = float(it.get("total","0"))
                 if size <= 0:
                     continue
@@ -195,7 +185,6 @@ def _fetch_positions() -> List[Dict]:
 
 def get_open_positions() -> List[Dict]:
     now = time.time()
-    # during cooldown use cache, but don't trust if too old
     if now < _POS_CACHE["cooldown_until"] and _POS_CACHE["data"]:
         if now - _POS_CACHE["ts"] > POS_MAX_STALE_SEC:
             return []
@@ -208,14 +197,13 @@ def get_open_positions() -> List[Dict]:
         _POS_CACHE["cooldown_until"] = 0.0
         return res
 
-    # failure: short cooldown; if cache is too old, return empty to avoid freezing pipeline
     if _POS_CACHE["data"]:
         _POS_CACHE["cooldown_until"] = now + POS_FAIL_COOLDOWN_SEC
         if now - _POS_CACHE["ts"] > POS_MAX_STALE_SEC:
             return []
     return _POS_CACHE["data"]
 
-# ---- order placement ---------------------------------------------------------
+# ── 주문 ──────────────────────────────────────────────────────
 def _calc_size_from_notional(symbol: str, usdt: float, price: float) -> float:
     spec = get_symbol_spec(symbol)
     step = float(spec.get("sizeStep", 0.001))
@@ -223,10 +211,6 @@ def _calc_size_from_notional(symbol: str, usdt: float, price: float) -> float:
     return max(step, round_down_step(size, step))
 
 def place_market_order(symbol: str, usdt_amount: float, side: str = "buy", leverage: float = 5.0, reduce_only: bool=False) -> Dict:
-    """
-    side: 'buy'/'sell' (we map to open_long/open_short or close_long/close_short)
-    reduce_only True will use close_* sides to guarantee position reduction.
-    """
     symbol = convert_symbol(symbol)
     mix = _mix_symbol(symbol)
     price = get_last_price(symbol)
@@ -251,15 +235,11 @@ def place_market_order(symbol: str, usdt_amount: float, side: str = "buy", lever
     }
     try:
         r = _req("POST", "/api/mix/v1/order/placeOrder", body=body, auth=True)
-        # Bitget returns {"code":"00000","msg":"success",...}
         return {"code": r.get("code",""), "data": r.get("data"), "msg": r.get("msg","")}
     except Exception as e:
         return {"code":"HTTP_ERR","msg":str(e)}
 
 def place_reduce_by_size(symbol: str, size: float, side: str = "long") -> Dict:
-    """
-    Reduce position by 'size' in contracts. We decide side automatically.
-    """
     symbol = convert_symbol(symbol)
     mix = _mix_symbol(symbol)
     step = float(get_symbol_spec(symbol).get("sizeStep", 0.001))
@@ -267,7 +247,6 @@ def place_reduce_by_size(symbol: str, size: float, side: str = "long") -> Dict:
     if qty <= 0:
         return {"code":"LOCAL_MIN_QTY"}
 
-    # if we are long, we need to sell to close -> 'close_long'
     side_tag = "close_long" if (side or "long").lower() == "long" else "close_short"
 
     body = {
