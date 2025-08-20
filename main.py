@@ -1,4 +1,4 @@
-# main.py – FastAPI ingress (큐/중복제거/워커/조용한 시작)
+# main.py – FastAPI ingress (patched: 그대로 사용, 옵션 설명 보강)
 import os, time, json, hashlib, threading, queue
 from collections import deque
 from typing import Dict, Any
@@ -43,17 +43,14 @@ def _infer_side(v: str, default="long") -> str:
     return s if s in ("long","short") else default
 
 async def _parse_any(req: Request) -> Dict[str, Any]:
-    # 1) JSON
     try: return await req.json()
     except Exception: pass
-    # 2) raw body
     try:
         raw = (await req.body()).decode(errors="ignore").strip()
         if raw:
             try: return json.loads(raw)
             except Exception: return json.loads(raw.replace("'", '"'))
     except Exception: pass
-    # 3) form(payload)
     try:
         form = await req.form()
         p = form.get("payload") or form.get("data")
