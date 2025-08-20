@@ -1,4 +1,4 @@
-# trader.py
+# trader.py – execution & recovery layer (stable)
 import os, time, threading
 from typing import Dict, Optional
 
@@ -15,25 +15,25 @@ except Exception:
 
 LEVERAGE = float(os.getenv("LEVERAGE", "5"))
 
-# ── TP 비율 (환경변수 반영) ───────────────────────────────────
+# ---- Profit taking ratios ----------------------------------------------------
 TP1_PCT = float(os.getenv("TP1_PCT", "0.30"))
-TP2_PCT = float(os.getenv("TP2_PCT", "0.40"))  # 초기 40%와 동일 효과 원하면 0.5714286 사용
+TP2_PCT = float(os.getenv("TP2_PCT", "0.40"))
 TP3_PCT = float(os.getenv("TP3_PCT", "0.30"))
 
-# ── Emergency stop (PnL 기준 고정) ────────────────────────────
-STOP_PCT           = float(os.getenv("STOP_PCT", "0.10"))   # -10% 손실률
+# ---- Emergency stop (PnL on margin) -----------------------------------------
+STOP_PCT           = float(os.getenv("STOP_PCT", "0.10"))   # 10% loss on margin
 STOP_CHECK_SEC     = float(os.getenv("STOP_CHECK_SEC", "1.0"))
 STOP_COOLDOWN_SEC  = float(os.getenv("STOP_COOLDOWN_SEC", "5.0"))
 
-# ── Reconciler ────────────────────────────────────────────────
+# ---- Reconciler --------------------------------------------------------------
 RECON_INTERVAL_SEC = float(os.getenv("RECON_INTERVAL_SEC", "60"))
 TP_EPSILON_RATIO   = float(os.getenv("TP_EPSILON_RATIO", "0.001"))
-RECON_DEBUG        = os.getenv("RECON_DEBUG", "0") == "1"   # 재시도 로그 on/off
+RECON_DEBUG        = os.getenv("RECON_DEBUG", "0") == "1"
 
-# ── 최근 진입 가드(선택 환경변수) ──────────────────────────────
-ENTRY_GUARD_SEC = float(os.getenv("ENTRY_GUARD_SEC", "45"))  # 설정 안 하면 45초
+# ---- Recent entry guard ------------------------------------------------------
+ENTRY_GUARD_SEC = float(os.getenv("ENTRY_GUARD_SEC", "45"))
 
-# ── Local state & locks ───────────────────────────────────────
+# ---- local states & locks ----------------------------------------------------
 position_data: Dict[str, dict] = {}
 _POS_LOCK = threading.RLock()
 
@@ -49,7 +49,7 @@ def _lock_for(key: str):
             _KEY_LOCKS[key] = threading.RLock()
     return _KEY_LOCKS[key]
 
-# ── Stop fire 쿨다운 ──────────────────────────────────────────
+# stop fire cooldown
 _STOP_FIRED: Dict[str, float] = {}
 _STOP_LOCK = threading.Lock()
 
@@ -62,11 +62,11 @@ def _should_fire_stop(key: str) -> bool:
         _STOP_FIRED[key] = now
         return True
 
-# ── Pending registry ──────────────────────────────────────────
+# pending registry
 _PENDING = {
-    "entry": {},  # key -> {amount, leverage, created, last_try, attempts}
-    "close": {},  # key -> {reason,  created, last_try, attempts}
-    "tp":    {}   # key(stage3 only) -> {stage, pct, init_size, cut_size, size_step, created, last_try, attempts}
+    "entry": {},
+    "close": {},
+    "tp": {}
 }
 _PENDING_LOCK = threading.RLock()
 
@@ -87,18 +87,17 @@ def _mark_done(typ: str, pkey: str, note: str = ""):
         send_telegram(f"✅ pending done [{typ}] {pkey} {note}")
 
 def get_pending_snapshot() -> Dict[str, Dict]:
-    """/pending 조회용(메인에서 노출)"""
     with _PENDING_LOCK:
         return {
-            "counts": {k: len(v) for k, v in _PENDING.items() },
+            "counts": {k: len(v) for k, v in _PENDING.items()},
             "entry_keys": list(_PENDING["entry"].keys()),
             "close_keys": list(_PENDING["close"].keys()),
-            "tp_keys":    list(_PENDING["tp"].keys()),
+            "tp_keys": list(_PENDING["tp"].keys()),
             "interval": RECON_INTERVAL_SEC,
             "debug": RECON_DEBUG,
         }
 
-# ── Helpers ───────────────────────────────────────────────────
+# ---- helpers -----------------------------------------------------------------
 def _get_remote(symbol: str, side: Optional[str] = None):
     symbol = convert_symbol(symbol)
     arr = get_open_positions()
@@ -123,9 +122,9 @@ def _loss_ratio_on_margin(entry: float, last: float, size: float, side: str, lev
     notional = entry * size
     pnl = _pnl_usdt(entry, last, notional, side)
     margin = max(1e-9, notional / max(1.0, leverage))
-    return max(0.0, -pnl) / margin  # 양수 = 손실
+    return max(0.0, -pnl) / margin
 
-# ── 최근 진입 가드 & 로컬 힌트 ─────────────────────────────────
+# recent entry guard & local hint
 _ENTRY_GUARD: Dict[str, float] = {}
 _ENTRY_GUARD_LOCK = threading.Lock()
 
@@ -140,7 +139,6 @@ def _recent_entry_guard_set(key: str):
         _ENTRY_GUARD[key] = time.time()
 
 def _has_local_position(symbol: str, within_sec: float = 180.0) -> bool:
-    """최근 로컬 기록 기반으로 포지션 존재로 간주(원격 반영 지연 대비)"""
     symbol = convert_symbol(symbol)
     now = time.time()
     with _POS_LOCK:
@@ -149,7 +147,7 @@ def _has_local_position(symbol: str, within_sec: float = 180.0) -> bool:
                 return True
     return False
 
-# ── Trading ops ───────────────────────────────────────────────
+# ---- trading ops -------------------------------------------------------------
 def enter_position(symbol: str, usdt_amount: float, side: str = "long", leverage: float = None):
     symbol = convert_symbol(symbol)
     side   = (side or "long").lower()
@@ -157,7 +155,7 @@ def enter_position(symbol: str, usdt_amount: float, side: str = "long", leverage
     lev    = float(leverage or LEVERAGE)
     pkey   = _pending_key_entry(symbol, side)
 
-    # pending 등록
+    # register pending
     with _PENDING_LOCK:
         _PENDING["entry"][pkey] = {"symbol": symbol, "side": side, "amount": usdt_amount,
                                    "leverage": lev, "created": time.time(), "last_try": 0.0, "attempts": 0}
@@ -165,21 +163,18 @@ def enter_position(symbol: str, usdt_amount: float, side: str = "long", leverage
         send_telegram(f"📌 pending add [entry] {pkey}")
 
     with _lock_for(key):
-        # [가드] 직전 성공 직후 재진입 차단 + 로컬 힌트 차단
         if _recent_entry_guard_hit(key) or _has_local_position(symbol):
             _mark_done("entry", pkey, "(local/guard)")
             if RECON_DEBUG:
                 send_telegram(f"⏭️ ENTRY 스킵(guard/local) {key}")
             return
 
-        # 이미 포지션 있으면 재진입 금지 + pending 종료
         if _get_remote_any_side(symbol):
             _mark_done("entry", pkey, "(exists)")
             return
 
         last = get_last_price(symbol)
         if not last or last <= 0:
-            # 실패 → 리컨실러가 재시도
             return
 
         resp = place_market_order(symbol, usdt_amount,
@@ -191,14 +186,14 @@ def enter_position(symbol: str, usdt_amount: float, side: str = "long", leverage
                 position_data[key] = {"symbol": symbol, "side": side, "entry_usd": usdt_amount, "ts": time.time()}
             with _STOP_LOCK:
                 _STOP_FIRED.pop(key, None)
-            _recent_entry_guard_set(key)  # 성공 시 가드 설정
+            _recent_entry_guard_set(key)
             _mark_done("entry", pkey)
             send_telegram(f"🚀 ENTRY {side.upper()} {symbol}\n• Notional≈ {usdt_amount} USDT\n• Lvg: {lev}x")
         elif code.startswith("LOCAL_MIN_QTY") or code.startswith("LOCAL_BAD_QTY"):
             _mark_done("entry", pkey, "(minQty/badQty)")
             send_telegram(f"⛔ ENTRY 스킵 {symbol} {side} → {resp}")
         else:
-            # 네트워크/호출 실패 등은 리컨실러가 재시도
+            # let reconciler retry
             pass
 
 def _sweep_full_close(symbol: str, side: str, reason: str, max_retry: int = 5, sleep_s: float = 0.3):
@@ -230,7 +225,6 @@ def take_partial_profit(symbol: str, pct: float, side: str = "long"):
             send_telegram(f"⚠️ TP 스킵: 계산된 사이즈=0 ({_key(symbol, side)})")
             return
 
-        # TP3면 펜딩 등록(남은 양만 채우기 위해)
         if abs(float(pct) - TP3_PCT) <= 1e-6:
             with _PENDING_LOCK:
                 pk = _pending_key_tp3(symbol, side)
@@ -251,7 +245,6 @@ def take_partial_profit(symbol: str, pct: float, side: str = "long"):
                 f"🤑 TP {int(pct*100)}% {side.upper()} {symbol}\n"
                 f"• Exit: {exit_price}\n• Cut size: {cut_size}\n• Realized≈ {realized:+.2f} USDT"
             )
-        # 실패는 리컨실러에서 채움
 
 def close_position(symbol: str, side: str = "long", reason: str = "manual"):
     symbol = convert_symbol(symbol)
@@ -259,7 +252,6 @@ def close_position(symbol: str, side: str = "long", reason: str = "manual"):
     key    = _key(symbol, side)
     pkey   = _pending_key_close(symbol, side)
 
-    # pending 등록
     with _PENDING_LOCK:
         _PENDING["close"][pkey] = {"symbol": symbol, "side": side, "reason": reason,
                                    "created": time.time(), "last_try": 0.0, "attempts": 0}
@@ -295,16 +287,15 @@ def close_position(symbol: str, side: str = "long", reason: str = "manual"):
             _mark_done("close", pkey)
             send_telegram(
                 f"✅ CLOSE {side.upper()} {symbol} ({reason})\n"
-                f"• Exit: {exit_price}\n• Size: {size}\n• Realized≈ {realized:+.2f} USDT"
+                f"• Exit: {exit_price}\n"
+                f"• Size: {size}\n"
+                f"• Realized≈ {realized:+.2f} USDT"
             )
-        # 실패는 리컨실러에서 재시도
 
 def reduce_by_contracts(symbol: str, contracts: float, side: str = "long"):
-    """고정 계약수만큼 reduceOnly 시장가로 즉시 감축."""
     symbol = convert_symbol(symbol)
     side   = (side or "long").lower()
     key    = _key(symbol, side)
-
     with _lock_for(key):
         step = float(get_symbol_spec(symbol).get("sizeStep", 0.001))
         qty  = round_down_step(float(contracts), step)
@@ -317,9 +308,13 @@ def reduce_by_contracts(symbol: str, contracts: float, side: str = "long"):
         else:
             send_telegram(f"❌ Reduce 실패 {key} → {resp}")
 
-# ── Emergency watchdog (PnL 손실률 기준 -10%) ────────────────
+# ---- watchdog (loss on margin >= STOP_PCT) -----------------------------------
+HEARTBEAT = {"watchdog": 0.0, "reconciler": 0.0}
+_THREAD   = {"watchdog": None, "reconciler": None}
+
 def _watchdog_loop():
     while True:
+        HEARTBEAT["watchdog"] = time.time()
         try:
             positions = get_open_positions()
             for p in positions:
@@ -335,27 +330,25 @@ def _watchdog_loop():
                 if loss_ratio >= STOP_PCT:
                     k = _key(symbol, side)
                     if _should_fire_stop(k):
-                        send_telegram(
-                            f"⛔ {symbol} {side.upper()} emergencyStop PnL≤{-int(STOP_PCT*100)}%"
-                        )
+                        send_telegram(f"⛔ {symbol} {side.upper()} emergencyStop PnL≤-{int(STOP_PCT*100)}%")
                         close_position(symbol, side=side, reason="emergencyStop")
         except Exception as e:
             print("watchdog error:", e)
         time.sleep(STOP_CHECK_SEC)
 
-# ── Reconciler (1분 주기 재시도) ──────────────────────────────
+# ---- reconciler --------------------------------------------------------------
 def _reconciler_loop():
     while True:
+        HEARTBEAT["reconciler"] = time.time()
         time.sleep(RECON_INTERVAL_SEC)
         try:
-            # ENTRY 재시도
+            # ENTRY retries
             with _PENDING_LOCK:
                 entry_items = list(_PENDING["entry"].items())
             for pkey, item in entry_items:
                 sym, side = item["symbol"], item["side"]
                 key = _key(sym, side)
 
-                # [가드] 직전 성공 직후 재시도 차단 + 로컬 힌트 차단
                 if _recent_entry_guard_hit(key) or _has_local_position(sym):
                     _mark_done("entry", pkey, "(guard)")
                     if RECON_DEBUG:
@@ -380,14 +373,14 @@ def _reconciler_loop():
                     item["attempts"] = item.get("attempts", 0) + 1
                     code = str(resp.get("code", ""))
                     if code == "00000":
-                        _recent_entry_guard_set(key)  # 재성공 시 가드
+                        _recent_entry_guard_set(key)
                         _mark_done("entry", pkey)
                         send_telegram(f"🔁 ENTRY 재시도 성공 {side.upper()} {sym}")
                     elif code.startswith("LOCAL_MIN_QTY") or code.startswith("LOCAL_BAD_QTY"):
                         _mark_done("entry", pkey, "(minQty/badQty)")
                         send_telegram(f"⛔ ENTRY 재시도 스킵 {sym} {side} → {resp}")
 
-            # CLOSE 재시도
+            # CLOSE retries
             with _PENDING_LOCK:
                 close_items = list(_PENDING["close"].items())
             for pkey, item in close_items:
@@ -413,7 +406,7 @@ def _reconciler_loop():
                             _mark_done("close", pkey)
                             send_telegram(f"🔁 CLOSE 재시도 성공 {side.upper()} {sym}")
 
-            # TP3 재시도
+            # TP3 retries
             with _PENDING_LOCK:
                 tp_items = list(_PENDING["tp"].items())
             for pkey, item in tp_items:
@@ -452,11 +445,44 @@ def _reconciler_loop():
         except Exception as e:
             print("reconciler error:", e)
 
-# ── Starters ──────────────────────────────────────────────────
+# ---- self-heal supervisor ----------------------------------------------------
+SUP_INTERVAL_SEC = float(os.getenv("SUP_INTERVAL_SEC", "5"))
+WD_STUCK_SEC     = float(os.getenv("WD_STUCK_SEC", str(max(5.0, STOP_CHECK_SEC*10))))
+REC_STUCK_SEC    = float(os.getenv("REC_STUCK_SEC", str(max(30.0, RECON_INTERVAL_SEC*4))))
+
+def _supervisor_loop():
+    while True:
+        try:
+            now = time.time()
+            t = _THREAD.get("watchdog")
+            if (t is None) or (not t.is_alive()) or (now - HEARTBEAT["watchdog"] > WD_STUCK_SEC):
+                try:
+                    send_telegram("♻️ restarting watchdog")
+                except Exception:
+                    pass
+                start_watchdogs()
+            t = _THREAD.get("reconciler")
+            if (t is None) or (not t.is_alive()) or (now - HEARTBEAT["reconciler"] > REC_STUCK_SEC):
+                try:
+                    send_telegram("♻️ restarting reconciler")
+                except Exception:
+                    pass
+                start_reconciler()
+        except Exception as e:
+            print("supervisor error:", e)
+        time.sleep(SUP_INTERVAL_SEC)
+
 def start_watchdogs():
     t = threading.Thread(target=_watchdog_loop, name="emergency-stop-watchdog", daemon=True)
     t.start()
+    _THREAD["watchdog"] = t
+    HEARTBEAT["watchdog"] = time.time()
 
 def start_reconciler():
     t = threading.Thread(target=_reconciler_loop, name="reconciler", daemon=True)
     t.start()
+    _THREAD["reconciler"] = t
+    HEARTBEAT["reconciler"] = time.time()
+
+def start_supervisor():
+    threading.Thread(target=_supervisor_loop, name="supervisor", daemon=True).start()
