@@ -1,4 +1,4 @@
-# bitget_api.py – Bitget USDT‑M Perp (UMCBL) 안정 클라이언트
+# bitget_api.py – Bitget USDT-M Perp (UMCBL) 안정 클라이언트 (patched)
 import os, time, json, hmac, hashlib, base64, requests, math, threading
 from typing import Dict, List, Optional
 
@@ -47,14 +47,14 @@ def _req(method: str, path: str, params: Optional[Dict] = None, body: Optional[D
         path_with_query = path + (("?" + q) if q else "")
         headers = _headers(method, path_with_query, "") if auth else {"Content-Type":"application/json"}
         _rl(path, 0.08)
-        r = requests.get(BASE_URL + path_with_query, headers=headers, timeout=10)
+        r = requests.get(BASE_URL + path_with_query, headers=headers, timeout=12)
     else:
         q = "&".join([f"{k}={v}" for k, v in params.items()]) if params else ""
         path_with_query = path + (("?" + q) if q else "")
         payload = json.dumps(body) if body else ""
         headers = _headers(method, path_with_query, payload) if auth else {"Content-Type":"application/json"}
         _rl(path, 0.08)
-        r = requests.post(BASE_URL + path_with_query, data=payload, headers=headers, timeout=10)
+        r = requests.post(BASE_URL + path_with_query, data=payload, headers=headers, timeout=12)
     r.raise_for_status()
     return r.json()
 
@@ -63,7 +63,7 @@ ALIASES: Dict[str, str] = {}
 
 def convert_symbol(sym: str) -> str:
     s = (sym or "").upper().strip()
-    if ":" in s:  # 예: BINANCE:IMXUSDT.P
+    if ":" in s:
         s = s.split(":", 1)[1]
     s = s.replace("/", "").replace("-", "").replace("_", "")
     if s.endswith(".P"):
@@ -76,7 +76,7 @@ def _mix_symbol(sym: str) -> str:
     return f"{convert_symbol(sym)}_UMCBL"
 
 # ── Ticker / Depth(mid) 캐시 ──────────────────────────────────
-_TICKER_CACHE: Dict[str, tuple] = {}  # sym -> (ts, price)
+_TICKER_CACHE: Dict[str, tuple] = {}
 TICKER_TTL    = float(os.getenv("TICKER_TTL", "1.2"))
 STRICT_TICKER = os.getenv("STRICT_TICKER", "0") == "1"
 
@@ -97,7 +97,6 @@ def get_last_price(sym: str) -> Optional[float]:
     c = _TICKER_CACHE.get(sym)
     if c and (time.time() - c[0] <= TICKER_TTL):
         return float(c[1])
-
     for i in range(2):
         try:
             r = _req("GET", "/api/mix/v1/market/ticker", {"symbol": _mix_symbol(sym)})
@@ -108,12 +107,10 @@ def get_last_price(sym: str) -> Optional[float]:
                     return px
         except Exception:
             time.sleep(0.2 * (i + 1))
-
     alt = _depth_midprice(sym)
     if alt and alt > 0:
         _TICKER_CACHE[sym] = (time.time(), alt)
         return alt
-
     if not STRICT_TICKER and c:
         return float(c[1])
     return None
@@ -158,7 +155,7 @@ def round_down_step(value: float, step: float) -> float:
         return value
     return math.floor(float(value) / step) * step
 
-# ── 포지션 캐시 (멈춤 방지) ───────────────────────────────────
+# ── 포지션 캐시 ───────────────────────────────────────────────
 _POS_CACHE = {"data": [], "ts": 0.0, "cooldown_until": 0.0}
 POS_FAIL_COOLDOWN_SEC = float(os.getenv("POS_FAIL_COOLDOWN_SEC", "6"))
 POS_MAX_STALE_SEC     = float(os.getenv("POS_MAX_STALE_SEC", "20"))
@@ -189,19 +186,34 @@ def get_open_positions() -> List[Dict]:
         if now - _POS_CACHE["ts"] > POS_MAX_STALE_SEC:
             return []
         return _POS_CACHE["data"]
-
     res = _fetch_positions()
     if res:
         _POS_CACHE["data"] = res
         _POS_CACHE["ts"] = now
         _POS_CACHE["cooldown_until"] = 0.0
         return res
-
     if _POS_CACHE["data"]:
         _POS_CACHE["cooldown_until"] = now + POS_FAIL_COOLDOWN_SEC
         if now - _POS_CACHE["ts"] > POS_MAX_STALE_SEC:
             return []
     return _POS_CACHE["data"]
+
+# ── (신규) 레버리지 설정 ─────────────────────────────────────
+def _set_leverage(symbol: str, leverage: float):
+    mix = _mix_symbol(symbol)
+    body = {
+        "symbol": mix,
+        "marginCoin": MARGIN_COIN,
+        "leverage": str(leverage),
+        "productType": PRODUCT_TYPE,
+        "holdSide": "long",
+    }
+    try:
+        _req("POST", "/api/mix/v1/account/setLeverage", body=body, auth=True)
+        body["holdSide"] = "short"
+        _req("POST", "/api/mix/v1/account/setLeverage", body=body, auth=True)
+    except Exception:
+        pass  # 설정 실패해도 주문은 시도
 
 # ── 주문 ──────────────────────────────────────────────────────
 def _calc_size_from_notional(symbol: str, usdt: float, price: float) -> float:
@@ -223,13 +235,19 @@ def place_market_order(symbol: str, usdt_amount: float, side: str = "buy", lever
     else:
         side_map = {"buy":"open_long", "sell":"open_short"}
 
+    # 레버리지 선설정 (실패해도 계속)
+    _set_leverage(symbol, leverage)
+
     body = {
         "symbol": mix,
+        "productType": PRODUCT_TYPE,
         "marginCoin": MARGIN_COIN,
         "size": str(size),
         "side": side_map.get(side.lower(), "open_long"),
         "orderType": "market",
         "reduceOnly": reduce_only,
+        "timeInForceValue": "normal",
+        "clientOid": f"mkt-{int(time.time()*1000)}",
         "presetTakeProfitPrice": "",
         "presetStopLossPrice": "",
     }
@@ -251,11 +269,14 @@ def place_reduce_by_size(symbol: str, size: float, side: str = "long") -> Dict:
 
     body = {
         "symbol": mix,
+        "productType": PRODUCT_TYPE,
         "marginCoin": MARGIN_COIN,
         "size": str(qty),
         "side": side_tag,
         "orderType": "market",
         "reduceOnly": True,
+        "timeInForceValue": "normal",
+        "clientOid": f"red-{int(time.time()*1000)}",
     }
     try:
         r = _req("POST", "/api/mix/v1/order/placeOrder", body=body, auth=True)
