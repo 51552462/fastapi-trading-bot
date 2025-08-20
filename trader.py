@@ -1,4 +1,4 @@
-# trader.py – 실행/복구 레이어 (안정화, 조용한 슈퍼바이저)
+# trader.py – 실행/복구 레이어 (patched: 실패 사유 텔레그램 알림 강화)
 import os, time, threading
 from typing import Dict, Optional
 
@@ -29,7 +29,7 @@ RECON_DEBUG        = os.getenv("RECON_DEBUG", "0") == "1"
 
 ENTRY_GUARD_SEC = float(os.getenv("ENTRY_GUARD_SEC", "45"))
 
-# ── 슈퍼바이저 알림 ON/OFF (기본 OFF) ─────────────────────────
+# ── 슈퍼바이저 알림 ON/OFF ───────────────────────────────────
 SUP_NOTIFY = os.getenv("SUP_NOTIFY", "0") == "1"
 SUP_NOTIFY_MIN_INTERVAL = float(os.getenv("SUP_NOTIFY_MIN_INTERVAL", "600"))  # 10분
 
@@ -56,7 +56,7 @@ def _should_fire_stop(key: str) -> bool:
     now = time.time()
     with _STOP_LOCK:
         last = _STOP_FIRED.get(key, 0.0)
-        if now - last < STOP_COOLDOWN_SEC:  # 쿨다운 내 재발사 금지
+        if now - last < STOP_COOLDOWN_SEC:
             return False
         _STOP_FIRED[key] = now
         return True
@@ -162,6 +162,7 @@ def enter_position(symbol: str, usdt_amount: float, side: str = "long", leverage
 
         last = get_last_price(symbol)
         if not last or last <= 0:
+            send_telegram(f"❌ ENTRY 실패 {symbol} {side} → ticker unavailable")
             return
 
         resp = place_market_order(symbol, usdt_amount,
@@ -176,11 +177,9 @@ def enter_position(symbol: str, usdt_amount: float, side: str = "long", leverage
             _recent_entry_guard_set(key)
             _mark_done("entry", pkey)
             send_telegram(f"🚀 ENTRY {side.upper()} {symbol}\n• Notional≈ {usdt_amount} USDT\n• Lvg: {lev}x")
-        elif code.startswith("LOCAL_MIN_QTY") or code.startswith("LOCAL_BAD_QTY"):
-            _mark_done("entry", pkey, "(minQty/badQty)")
-            send_telegram(f"⛔ ENTRY 스킵 {symbol} {side} → {resp}")
         else:
-            pass
+            # 실패 이유를 즉시 노출
+            send_telegram(f"❌ ENTRY 실패 {symbol} {side} → {resp}")
 
 def _sweep_full_close(symbol: str, side: str, reason: str, max_retry: int = 5, sleep_s: float = 0.3):
     for _ in range(max_retry):
@@ -211,6 +210,7 @@ def take_partial_profit(symbol: str, pct: float, side: str = "long"):
             send_telegram(f"⚠️ TP 스킵: 계산된 사이즈=0 ({_key(symbol, side)})")
             return
 
+        # TP3 보정 페일오버 큐
         if abs(float(pct) - TP3_PCT) <= 1e-6:
             with _PENDING_LOCK:
                 pk = _pending_key_tp3(symbol, side)
@@ -231,6 +231,8 @@ def take_partial_profit(symbol: str, pct: float, side: str = "long"):
                 f"🤑 TP {int(pct*100)}% {side.upper()} {symbol}\n"
                 f"• Exit: {exit_price}\n• Cut size: {cut_size}\n• Realized≈ {realized:+.2f} USDT"
             )
+        else:
+            send_telegram(f"❌ TP 실패 {side.upper()} {symbol} → {resp}")
 
 def close_position(symbol: str, side: str = "long", reason: str = "manual"):
     symbol = convert_symbol(symbol)
@@ -275,6 +277,8 @@ def close_position(symbol: str, side: str = "long", reason: str = "manual"):
                 f"✅ CLOSE {side.upper()} {symbol} ({reason})\n"
                 f"• Exit: {exit_price}\n• Size: {size}\n• Realized≈ {realized:+.2f} USDT"
             )
+        else:
+            send_telegram(f"❌ CLOSE 실패 {side.upper()} {symbol}({reason}) → {resp}")
 
 def reduce_by_contracts(symbol: str, contracts: float, side: str = "long"):
     symbol = convert_symbol(symbol)
@@ -315,7 +319,7 @@ def _watchdog_loop():
                 symbol = p.get("symbol"); side = p.get("side")
                 entry  = float(p.get("entry_price") or 0)
                 size   = float(p.get("size") or 0)
-                if not symbol or not side or entry <= 0 or size <= 0:  # 방어
+                if not symbol or not side or entry <= 0 or size <= 0:
                     continue
                 last = get_last_price(symbol)
                 if not last:
@@ -369,9 +373,8 @@ def _reconciler_loop():
                         _recent_entry_guard_set(key)
                         _mark_done("entry", pkey)
                         send_telegram(f"🔁 ENTRY 재시도 성공 {side.upper()} {sym}")
-                    elif code.startswith("LOCAL_MIN_QTY") or code.startswith("LOCAL_BAD_QTY"):
-                        _mark_done("entry", pkey, "(minQty/badQty)")
-                        send_telegram(f"⛔ ENTRY 재시도 스킵 {sym} {side} → {resp}")
+                    else:
+                        send_telegram(f"❌ ENTRY 재시도 실패 {side.upper()} {sym} → {resp}")
 
             # CLOSE 재시도
             with _PENDING_LOCK:
@@ -398,6 +401,8 @@ def _reconciler_loop():
                         if ok:
                             _mark_done("close", pkey)
                             send_telegram(f"🔁 CLOSE 재시도 성공 {side.upper()} {sym}")
+                    else:
+                        send_telegram(f"❌ CLOSE 재시도 실패 {side.upper()} {sym} → {resp}")
 
             # TP3 재시도
             with _PENDING_LOCK:
@@ -435,10 +440,12 @@ def _reconciler_loop():
                     item["attempts"] = item.get("attempts", 0) + 1
                     if str(resp.get("code", "")) == "00000":
                         send_telegram(f"🔁 TP3 재시도 감축 {side.upper()} {sym} remain≈{remain}")
+                    else:
+                        send_telegram(f"❌ TP3 재시도 실패 {side.upper()} {sym} → {resp}")
         except Exception as e:
             print("reconciler error:", e)
 
-# ── 슈퍼바이저(조용/안정) ─────────────────────────────────────
+# ── 슈퍼바이저 ────────────────────────────────────────────────
 SUP_INTERVAL_SEC = float(os.getenv("SUP_INTERVAL_SEC", "5"))
 WD_STUCK_SEC     = float(os.getenv("WD_STUCK_SEC", str(max(15.0, STOP_CHECK_SEC*30))))
 REC_STUCK_SEC    = float(os.getenv("REC_STUCK_SEC", str(max(60.0, RECON_INTERVAL_SEC*3))))
@@ -447,11 +454,9 @@ def _supervisor_loop():
     while True:
         try:
             now = time.time()
-            # watchdog
             tw = _THREAD.get("watchdog")
             w_stale = (now - HEARTBEAT["watchdog"]) > WD_STUCK_SEC
             if (tw is None) or (not tw.is_alive()) or w_stale:
-                # 두 번 연속 stale 일 때만 재기동(오탐 방지)
                 _STUCK_CNT["watchdog"] += 1 if w_stale else 0
                 if (tw is None) or (not tw.is_alive()) or _STUCK_CNT["watchdog"] >= 2:
                     _maybe_notify("watchdog", "♻️ restarting watchdog")
@@ -460,7 +465,6 @@ def _supervisor_loop():
             else:
                 _STUCK_CNT["watchdog"] = 0
 
-            # reconciler
             tr = _THREAD.get("reconciler")
             r_stale = (now - HEARTBEAT["reconciler"]) > REC_STUCK_SEC
             if (tr is None) or (not tr.is_alive()) or r_stale:
