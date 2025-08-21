@@ -1,12 +1,11 @@
-import os, time, json, hashlib, threading, queue, re, random
+import os, time, json, hashlib, threading, queue, re
 from collections import deque
 from typing import Dict, Any
 from fastapi import FastAPI, Request
 
 from trader import (
     enter_position, take_partial_profit, close_position, reduce_by_contracts,
-    start_watchdogs, start_reconciler, get_pending_snapshot,
-    start_capacity_guard, capacity_status
+    start_watchdogs, start_reconciler, get_pending_snapshot
 )
 from telegram_bot import send_telegram
 from bitget_api import convert_symbol, get_open_positions
@@ -21,7 +20,14 @@ WORKERS        = int(os.getenv("WORKERS", "6"))
 QUEUE_MAX      = int(os.getenv("QUEUE_MAX", "2000"))
 
 LOG_INGRESS    = os.getenv("LOG_INGRESS", "0") == "1"  # 수신 요약 텔레그램 로그
-TRACE_LOG      = os.getenv("TRACE_LOG", "0") == "1"    # 상세 추적 로그
+
+# >>> 추가: 진입금 통제 옵션 (최소 변경)
+FORCE_DEFAULT_AMOUNT = os.getenv("FORCE_DEFAULT_AMOUNT", "0") == "1"  # 1이면 트뷰 amount 무시
+SYMBOL_AMOUNT_JSON = os.getenv("SYMBOL_AMOUNT_JSON", "")              # {"BTCUSDT":30,"ETHUSDT":15}
+try:
+    SYMBOL_AMOUNT = json.loads(SYMBOL_AMOUNT_JSON) if SYMBOL_AMOUNT_JSON else {}
+except Exception:
+    SYMBOL_AMOUNT = {}
 
 # ── App/Infra ──────────────────────────────────────────────────
 app = FastAPI()
@@ -93,13 +99,15 @@ def _handle_signal(data: Dict[str, Any]):
     amount   = float(data.get("amount", DEFAULT_AMOUNT))
     leverage = float(data.get("leverage", LEVERAGE))
 
-    # trace id 부여
-    trace = data.get("trace_id")
-    if not trace:
-        trace = f"{int(time.time()*1000)}-{random.randint(1000,9999)}"
-        data["trace_id"] = trace
-    # trader 쪽에서 읽을 수 있게 환경변수에 기록
-    os.environ["CURRENT_TRACE_ID"] = str(trace)
+    # >>> 추가: 진입 금액 결정(우선순위: SYMBOL_AMOUNT → FORCE_DEFAULT → 트뷰/DEFAULT)
+    resolved_amount = float(amount)
+    if (symbol in SYMBOL_AMOUNT) and (str(SYMBOL_AMOUNT[symbol]).strip() != ""):
+        try:
+            resolved_amount = float(SYMBOL_AMOUNT[symbol])
+        except Exception:
+            resolved_amount = float(DEFAULT_AMOUNT)
+    elif FORCE_DEFAULT_AMOUNT:
+        resolved_amount = float(DEFAULT_AMOUNT)
 
     if not symbol:
         send_telegram("⚠️ symbol 없음: " + json.dumps(data))
@@ -121,14 +129,14 @@ def _handle_signal(data: Dict[str, Any]):
         return
     _BIZDEDUP[bk] = now
 
-    if LOG_INGRESS or TRACE_LOG:
+    if LOG_INGRESS:
         try:
-            send_telegram(f"📥[{trace}] type={typ} {symbol} {side} amt={amount}")
+            send_telegram(f"📥 {typ} {symbol} {side} amt={resolved_amount}")
         except Exception:
             pass
 
     if typ == "entry":
-        enter_position(symbol, amount, side=side, leverage=leverage); return
+        enter_position(symbol, resolved_amount, side=side, leverage=leverage); return
 
     if typ in ("tp1", "tp2", "tp3"):
         pct = float(os.getenv("TP1_PCT", "0.30")) if typ == "tp1" else \
@@ -228,41 +236,14 @@ def config():
         "DEFAULT_AMOUNT": DEFAULT_AMOUNT, "LEVERAGE": LEVERAGE,
         "DEDUP_TTL": DEDUP_TTL, "BIZDEDUP_TTL": BIZDEDUP_TTL,
         "WORKERS": WORKERS, "QUEUE_MAX": QUEUE_MAX,
-        "LOG_INGRESS": LOG_INGRESS, "TRACE_LOG": TRACE_LOG,
+        "LOG_INGRESS": LOG_INGRESS,
+        "FORCE_DEFAULT_AMOUNT": FORCE_DEFAULT_AMOUNT,
+        "SYMBOL_AMOUNT": SYMBOL_AMOUNT,
     }
 
 @app.get("/pending")
 def pending():
     return get_pending_snapshot()
-
-@app.get("/capacity")
-def capacity():
-    return capacity_status()
-
-@app.get("/diag")
-def diag():
-    try:
-        return {
-            "health": {"ok": True, "queue": _task_q.qsize(), "workers": WORKERS},
-            "capacity": capacity_status(),
-            "pending": get_pending_snapshot(),
-            "config": {
-                "LOG_INGRESS": LOG_INGRESS, "RECON_DEBUG": os.getenv("RECON_DEBUG","0"),
-                "TRACE_LOG": TRACE_LOG, "DEFAULT_AMOUNT": DEFAULT_AMOUNT, "LEVERAGE": LEVERAGE
-            }
-        }
-    except Exception as e:
-        return {"ok": False, "error": str(e)}
-
-@app.post("/selftest/entry")
-def selftest_entry(symbol: str="BTCUSDT", side: str="long", amount: float=5.0, leverage: float=None):
-    data = {
-        "type": "entry", "symbol": symbol, "side": side,
-        "amount": amount, "leverage": leverage if leverage is not None else LEVERAGE,
-        "trace_id": f"SELF-{int(time.time()*1000)}"
-    }
-    _task_q.put_nowait(data)
-    return {"ok": True, "queued": True, "data": data}
 
 # ── Startup ────────────────────────────────────────────────────
 @app.on_event("startup")
@@ -271,15 +252,14 @@ def on_startup():
     for i in range(WORKERS):
         t = threading.Thread(target=_worker_loop, args=(i,), daemon=True, name=f"signal-worker-{i}")
         t.start()
-    # 긴급 스탑 워치독 + 리컨실러 + 용량가드 시작
+    # 긴급 스탑 워치독 + 리컨실러 시작
     start_watchdogs()
     start_reconciler()
-    start_capacity_guard()
     # 텔레그램 알림은 비동기로(콜드스타트 지연 방지)
     try:
         threading.Thread(
             target=send_telegram,
-            args=("✅ FastAPI up (workers + watchdog + reconciler + capacity)",),
+            args=("✅ FastAPI up (workers + watchdog + reconciler)",),
             daemon=True
         ).start()
     except Exception:
