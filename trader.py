@@ -14,6 +14,7 @@ except Exception:
         print("[TG]", msg)
 
 LEVERAGE = float(os.getenv("LEVERAGE", "5"))
+TRACE_LOG = os.getenv("TRACE_LOG", "0") == "1"
 
 # ── TP 비율 (환경변수 반영) ───────────────────────────────────
 TP1_PCT = float(os.getenv("TP1_PCT", "0.30"))
@@ -29,6 +30,54 @@ STOP_COOLDOWN_SEC  = float(os.getenv("STOP_COOLDOWN_SEC", "5.0"))
 RECON_INTERVAL_SEC = float(os.getenv("RECON_INTERVAL_SEC", "60"))
 TP_EPSILON_RATIO   = float(os.getenv("TP_EPSILON_RATIO", "0.001"))
 RECON_DEBUG        = os.getenv("RECON_DEBUG", "0") == "1"   # 재시도 로그 on/off
+
+# ── Capacity guard (포지션 수 제한) ───────────────────────────
+MAX_OPEN_POSITIONS = int(os.getenv("MAX_OPEN_POSITIONS", "50"))
+CAP_CHECK_SEC      = float(os.getenv("CAP_CHECK_SEC", "10"))
+
+_CAPACITY = {"blocked": False, "last_count": 0, "ts": 0.0}
+_CAP_LOCK = threading.Lock()
+
+def capacity_status():
+    with _CAP_LOCK:
+        return {
+            "blocked": _CAPACITY["blocked"],
+            "last_count": _CAPACITY["last_count"],
+            "ts": _CAPACITY["ts"],
+            "max": MAX_OPEN_POSITIONS,
+            "interval": CAP_CHECK_SEC,
+        }
+
+def can_enter_now() -> bool:
+    with _CAP_LOCK:
+        return not _CAPACITY["blocked"]
+
+def _capacity_loop():
+    prev_blocked = None
+    while True:
+        try:
+            count = len(get_open_positions())  # long/short 합산
+            now = time.time()
+            blocked = count >= MAX_OPEN_POSITIONS
+            with _CAP_LOCK:
+                _CAPACITY["blocked"] = blocked
+                _CAPACITY["last_count"] = count
+                _CAPACITY["ts"] = now
+            # 상태 변화 시 알림(선택)
+            if prev_blocked is None or prev_blocked != blocked:
+                state = "BLOCKED (>= cap)" if blocked else "UNBLOCKED (< cap)"
+                try:
+                    send_telegram(f"ℹ️ Position capacity {state} | {count}/{MAX_OPEN_POSITIONS}")
+                except Exception:
+                    pass
+                prev_blocked = blocked
+        except Exception as e:
+            print("capacity guard error:", e)
+        time.sleep(CAP_CHECK_SEC)
+
+def start_capacity_guard():
+    t = threading.Thread(target=_capacity_loop, name="capacity-guard", daemon=True)
+    t.start()
 
 # ── Local state & locks ───────────────────────────────────────
 position_data: Dict[str, dict] = {}
@@ -93,6 +142,7 @@ def get_pending_snapshot() -> Dict[str, Dict]:
             "tp_keys": list(_PENDING["tp"].keys()),
             "interval": RECON_INTERVAL_SEC,
             "debug": RECON_DEBUG,
+            "capacity": capacity_status(),
         }
 
 # ── Helpers ───────────────────────────────────────────────────
@@ -130,6 +180,20 @@ def enter_position(symbol: str, usdt_amount: float, side: str = "long", leverage
     lev    = float(leverage or LEVERAGE)
     pkey   = _pending_key_entry(symbol, side)
 
+    trace = os.getenv("CURRENT_TRACE_ID", "")
+
+    if TRACE_LOG:
+        send_telegram(f"🔎 ENTRY request trace={trace} {symbol} {side} amt={usdt_amount}")
+
+    # ── 용량 가드: 포지션 가득 차면 즉시 스킵 (pending 등록 없이 바로 리턴)
+    if not can_enter_now():
+        try:
+            st = capacity_status()
+            send_telegram(f"🧱 capacity BLOCKED {symbol} {side} {st.get('last_count')}/{st.get('max')} trace={trace}")
+        except Exception:
+            pass
+        return
+
     # pending 등록
     with _PENDING_LOCK:
         _PENDING["entry"][pkey] = {"symbol": symbol, "side": side, "amount": usdt_amount,
@@ -145,6 +209,8 @@ def enter_position(symbol: str, usdt_amount: float, side: str = "long", leverage
 
         last = get_last_price(symbol)
         if not last or last <= 0:
+            if TRACE_LOG:
+                send_telegram(f"❗ ticker_fail {symbol} trace={trace}")
             # 실패 → 리컨실러가 재시도
             return
 
@@ -152,6 +218,9 @@ def enter_position(symbol: str, usdt_amount: float, side: str = "long", leverage
                                   side=("buy" if side == "long" else "sell"),
                                   leverage=lev, reduce_only=False)
         code = str(resp.get("code", ""))
+        if TRACE_LOG:
+            send_telegram(f"📦 order_resp code={code} {symbol} {side} trace={trace}")
+
         if code == "00000":
             with _POS_LOCK:
                 position_data[key] = {"symbol": symbol, "side": side, "entry_usd": usdt_amount, "ts": time.time()}
@@ -163,6 +232,8 @@ def enter_position(symbol: str, usdt_amount: float, side: str = "long", leverage
             _mark_done("entry", pkey, "(minQty/badQty)")
             send_telegram(f"⛔ ENTRY 스킵 {symbol} {side} → {resp}")
         else:
+            if TRACE_LOG:
+                send_telegram(f"❌ order_fail resp={resp} trace={trace}")
             # 네트워크/호출 실패 등은 리컨실러가 재시도
             pass
 
@@ -322,13 +393,21 @@ def _reconciler_loop():
                 if _get_remote_any_side(sym):
                     _mark_done("entry", pkey, "(exists)")
                     continue
+
+                # ── 용량 가드: 가득 차 있으면 이번 사이클 스킵(펜딩 유지)
+                if not can_enter_now():
+                    if TRACE_LOG:
+                        st = capacity_status()
+                        send_telegram(f"⏸️ retry_hold cap {sym} {side} {st['last_count']}/{st['max']}")
+                    continue
+
                 with _lock_for(key):
                     now = time.time()
                     if now - item.get("last_try", 0.0) < RECON_INTERVAL_SEC - 1:
                         continue
                     amt, lev = item["amount"], item["leverage"]
-                    if RECON_DEBUG:
-                        send_telegram(f"🔁 retry [entry] {pkey}")
+                    if RECON_DEBUG or TRACE_LOG:
+                        send_telegram(f"🔁 retry_entry {sym} {side} attempt={item.get('attempts',0)+1}")
                     resp = place_market_order(sym, amt,
                                               side=("buy" if side == "long" else "sell"),
                                               leverage=lev, reduce_only=False)
@@ -415,4 +494,3 @@ def start_watchdogs():
 def start_reconciler():
     t = threading.Thread(target=_reconciler_loop, name="reconciler", daemon=True)
     t.start()
-
