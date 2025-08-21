@@ -189,15 +189,18 @@ def place_market_order(symbol: str, usdt_amount: float, side: str, leverage: flo
         "orderType":  "market",
         "leverage":   str(leverage),
         "reduceOnly": bool(reduce_only),
+        "clientOid":  f"cli-{int(time.time()*1000)}"
     }
     bj = json.dumps(body)
     try:
         _rl("order", 0.12)
         res = requests.post(BASE_URL + path, headers=_headers("POST", path, bj), data=bj, timeout=15)
         if res.status_code != 200:
+            print("❌ order HTTP", res.status_code, res.text[:200])
             return {"code": f"HTTP_{res.status_code}", "msg": res.text}
         return res.json()
     except Exception as e:
+        print("❌ order EXC", str(e))
         return {"code": "LOCAL_EXCEPTION", "msg": str(e)}
 
 def place_reduce_by_size(symbol: str, size: float, side: str) -> Dict:
@@ -219,15 +222,18 @@ def place_reduce_by_size(symbol: str, size: float, side: str) -> Dict:
         "side":       "sell_single" if side.lower() == "long" else "buy_single",
         "orderType":  "market",
         "reduceOnly": True,
+        "clientOid":  f"cli-red-{int(time.time()*1000)}"
     }
     bj = json.dumps(body)
     try:
         _rl("order", 0.12)
         res = requests.post(BASE_URL + path, headers=_headers("POST", path, bj), data=bj, timeout=15)
         if res.status_code != 200:
+            print("❌ reduce HTTP", res.status_code, res.text[:200])
             return {"code": f"HTTP_{res.status_code}", "msg": res.text}
         return res.json()
     except Exception as e:
+        print("❌ reduce EXC", str(e))
         return {"code": "LOCAL_EXCEPTION", "msg": str(e)}
 
 # ── Positions ────────────────────────────────────────────────
@@ -284,4 +290,3 @@ def get_open_positions() -> List[Dict]:
         _POS_CACHE["cooldown_until"] = now + 90
         print("⚠️ position 새 조회 실패 → 캐시 반환(90s 쿨다운)")
     return _POS_CACHE["data"]
-
