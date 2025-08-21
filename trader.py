@@ -32,7 +32,7 @@ TP_EPSILON_RATIO   = float(os.getenv("TP_EPSILON_RATIO", "0.001"))
 RECON_DEBUG        = os.getenv("RECON_DEBUG", "0") == "1"
 
 # ── Capacity guard (주기적 모니터) ────────────────────────────
-MAX_OPEN_POSITIONS = int(os.getenv("MAX_OPEN_POSITIONS", "70"))
+MAX_OPEN_POSITIONS = int(os.getenv("MAX_OPEN_POSITIONS", "60"))
 CAP_CHECK_SEC      = float(os.getenv("CAP_CHECK_SEC", "10"))
 
 _CAPACITY = {"blocked": False, "last_count": 0, "ts": 0.0}
@@ -533,3 +533,4 @@ def start_watchdogs():
 def start_reconciler():
     t = threading.Thread(target=_reconciler_loop, name="reconciler", daemon=True)
     t.start()
+
