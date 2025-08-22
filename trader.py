@@ -27,7 +27,7 @@ STOP_CHECK_SEC     = float(os.getenv("STOP_CHECK_SEC", "1.0"))
 STOP_COOLDOWN_SEC  = float(os.getenv("STOP_COOLDOWN_SEC", "5.0"))
 
 # ── Reconciler ────────────────────────────────────────────────
-RECON_INTERVAL_SEC = float(os.getenv("RECON_INTERVAL_SEC", "60"))
+RECON_INTERVAL_SEC = float(os.getenv("RECON_INTERVAL_SEC", "50"))
 TP_EPSILON_RATIO   = float(os.getenv("TP_EPSILON_RATIO", "0.001"))
 RECON_DEBUG        = os.getenv("RECON_DEBUG", "0") == "1"
 
@@ -533,4 +533,5 @@ def start_watchdogs():
 def start_reconciler():
     t = threading.Thread(target=_reconciler_loop, name="reconciler", daemon=True)
     t.start()
+
 
