@@ -283,6 +283,11 @@ def _sweep_full_close(symbol: str, side: str, reason: str, max_retry: int = 5, s
     p = _get_remote(symbol, side)
     return (not p) or float(p.get("size", 0)) <= 0
 
+# ── Breakeven(본절) 스톱 설정 ─────────────────────────────────
+BE_ENABLE        = os.getenv("BE_ENABLE", "1") == "1"           # 기본 ON (원하지 않으면 0)
+BE_AFTER_STAGE   = int(os.getenv("BE_AFTER_STAGE", "1"))        # 1=TP1부터, 2=TP2부터
+BE_EPSILON_RATIO = float(os.getenv("BE_EPSILON_RATIO", "0.0005"))  # 0.05% 완충
+
 def take_partial_profit(symbol: str, pct: float, side: str = "long"):
     symbol = convert_symbol(symbol)
     side   = (side or "long").lower()
@@ -322,6 +327,21 @@ def take_partial_profit(symbol: str, pct: float, side: str = "long"):
                 f"🤑 TP {int(pct*100)}% {side.upper()} {symbol}\n"
                 f"• Exit: {exit_price}\n• Cut size: {cut_size}\n• Realized≈ {realized:+.2f} USDT"
             )
+            # ── [추가] TP1/TP2 수익 체결 시 본절 스톱 무장
+            try:
+                stage = 1 if abs(float(pct) - TP1_PCT) <= 1e-6 else (2 if abs(float(pct) - TP2_PCT) <= 1e-6 else 0)
+                if BE_ENABLE and stage in (1, 2) and stage >= BE_AFTER_STAGE:
+                    profited = (exit_price > entry) if side == "long" else (exit_price < entry)
+                    if profited:
+                        with _POS_LOCK:
+                            st = position_data.get(key, {}) or {}
+                            st["be_armed"] = True
+                            st["be_entry"] = entry
+                            st["be_from_stage"] = stage
+                            position_data[key] = st
+                        send_telegram(f"🧷 Breakeven ARMED at entry≈{entry} ({symbol} {side}, from TP{stage})")
+            except Exception as _:
+                pass
 
 def close_position(symbol: str, side: str = "long", reason: str = "manual"):
     symbol = convert_symbol(symbol)
@@ -364,7 +384,9 @@ def close_position(symbol: str, side: str = "long", reason: str = "manual"):
             _mark_done("close", pkey)
             send_telegram(
                 f"✅ CLOSE {side.upper()} {symbol} ({reason})\n"
-                f"• Exit: {exit_price}\n• Size: {size}\n• Realized≈ {realized:+.2f} USDT"
+                f"• Exit: {exit_price}\n"
+                f"• Size: {size}\n"
+                f"• Realized≈ {realized:+.2f} USDT"
             )
 
 def reduce_by_contracts(symbol: str, contracts: float, side: str = "long"):
@@ -410,6 +432,41 @@ def _watchdog_loop():
         except Exception as e:
             print("watchdog error:", e)
         time.sleep(STOP_CHECK_SEC)
+
+# ── Breakeven(본절) 워치독 ────────────────────────────────────
+def _breakeven_watchdog():
+    if not BE_ENABLE:
+        return
+    while True:
+        try:
+            for p in get_open_positions():
+                symbol = p.get("symbol"); side = (p.get("side") or "").lower()
+                entry  = float(p.get("entry_price") or 0)
+                size   = float(p.get("size") or 0)
+                if not symbol or side not in ("long","short") or entry <= 0 or size <= 0:
+                    continue
+
+                key = _key(symbol, side)
+                with _POS_LOCK:
+                    st = position_data.get(key, {}) or {}
+                    be_armed = bool(st.get("be_armed"))
+                    be_entry = float(st.get("be_entry") or 0.0)
+
+                if not (be_armed and be_entry > 0):
+                    continue
+
+                last = get_last_price(symbol)
+                if not last:
+                    continue
+
+                eps = max(be_entry * BE_EPSILON_RATIO, 0.0)  # 진입가 근처 노이즈 완충
+                trigger = (last <= be_entry - eps) if side == "long" else (last >= be_entry + eps)
+                if trigger:
+                    send_telegram(f"🧷 Breakeven stop → CLOSE {side.upper()} {symbol} @≈{last} (entry≈{be_entry})")
+                    close_position(symbol, side=side, reason="breakeven")
+        except Exception as e:
+            print("breakeven watchdog error:", e)
+        time.sleep(0.8)
 
 # ── Reconciler (1분 주기 재시도) ──────────────────────────────
 def _reconciler_loop():
@@ -529,11 +586,10 @@ def _reconciler_loop():
 def start_watchdogs():
     t = threading.Thread(target=_watchdog_loop, name="emergency-stop-watchdog", daemon=True)
     t.start()
+    # 본절 스톱 워치독 시작 (요청 기능 추가)
+    if BE_ENABLE:
+        threading.Thread(target=_breakeven_watchdog, name="breakeven-watchdog", daemon=True).start()
 
 def start_reconciler():
     t = threading.Thread(target=_reconciler_loop, name="reconciler", daemon=True)
     t.start()
-
-
-
-
