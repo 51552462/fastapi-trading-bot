@@ -40,8 +40,16 @@ def _headers(method: str, path_with_query: str, body: str = "") -> Dict[str, str
 
 # ── Optional symbol aliases (TradingView ↔ Bitget 선물 심볼 불일치 보정) ──
 ALIASES: Dict[str, str] = {
-    # 예시) "KAIAUSDT": "KLAYUSDT",
+    # 예시) "KAIAUSDT": "KLAYUSDT",  # 필요시 환경변수로 주입하세요.
 }
+
+# 환경변수로 매핑 주입 (예: {"KAIAUSDT":"KLAYUSDT","TNSRUSDT":"TNSRUSDT"})
+_alias_env = os.getenv("SYMBOL_ALIASES_JSON", "")
+if _alias_env:
+    try:
+        ALIASES.update(json.loads(_alias_env))
+    except Exception:
+        pass
 
 # ── Symbol helpers ─────────────────────────────────────────────
 def convert_symbol(sym: str) -> str:
