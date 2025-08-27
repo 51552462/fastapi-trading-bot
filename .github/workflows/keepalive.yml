@@ -2,7 +2,9 @@ name: KeepAlive Ping
 
 on:
   schedule:
-    - cron: "*/5 * * * *"      # 5분마다 (UTC 기준)
+    # 정각(:00)을 피해서 5분 간격 유지 (UTC 기준)
+    # 03,08,13,18,23,28,33,38,43,48,53,58 분에만 실행
+    - cron: "3,8,13,18,23,28,33,38,43,48,53,58 * * * *"
   workflow_dispatch:           # 수동 실행 버튼
 
 jobs:
@@ -16,7 +18,7 @@ jobs:
 
     steps:
       - name: Jitter (spread load)
-        run: sleep $((RANDOM % 60))   # 정각 몰림 방지(0~59초 랜덤 대기)
+        run: sleep $((RANDOM % 60))   # 시작 시각 분산(충돌 완화)
 
       - name: Ping /health
         env:
