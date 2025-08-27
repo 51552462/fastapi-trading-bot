@@ -38,72 +38,6 @@ CAP_CHECK_SEC      = float(os.getenv("CAP_CHECK_SEC", "10"))
 _CAPACITY = {"blocked": False, "last_count": 0, "ts": 0.0}
 _CAP_LOCK = threading.Lock()
 
-def capacity_status():
-    with _CAP_LOCK, _RES_LOCK:
-        return {
-            "blocked": _CAPACITY["blocked"],
-            "last_count": _CAPACITY["last_count"],
-            "reserved": _RESERVE["count"],
-            "effective_now": _CAPACITY["last_count"] + _RESERVE["count"],
-            "max": MAX_OPEN_POSITIONS,
-            "interval": CAP_CHECK_SEC,
-            "ts": _CAPACITY["ts"],
-        }
-
-def can_enter_now() -> bool:
-    with _CAP_LOCK:
-        return not _CAPACITY["blocked"]
-
-def _capacity_loop():
-    prev_blocked = None
-    while True:
-        try:
-            count = len(get_open_positions())  # long/short 합산
-            now = time.time()
-            blocked = count >= MAX_OPEN_POSITIONS
-            with _CAP_LOCK:
-                _CAPACITY["blocked"] = blocked
-                _CAPACITY["last_count"] = count
-                _CAPACITY["ts"] = now
-            if prev_blocked is None or prev_blocked != blocked:
-                state = "BLOCKED (>= cap)" if blocked else "UNBLOCKED (< cap)"
-                try:
-                    send_telegram(f"ℹ️ Position capacity {state} | {count}/{MAX_OPEN_POSITIONS}")
-                except Exception:
-                    pass
-                prev_blocked = blocked
-        except Exception as e:
-            print("capacity guard error:", e)
-        time.sleep(CAP_CHECK_SEC)
-
-def start_capacity_guard():
-    t = threading.Thread(target=_capacity_loop, name="capacity-guard", daemon=True)
-    t.start()
-
-# ── STRICT admission (실시간 예약 토큰 게이트) ────────────────
-_RESERVE = {"count": 0}
-_RES_LOCK = threading.Lock()
-
-def _strict_try_reserve() -> bool:
-    """원격 오픈수 + 로컬 예약수 기준으로 원자적으로 슬롯 선점."""
-    try:
-        open_now = len(get_open_positions())
-    except Exception:
-        # 원격 조회 실패 시 마지막 카운트 사용
-        with _CAP_LOCK:
-            open_now = _CAPACITY["last_count"]
-    with _RES_LOCK:
-        effective = open_now + _RESERVE["count"]
-        if effective >= MAX_OPEN_POSITIONS:
-            return False
-        _RESERVE["count"] += 1
-        return True
-
-def _strict_release():
-    with _RES_LOCK:
-        if _RESERVE["count"] > 0:
-            _RESERVE["count"] -= 1
-
 # ── Local state & locks ───────────────────────────────────────
 position_data: Dict[str, dict] = {}
 _POS_LOCK = threading.RLock()
@@ -119,6 +53,18 @@ def _lock_for(key: str):
         if key not in _KEY_LOCKS:
             _KEY_LOCKS[key] = threading.RLock()
     return _KEY_LOCKS[key]
+
+def _local_open_count() -> int:
+    with _POS_LOCK:
+        return len(position_data)
+
+def _local_has_any(symbol: str) -> bool:
+    symbol = convert_symbol(symbol)
+    with _POS_LOCK:
+        for k in position_data.keys():
+            if k.startswith(symbol + "_"):
+                return True
+    return False
 
 # ── Stop fire 쿨다운 ──────────────────────────────────────────
 _STOP_FIRED: Dict[str, float] = {}
@@ -159,7 +105,7 @@ def _mark_done(typ: str, pkey: str, note: str = ""):
 
 def get_pending_snapshot() -> Dict[str, Dict]:
     """/pending 조회용(메인에서 노출)"""
-    with _PENDING_LOCK, _RES_LOCK, _CAP_LOCK:
+    with _PENDING_LOCK, _CAP_LOCK, _POS_LOCK:
         return {
             "counts": {k: len(v) for k, v in _PENDING.items()},
             "entry_keys": list(_PENDING["entry"].keys()),
@@ -170,12 +116,13 @@ def get_pending_snapshot() -> Dict[str, Dict]:
             "capacity": {
                 "blocked": _CAPACITY["blocked"],
                 "last_count": _CAPACITY["last_count"],
-                "reserved": _RESERVE["count"],
-                "effective_now": _CAPACITY["last_count"] + _RESERVE["count"],
+                "local_open": _local_open_count(),
+                "effective_now": _CAPACITY["last_count"],
                 "max": MAX_OPEN_POSITIONS,
                 "interval": CAP_CHECK_SEC,
                 "ts": _CAPACITY["ts"],
             },
+            "local_keys": list(position_data.keys()),
         }
 
 # ── Helpers ───────────────────────────────────────────────────
@@ -205,6 +152,71 @@ def _loss_ratio_on_margin(entry: float, last: float, size: float, side: str, lev
     margin = max(1e-9, notional / max(1.0, leverage))
     return max(0.0, -pnl) / margin  # 양수 = 손실
 
+# ── Capacity ──────────────────────────────────────────────────
+def capacity_status():
+    with _CAP_LOCK:
+        return {
+            "blocked": _CAPACITY["blocked"],
+            "last_count": _CAPACITY["last_count"],
+            "max": MAX_OPEN_POSITIONS,
+            "interval": CAP_CHECK_SEC,
+            "ts": _CAPACITY["ts"],
+        }
+
+def can_enter_now() -> bool:
+    with _CAP_LOCK:
+        return not _CAPACITY["blocked"]
+
+def _capacity_loop():
+    prev_blocked = None
+    while True:
+        try:
+            # 원격 오픈수 + 로컬 엔트리 기록 합산(안전)
+            count = len(get_open_positions()) + _local_open_count()
+            now = time.time()
+            blocked = count >= MAX_OPEN_POSITIONS
+            with _CAP_LOCK:
+                _CAPACITY["blocked"] = blocked
+                _CAPACITY["last_count"] = count
+                _CAPACITY["ts"] = now
+            if prev_blocked is None or prev_blocked != blocked:
+                state = "BLOCKED (>= cap)" if blocked else "UNBLOCKED (< cap)"
+                try:
+                    send_telegram(f"ℹ️ Position capacity {state} | {count}/{MAX_OPEN_POSITIONS}")
+                except Exception:
+                    pass
+                prev_blocked = blocked
+        except Exception as e:
+            print("capacity guard error:", e)
+        time.sleep(CAP_CHECK_SEC)
+
+def start_capacity_guard():
+    t = threading.Thread(target=_capacity_loop, name="capacity-guard", daemon=True)
+    t.start()
+
+# ── STRICT admission (실시간 예약 토큰 게이트) ────────────────
+_RESERVE = {"count": 0}
+_RES_LOCK = threading.Lock()
+
+def _strict_try_reserve() -> bool:
+    """원격 오픈수 + 로컬 오픈수 + 로컬 예약수 기준으로 원자적으로 슬롯 선점."""
+    try:
+        open_now_remote = len(get_open_positions())
+    except Exception:
+        open_now_remote = 0
+    local_now = _local_open_count()
+    with _RES_LOCK, _CAP_LOCK:
+        effective = open_now_remote + local_now + _RESERVE["count"]
+        if effective >= MAX_OPEN_POSITIONS:
+            return False
+        _RESERVE["count"] += 1
+        return True
+
+def _strict_release():
+    with _RES_LOCK:
+        if _RESERVE["count"] > 0:
+            _RESERVE["count"] -= 1
+
 # ── Trading ops ───────────────────────────────────────────────
 def enter_position(symbol: str, usdt_amount: float, side: str = "long", leverage: float = None):
     symbol = convert_symbol(symbol)
@@ -218,16 +230,16 @@ def enter_position(symbol: str, usdt_amount: float, side: str = "long", leverage
     if TRACE_LOG:
         send_telegram(f"🔎 ENTRY request trace={trace} {symbol} {side} amt={usdt_amount}")
 
-    # ── 실시간 엄격 게이트: 슬롯 선점 실패 시 즉시 스킵
+    # ── 실시간 엄격 게이트
     if not _strict_try_reserve():
         st = capacity_status()
-        send_telegram(f"🧱 STRICT HOLD {symbol} {side} {st['effective_now']}/{st['max']} trace={trace}")
+        send_telegram(f"🧱 STRICT HOLD {symbol} {side} {st['last_count']}/{MAX_OPEN_POSITIONS} trace={trace}")
         return
     try:
-        # (선택) 주기적 가드도 병행: blocked면 조기 스킵
+        # (보조) 주기적 가드
         if not can_enter_now():
             st = capacity_status()
-            send_telegram(f"⏳ ENTRY HOLD (periodic) {symbol} {side} {st['last_count']}/{st['max']} trace={trace}")
+            send_telegram(f"⏳ ENTRY HOLD (periodic) {symbol} {side} {st['last_count']}/{MAX_OPEN_POSITIONS} trace={trace}")
             return
 
         # pending 등록
@@ -238,7 +250,8 @@ def enter_position(symbol: str, usdt_amount: float, side: str = "long", leverage
             send_telegram(f"📌 pending add [entry] {pkey}")
 
         with _lock_for(key):
-            if _get_remote_any_side(symbol):
+            # ✅ 로컬/원격 둘 다 확인 → 이미 보유 시 재진입 차단
+            if _local_has_any(symbol) or _get_remote_any_side(symbol):
                 _mark_done("entry", pkey, "(exists)")
                 return
 
@@ -479,15 +492,16 @@ def _reconciler_loop():
             for pkey, item in entry_items:
                 sym, side = item["symbol"], item["side"]
                 key = _key(sym, side)
-                if _get_remote_any_side(sym):
+                # ✅ 로컬/원격 모두 확인 → 이미 보유면 재시도 중단
+                if _local_has_any(sym) or _get_remote_any_side(sym):
                     _mark_done("entry", pkey, "(exists)")
                     continue
 
-                # 실시간 엄격 게이트: 슬롯 선점 실패 시 이번 사이클 스킵
+                # 실시간 엄격 게이트
                 if not _strict_try_reserve():
                     if TRACE_LOG:
                         st = capacity_status()
-                        send_telegram(f"⏸️ retry_hold STRICT {sym} {side} {st['effective_now']}/{st['max']}")
+                        send_telegram(f"⏸️ retry_hold STRICT {sym} {side} {st['last_count']}/{MAX_OPEN_POSITIONS}")
                     continue
 
                 try:
@@ -510,6 +524,8 @@ def _reconciler_loop():
                         code = str(resp.get("code", ""))
                         if code == "00000":
                             _mark_done("entry", pkey)
+                            with _POS_LOCK:
+                                position_data[key] = {"symbol": sym, "side": side, "entry_usd": amt, "ts": time.time()}
                             send_telegram(f"🔁 ENTRY 재시도 성공 {side.upper()} {sym}")
                         elif code.startswith("LOCAL_MIN_QTY") or code.startswith("LOCAL_BAD_QTY"):
                             _mark_done("entry", pkey, "(minQty/badQty)")
@@ -526,6 +542,8 @@ def _reconciler_loop():
                 p = _get_remote(sym, side)
                 if not p or float(p.get("size", 0)) <= 0:
                     _mark_done("close", pkey, "(no-remote)")
+                    with _POS_LOCK:
+                        position_data.pop(key, None)
                     continue
                 with _lock_for(key):
                     now = time.time()
@@ -541,6 +559,8 @@ def _reconciler_loop():
                         ok = _sweep_full_close(sym, side, "reconcile")
                         if ok:
                             _mark_done("close", pkey)
+                            with _POS_LOCK:
+                                position_data.pop(key, None)
                             send_telegram(f"🔁 CLOSE 재시도 성공 {side.upper()} {sym}")
 
             # TP3 재시도
@@ -583,10 +603,15 @@ def _reconciler_loop():
             print("reconciler error:", e)
 
 # ── Starters ──────────────────────────────────────────────────
+def start_capacity_guard():
+    # 이미 위에서 정의. 호출부에서 사용.
+    _capacity_loop_thread = threading.Thread(target=_capacity_loop, name="capacity-guard", daemon=True)
+    _capacity_loop_thread.start()
+
 def start_watchdogs():
     t = threading.Thread(target=_watchdog_loop, name="emergency-stop-watchdog", daemon=True)
     t.start()
-    # 본절 스톱 워치독 시작 (요청 기능 추가)
+    # 본절 스톱 워치독 시작 (요청 기능 유지)
     if BE_ENABLE:
         threading.Thread(target=_breakeven_watchdog, name="breakeven-watchdog", daemon=True).start()
 
