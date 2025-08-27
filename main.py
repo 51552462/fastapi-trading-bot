@@ -5,7 +5,7 @@ from fastapi import FastAPI, Request
 
 from trader import (
     enter_position, take_partial_profit, close_position, reduce_by_contracts,
-    start_watchdogs, start_reconciler, get_pending_snapshot
+    start_watchdogs, start_reconciler, get_pending_snapshot, start_capacity_guard
 )
 from telegram_bot import send_telegram
 from bitget_api import convert_symbol, get_open_positions
@@ -198,7 +198,7 @@ async def _ingest(req: Request):
     return {"ok": True, "queued": True, "qsize": _task_q.qsize()}
 
 # ── Endpoints (호환 경로 3개 + 루트/헬스) ──────────────────────
-@app.get("/")
+app.get("/")
 def root():
     return {"ok": True}
 
@@ -252,14 +252,15 @@ def on_startup():
     for i in range(WORKERS):
         t = threading.Thread(target=_worker_loop, args=(i,), daemon=True, name=f"signal-worker-{i}")
         t.start()
-    # 긴급 스탑 워치독 + 리컨실러 시작
+    # 가드/워치독/리컨실러 시작
+    start_capacity_guard()
     start_watchdogs()
     start_reconciler()
     # 텔레그램 알림은 비동기로(콜드스타트 지연 방지)
     try:
         threading.Thread(
             target=send_telegram,
-            args=("✅ FastAPI up (workers + watchdog + reconciler)",),
+            args=("✅ FastAPI up (workers + watchdog + reconciler + capacity-guard)",),
             daemon=True
         ).start()
     except Exception:
