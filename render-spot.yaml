@@ -1,0 +1,7 @@
+services:
+  - type: web
+    name: fastapi-spot-bot
+    env: python
+    plan: free
+    startCommand: uvicorn main_spot:app --host 0.0.0.0 --port 10001
+    autoDeploy: true
