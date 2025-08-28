@@ -8,17 +8,13 @@ API_KEY        = os.getenv("BITGET_API_KEY", "")
 API_SECRET     = os.getenv("BITGET_API_SECRET", "")
 API_PASSPHRASE = os.getenv("BITGET_API_PASSWORD", "")
 
-# ── Simple rate-limit guard (best-effort) ─────────────────────
 _last_call = {}
 def _rl(key: str, min_interval: float = 0.08):
-    now = time.time()
-    prev = _last_call.get(key, 0.0)
+    now = time.time(); prev = _last_call.get(key, 0.0)
     wait = min_interval - (now - prev)
-    if wait > 0:
-        time.sleep(wait)
+    if wait > 0: time.sleep(wait)
     _last_call[key] = time.time()
 
-# ── Auth (Bitget: HMAC-SHA256 → base64) ───────────────────────
 def _ts() -> str:
     return str(int(time.time() * 1000))
 
@@ -38,129 +34,89 @@ def _headers(method: str, path_with_query: str, body: str = "") -> Dict[str, str
         "locale": "en-US",
     }
 
-# ── Optional symbol aliases (TradingView ↔ Bitget 선물 심볼 불일치 보정) ──
-ALIASES: Dict[str, str] = {
-    # 예시) "KAIAUSDT": "KLAYUSDT",  # 필요시 환경변수로 주입하세요.
-}
-
-# 환경변수로 매핑 주입 (예: {"KAIAUSDT":"KLAYUSDT","TNSRUSDT":"TNSRUSDT"})
+# TradingView ↔ Bitget 심볼 보정(필요 시 환경변수로 주입)
+ALIASES: Dict[str, str] = {}
 _alias_env = os.getenv("SYMBOL_ALIASES_JSON", "")
 if _alias_env:
-    try:
-        ALIASES.update(json.loads(_alias_env))
-    except Exception:
-        pass
+    try: ALIASES.update(json.loads(_alias_env))
+    except: pass
 
-# ── Symbol helpers ─────────────────────────────────────────────
 def convert_symbol(sym: str) -> str:
     s = (sym or "").upper().replace("/", "").replace("-", "").replace("_", "")
-    if s.endswith("PERP"):
-        s = s[:-4]
+    if s.endswith("PERP"): s = s[:-4]
     return ALIASES.get(s, s)
 
 def _mix_symbol(sym: str) -> str:
     return f"{convert_symbol(sym)}_UMCBL"
 
-# ── Ticker cache & fallbacks ──────────────────────────────────
-_TICKER_CACHE: Dict[str, tuple] = {}  # { "BTCUSDT": (ts, price) }
-TICKER_TTL   = float(os.getenv("TICKER_TTL", "2.5"))            # seconds
-STRICT_TICKER = os.getenv("STRICT_TICKER", "0") == "1"          # 1 → 폴백 금지
+_TICKER_CACHE: Dict[str, tuple] = {}
+TICKER_TTL    = float(os.getenv("TICKER_TTL", "2.5"))
+STRICT_TICKER = os.getenv("STRICT_TICKER", "0") == "1"
 
 def _depth_midprice(symbol: str) -> Optional[float]:
-    """ticker 비거나 에러일 때 오더북 최우선 호가로 미드프라이스 산출."""
-    path = "/api/mix/v1/market/depth"
-    q = f"symbol={_mix_symbol(symbol)}&limit=5"
     try:
         _rl("depth", 0.08)
-        r = requests.get(f"{BASE_URL}{path}?{q}", timeout=10)
-        j = r.json()
-        d = j.get("data") or {}
-        asks = d.get("asks") or d.get("ask") or []
-        bids = d.get("bids") or d.get("bid") or []
+        r = requests.get(f"{BASE_URL}/api/mix/v1/market/depth?symbol={_mix_symbol(symbol)}&limit=5", timeout=10)
+        j = r.json(); d = j.get("data") or {}
+        asks = d.get("asks") or d.get("ask") or []; bids = d.get("bids") or d.get("bid") or []
         if asks and bids:
-            best_ask = float(asks[0][0])
-            best_bid = float(bids[0][0])
-            if best_ask > 0 and best_bid > 0:
-                return (best_ask + best_bid) / 2.0
-    except Exception:
-        pass
+            a = float(asks[0][0]); b = float(bids[0][0])
+            if a > 0 and b > 0: return (a + b) / 2.0
+    except: pass
     return None
 
-def get_last_price(symbol: str, retries: int = 6, sleep_base: float = 0.20) -> Optional[float]:
-    """USDT-M 선물(UMCBL) last 가격. 실패 시: 오더북 미드프라이스 → 캐시 폴백(엄격모드 해제 시)"""
+def get_last_price(symbol: str, retries: int = 6, base: float = 0.20) -> Optional[float]:
     sym = convert_symbol(symbol)
-
-    # 1) 캐시 히트
-    c = _TICKER_CACHE.get(sym)
-    now = time.time()
-    if c and now - c[0] <= TICKER_TTL:
-        return float(c[1])
+    c = _TICKER_CACHE.get(sym); now = time.time()
+    if c and now - c[0] <= TICKER_TTL: return float(c[1])
 
     url = f"{BASE_URL}/api/mix/v1/market/ticker?symbol={_mix_symbol(sym)}"
-
     for i in range(retries):
         try:
             _rl("ticker", 0.06)
             r = requests.get(url, timeout=10)
             if r.status_code != 200:
-                time.sleep(sleep_base * (2 ** i) + random.uniform(0, 0.1))
-                continue
-            j = r.json()
-            data = j.get("data")
+                time.sleep(base * (2 ** i) + random.uniform(0, 0.1)); continue
+            j = r.json(); data = j.get("data")
             if data and data.get("last") is not None:
                 px = float(data["last"])
                 if px > 0:
-                    _TICKER_CACHE[sym] = (time.time(), px)
-                    return px
-            # ticker 비면 오더북 미드프라이스 폴백
+                    _TICKER_CACHE[sym] = (time.time(), px); return px
             alt = _depth_midprice(sym)
             if alt and alt > 0:
-                _TICKER_CACHE[sym] = (time.time(), alt)
-                return alt
-        except Exception:
-            pass
-        time.sleep(sleep_base * (2 ** i) + random.uniform(0, 0.1))
+                _TICKER_CACHE[sym] = (time.time(), alt); return alt
+        except: pass
+        time.sleep(base * (2 ** i) + random.uniform(0, 0.1))
 
-    # 2) 최종 실패 → 캐시 폴백(엄격모드가 아니면)
     if not STRICT_TICKER:
         c = _TICKER_CACHE.get(sym)
-        if c:
-            return float(c[1])
+        if c: return float(c[1])
+    print(f"❌ Ticker 실패(최종): {_mix_symbol(sym)}"); return None
 
-    print(f"❌ Ticker 실패(최종): {_mix_symbol(sym)}")
-    return None
-
-# ── Symbol spec cache (sizeStep / minQty) ─────────────────────
 _SYMBOLS_CACHE = {"ts": 0.0, "data": {}}
-
 def _refresh_symbols_cache():
-    path = "/api/mix/v1/public/symbols"
-    q    = "productType=umcbl"
     try:
         _rl("symbols", 0.15)
-        r = requests.get(f"{BASE_URL}{path}?{q}", headers=_headers("GET", f"{path}?{q}", ""), timeout=12)
-        j = r.json()
-        arr = j.get("data") or []
+        r = requests.get(f"{BASE_URL}/api/mix/v1/public/symbols?productType=umcbl",
+                         headers=_headers("GET", "/api/mix/v1/public/symbols?productType=umcbl", ""), timeout=12)
+        j = r.json(); arr = j.get("data") or []
         m = {}
         for it in arr:
-            sym_full = (it.get("symbol") or "")
-            if not sym_full.endswith("_UMCBL"):
-                continue
-            sym_core   = sym_full.replace("_UMCBL", "")
+            sym_full = it.get("symbol") or ""
+            if not sym_full.endswith("_UMCBL"): continue
+            sym_core = sym_full.replace("_UMCBL", "")
             size_scale = int(it.get("sizeScale") or 0)
             size_step  = 10 ** (-size_scale) if size_scale >= 0 else 0.001
             min_qty    = float(it.get("minTradeNum") or it.get("minOrderSize") or 0.0)
             m[sym_core] = {"sizeStep": size_step, "minQty": min_qty}
-        _SYMBOLS_CACHE["data"] = m
-        _SYMBOLS_CACHE["ts"]   = time.time()
+        _SYMBOLS_CACHE["data"] = m; _SYMBOLS_CACHE["ts"] = time.time()
     except Exception as e:
         print("❌ 심볼 캐시 갱신 실패:", e)
 
 def get_symbol_spec(symbol: str) -> Dict[str, float]:
     now = time.time()
-    if now - _SYMBOLS_CACHE["ts"] > 600 or not _SYMBOLS_CACHE["data"]:
-        _refresh_symbols_cache()
-    sym  = convert_symbol(symbol)
+    if now - _SYMBOLS_CACHE["ts"] > 600 or not _SYMBOLS_CACHE["data"]: _refresh_symbols_cache()
+    sym = convert_symbol(symbol)
     spec = _SYMBOLS_CACHE["data"].get(sym)
     if not spec:
         spec = {"sizeStep": 0.001, "minQty": 0.001}
@@ -168,22 +124,15 @@ def get_symbol_spec(symbol: str) -> Dict[str, float]:
     return spec
 
 def round_down_step(qty: float, step: float) -> float:
-    if step <= 0:
-        return round(qty, 6)
-    k = math.floor(qty / step)
-    return round(k * step, 6)
+    if step <= 0: return round(qty, 6)
+    k = math.floor(qty / step); return round(k * step, 6)
 
-# ── Orders ────────────────────────────────────────────────────
 def place_market_order(symbol: str, usdt_amount: float, side: str, leverage: float = 5, reduce_only: bool = False) -> Dict:
-    """usdt_amount → 시장가 수량 환산 후 주문. side='buy'|'sell'"""
     last = get_last_price(symbol)
-    if not last:
-        return {"code": "LOCAL_TICKER_FAIL", "msg": "ticker_none"}
-
+    if not last: return {"code": "LOCAL_TICKER_FAIL", "msg": "ticker_none"}
     spec = get_symbol_spec(symbol)
     qty  = round_down_step(usdt_amount / last, float(spec.get("sizeStep", 0.001)))
-    if qty <= 0:
-        return {"code": "LOCAL_BAD_QTY", "msg": f"qty {qty}"}
+    if qty <= 0: return {"code": "LOCAL_BAD_QTY", "msg": f"qty {qty}"}
     if qty < float(spec.get("minQty", 0.0)):
         need = float(spec.get("minQty")) * last
         return {"code": "LOCAL_MIN_QTY", "msg": f"need≈{need:.6f}USDT", "qty": qty}
@@ -212,15 +161,11 @@ def place_market_order(symbol: str, usdt_amount: float, side: str, leverage: flo
         return {"code": "LOCAL_EXCEPTION", "msg": str(e)}
 
 def place_reduce_by_size(symbol: str, size: float, side: str) -> Dict:
-    """size 계약 수량을 reduceOnly 시장가로 청산. side='long'→sell_single, 'short'→buy_single"""
     size = float(size)
-    if size <= 0:
-        return {"code": "LOCAL_BAD_QTY", "msg": "size<=0"}
-
+    if size <= 0: return {"code": "LOCAL_BAD_QTY", "msg": "size<=0"}
     step = float(get_symbol_spec(symbol).get("sizeStep", 0.001))
     size = round_down_step(size, step)
-    if size <= 0:
-        return {"code": "LOCAL_STEP_ZERO", "msg": "after_step=0"}
+    if size <= 0: return {"code": "LOCAL_STEP_ZERO", "msg": "after_step=0"}
 
     path = "/api/mix/v1/order/placeOrder"
     body = {
@@ -244,42 +189,32 @@ def place_reduce_by_size(symbol: str, size: float, side: str) -> Dict:
         print("❌ reduce EXC", str(e))
         return {"code": "LOCAL_EXCEPTION", "msg": str(e)}
 
-# ── Positions ────────────────────────────────────────────────
 _POS_CACHE = {"data": [], "ts": 0.0, "cooldown_until": 0.0}
-
-def _ffloat(x):
+def _ffloat(x): 
     try: return float(x)
     except: return 0.0
 
 def _fetch_positions() -> List[Dict]:
-    path = "/api/mix/v1/position/allPosition"
-    q    = "productType=umcbl"
     try:
         _rl("positions", 0.10)
-        res = requests.get(f"{BASE_URL}{path}?{q}", headers=_headers("GET", f"{path}?{q}", ""), timeout=12)
+        res = requests.get(f"{BASE_URL}/api/mix/v1/position/allPosition?productType=umcbl",
+                           headers=_headers("GET", "/api/mix/v1/position/allPosition?productType=umcbl", ""), timeout=12)
         j = res.json()
     except Exception as e:
-        print("❌ position fetch 예외:", e)
-        return []
-
-    if not j or j.get("code") not in ("00000", "0"):
-        print("❌ position 응답 이상:", j)
-        return []
-
+        print("❌ position fetch 예외:", e); return []
+    if not j or j.get("code") not in ("00000","0"):
+        print("❌ position 응답 이상:", j); return []
     raw = j.get("data") or []
-    if isinstance(raw, dict):
-        raw = raw.get("positions") or raw.get("list") or []
-
+    if isinstance(raw, dict): raw = raw.get("positions") or raw.get("list") or []
     out: List[Dict] = []
     for it in raw:
         sym_full = it.get("symbol") or ""
-        if not sym_full.endswith("_UMCBL"):
-            continue
-        sym_core = sym_full.replace("_UMCBL", "")
-        hold     = (it.get("holdSide") or it.get("side") or "").lower()  # long | short
+        if not sym_full.endswith("_UMCBL"): continue
+        sym_core = sym_full.replace("_UMCBL","")
+        hold     = (it.get("holdSide") or it.get("side") or "").lower()
         sz       = _ffloat(it.get("total") or it.get("available") or it.get("size"))
         avg      = _ffloat(it.get("averageOpenPrice") or it.get("avgOpenPrice") or it.get("entryPrice"))
-        if sz > 0 and hold in ("long", "short"):
+        if sz > 0 and hold in ("long","short"):
             out.append({"symbol": sym_core, "side": hold, "size": sz, "entry_price": avg})
     return out
 
@@ -289,11 +224,8 @@ def get_open_positions() -> List[Dict]:
         return _POS_CACHE["data"]
     res = _fetch_positions()
     if res:
-        _POS_CACHE["data"] = res
-        _POS_CACHE["ts"] = now
-        _POS_CACHE["cooldown_until"] = 0.0
+        _POS_CACHE["data"] = res; _POS_CACHE["ts"] = now; _POS_CACHE["cooldown_until"] = 0.0
         return res
-    # 실패 시 캐시 반환 + 쿨다운
     if _POS_CACHE["data"]:
         _POS_CACHE["cooldown_until"] = now + 90
         print("⚠️ position 새 조회 실패 → 캐시 반환(90s 쿨다운)")
