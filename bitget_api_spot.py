@@ -136,36 +136,76 @@ def get_last_price_spot(symbol: str, retries: int = 5, sleep_base: float = 0.18)
         time.sleep(sleep_base * (2 ** i))
     return None
 
-# ---------- balances ----------
+# ---------- balances (v2 우선, v1 폴백) ----------
 _BAL_CACHE = {"ts": 0.0, "data": {}}
 
-def get_spot_balances() -> Dict[str, float]:
+def _fetch_assets_v2(coin: str | None = None) -> dict:
+    path = "/api/v2/spot/account/assets"
+    if coin:
+        path += f"?coin={coin}"
+    _rl("spot_bal_v2", 0.15)
+    r = requests.get(BASE_URL + path, headers=_headers("GET", path, ""), timeout=12)
+    j = r.json()
+    arr = j.get("data") or []
+    m = {}
+    for it in arr:
+        c = (it.get("coin") or "").upper()
+        if not c:
+            continue
+        avail = float(it.get("available") or 0.0)
+        m[c] = avail
+    return m
+
+def _fetch_assets_v1() -> dict:
     path = "/api/spot/v1/account/assets"
+    _rl("spot_bal_v1", 0.15)
+    r = requests.get(BASE_URL + path, headers=_headers("GET", path, ""), timeout=12)
+    j = r.json()
+    arr = j.get("data") or []
+    m = {}
+    for it in arr:
+        c = (it.get("coin") or "").upper()
+        if not c:
+            continue
+        avail = float(it.get("available") or 0.0)
+        m[c] = avail
+    return m
+
+def get_spot_balances(force: bool = False, coin: str | None = None) -> Dict[str, float]:
+    """
+    coin가 주어지면 v2로 단일코인만 조회(신선). force=True면 캐시 무시.
+    그 외엔 캐시 → v2 전체 → v1 전체 순서로 시도.
+    """
     now = time.time()
-    if now - _BAL_CACHE["ts"] < 5.0 and _BAL_CACHE["data"]:
-        return _BAL_CACHE["data"]
+    if not force and not coin:
+        if now - _BAL_CACHE["ts"] < 5.0 and _BAL_CACHE["data"]:
+            return _BAL_CACHE["data"]
+
     try:
-        _rl("spot_bal", 0.15)
-        r = requests.get(BASE_URL + path, headers=_headers("GET", path, ""), timeout=12)
-        j = r.json()
-        arr = j.get("data") or []
-        m = {}
-        for it in arr:
-            coin = (it.get("coin") or "").upper()
-            avail = float(it.get("available") or 0.0)
-            if coin:
-                m[coin] = avail
-        _BAL_CACHE["ts"] = now
-        _BAL_CACHE["data"] = m
-        return m
+        if coin:
+            # 단일 코인 강제 신선 조회
+            return _fetch_assets_v2(coin)
+        # 전체 조회 (v2 우선)
+        m = _fetch_assets_v2(None)
+        if not m:
+            m = _fetch_assets_v1()
+        if m:
+            _BAL_CACHE["ts"] = now
+            _BAL_CACHE["data"] = m
+        return m or (_BAL_CACHE["data"] or {})
     except Exception as e:
         print("spot balances error:", e)
         return _BAL_CACHE["data"] or {}
 
-def get_spot_free_qty(symbol: str) -> float:
+def get_spot_free_qty(symbol: str, fresh: bool = False) -> float:
     base = convert_symbol(symbol).replace("USDT", "")
-    bals = get_spot_balances()
-    return float(bals.get(base, 0.0))
+    if fresh:
+        m = get_spot_balances(force=True, coin=base)
+        return float(m.get(base, 0.0))
+    # 일반 캐시 사용 경로
+    m = get_spot_balances()
+    return float(m.get(base, 0.0))
+
 
 # ---------- orders ----------
 def place_spot_market_buy(symbol: str, usdt_amount: float) -> Dict:
@@ -230,3 +270,4 @@ def place_spot_market_sell_qty(symbol: str, qty: float) -> Dict:
         return res.json()
     except Exception as e:
         return {"code": "LOCAL_EXCEPTION", "msg": str(e)}
+
