@@ -2,8 +2,7 @@ name: KeepAlive Ping
 
 on:
   schedule:
-    # 정각(:00) 영구 회피 + 3분 간격 예열 (UTC 기준)
-    - cron: "1-59/3 * * * *"    # 01,04,07,...,58
+    - cron: "1-59/3 * * * *"    # 01,04,07,...,58 (UTC) → 정각(:00) 절대 미포함
   workflow_dispatch:
 
 concurrency:
@@ -18,7 +17,10 @@ jobs:
 
     steps:
       - name: Random jitter (spread load)
-        run: sleep $((RANDOM % 45))   # 0~44초 랜덤 대기로 동시폭주 완화
+        run: sleep $((RANDOM % 45))   # 0~44초 랜덤 대기
+
+      - name: Show schedule tick (debug)
+        run: date -u +"UTC %Y-%m-%d %H:%M:%S"
 
       - name: Ping /health
         env:
