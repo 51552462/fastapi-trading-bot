@@ -8,8 +8,8 @@ API_KEY        = os.getenv("BITGET_API_KEY", "")
 API_SECRET     = os.getenv("BITGET_API_SECRET", "")
 API_PASSPHRASE = os.getenv("BITGET_API_PASSWORD", "")
 
-# ---------- Rate limit (best-effort) ----------
-_last_call = {}
+# ---------- rate limit ----------
+_last_call: Dict[str, float] = {}
 def _rl(key: str, min_interval: float = 0.08):
     now = time.time()
     prev = _last_call.get(key, 0.0)
@@ -18,7 +18,7 @@ def _rl(key: str, min_interval: float = 0.08):
         time.sleep(wait)
     _last_call[key] = time.time()
 
-# ---------- Auth (Bitget HMAC-SHA256 → base64) ----------
+# ---------- auth ----------
 def _ts() -> str:
     return str(int(time.time() * 1000))
 
@@ -38,7 +38,7 @@ def _headers(method: str, path_with_query: str, body: str = "") -> Dict[str, str
         "locale": "en-US",
     }
 
-# ---------- Symbol helpers ----------
+# ---------- symbol helpers ----------
 ALIASES: Dict[str, str] = {}
 _alias_env = os.getenv("SYMBOL_ALIASES_JSON", "")
 if _alias_env:
@@ -55,25 +55,24 @@ def _spot_symbol(sym: str) -> str:
     base = convert_symbol(sym)
     return base if base.endswith("_SPBL") else f"{base}_SPBL"  # BTCUSDT_SPBL
 
-# ---------- Product(spec) cache ----------
+# ---------- products(spec) ----------
 _PROD_CACHE = {"ts": 0.0, "data": {}}
 
 def _refresh_products_cache():
-    # https://www.bitget.com/api-doc/spot/market/Get-Symbols
     path = "/api/spot/v1/public/products"
     try:
         _rl("products", 0.15)
         r = requests.get(BASE_URL + path, timeout=12)
         j = r.json()
         arr = j.get("data") or []
-        m = {}
+        m: Dict[str, Dict[str, float]] = {}
         for it in arr:
             sym_raw = (it.get("symbol") or "").upper()
             if not sym_raw:
                 continue
             qty_prec   = int(it.get("quantityPrecision") or 6)
             price_prec = int(it.get("pricePrecision") or 6)
-            min_amt    = float(it.get("minTradeAmount") or 0.0)  # quote(USDT) 최소 주문 금액
+            min_amt    = float(it.get("minTradeAmount") or 0.0)  # 최소주문(quote=USDT)
             m[sym_raw] = {
                 "qtyStep": 10 ** (-qty_prec),
                 "priceStep": 10 ** (-price_prec),
@@ -88,7 +87,7 @@ def get_symbol_spec_spot(symbol: str) -> Dict[str, float]:
     now = time.time()
     if now - _PROD_CACHE["ts"] > 600 or not _PROD_CACHE["data"]:
         _refresh_products_cache()
-    key = _spot_symbol(symbol)  # *_SPBL
+    key = _spot_symbol(symbol)
     spec = _PROD_CACHE["data"].get(key)
     if not spec:
         spec = {"qtyStep": 0.000001, "priceStep": 0.000001, "minQuote": 5.0}
@@ -101,7 +100,7 @@ def round_down_step(x: float, step: float) -> float:
     k = math.floor(float(x) / step)
     return round(k * step, 8)
 
-# ---------- Ticker ----------
+# ---------- ticker ----------
 _SPOT_TICKER_CACHE: Dict[str, tuple] = {}
 SPOT_TICKER_TTL = float(os.getenv("SPOT_TICKER_TTL", "2.5"))
 
@@ -125,10 +124,8 @@ def get_last_price_spot(symbol: str, retries: int = 5, sleep_base: float = 0.18)
             px = None
             if isinstance(d, dict):
                 px = d.get("close") or d.get("last")
-            elif isinstance(d, list) and d:
-                first = d[0]
-                if isinstance(first, dict):
-                    px = first.get("close") or first.get("last")
+            elif isinstance(d, list) and d and isinstance(d[0], dict):
+                px = d[0].get("close") or d[0].get("last")
             if px:
                 v = float(px)
                 if v > 0:
@@ -139,7 +136,7 @@ def get_last_price_spot(symbol: str, retries: int = 5, sleep_base: float = 0.18)
         time.sleep(sleep_base * (2 ** i))
     return None
 
-# ---------- Balances ----------
+# ---------- balances ----------
 _BAL_CACHE = {"ts": 0.0, "data": {}}
 
 def get_spot_balances() -> Dict[str, float]:
@@ -170,26 +167,27 @@ def get_spot_free_qty(symbol: str) -> float:
     bals = get_spot_balances()
     return float(bals.get(base, 0.0))
 
-# ---------- Orders ----------
+# ---------- orders ----------
 def place_spot_market_buy(symbol: str, usdt_amount: float) -> Dict:
-    last = get_last_price_spot(symbol)
-    if not last:
-        return {"code":"LOCAL_TICKER_FAIL","msg":"no_spot_ticker"}
+    """
+    Market-Buy: Bitget는 'quantity/size'를 'quote 금액(USDT)'으로 해석함.
+    따라서 가격으로 나누지 말고 usdt_amount 그대로 전송.
+    """
+    # 최소 주문 금액 검증
     spec = get_symbol_spec_spot(symbol)
     min_quote = float(spec.get("minQuote", 5.0))
     if usdt_amount < min_quote:
-        return {"code":"LOCAL_MIN_QUOTE","msg":f"need>={min_quote}USDT"}
-    qty = round_down_step(usdt_amount / last, float(spec.get("qtyStep", 1e-6)))
-    if qty <= 0:
-        return {"code":"LOCAL_BAD_QTY","msg":f"qty={qty}"}
+        return {"code": "LOCAL_MIN_QUOTE", "msg": f"need>={min_quote}USDT"}
 
+    # 일부 API는 소수 자리 너무 길면 거부하므로 6자리로 제한
+    amt_str = f"{float(usdt_amount):.6f}".rstrip("0").rstrip(".")
     path = "/api/spot/v1/trade/orders"
     body = {
         "symbol": _spot_symbol(symbol),
         "side": "buy",
         "orderType": "market",
         "force": "gtc",
-        "quantity": str(qty)
+        "quantity": amt_str  # 금액(USDT) 그대로
     }
     bj = json.dumps(body)
     try:
@@ -199,24 +197,29 @@ def place_spot_market_buy(symbol: str, usdt_amount: float) -> Dict:
             return {"code": f"HTTP_{res.status_code}", "msg": res.text}
         return res.json()
     except Exception as e:
-        return {"code":"LOCAL_EXCEPTION","msg":str(e)}
+        return {"code": "LOCAL_EXCEPTION", "msg": str(e)}
 
 def place_spot_market_sell_qty(symbol: str, qty: float) -> Dict:
+    """
+    Market-Sell: base 수량으로 전송.
+    """
     qty = float(qty)
     if qty <= 0:
-        return {"code":"LOCAL_BAD_QTY","msg":"qty<=0"}
+        return {"code": "LOCAL_BAD_QTY", "msg": "qty<=0"}
     spec = get_symbol_spec_spot(symbol)
-    qty = round_down_step(qty, float(spec.get("qtyStep", 1e-6)))
+    step = float(spec.get("qtyStep", 1e-6))
+    qty  = round_down_step(qty, step)
     if qty <= 0:
-        return {"code":"LOCAL_STEP_ZERO","msg":"after_step=0"}
+        return {"code": "LOCAL_STEP_ZERO", "msg": "after_step=0"}
 
+    qty_str = f"{qty:.8f}".rstrip("0").rstrip(".")
     path = "/api/spot/v1/trade/orders"
     body = {
         "symbol": _spot_symbol(symbol),
         "side": "sell",
         "orderType": "market",
         "force": "gtc",
-        "quantity": str(qty)
+        "quantity": qty_str
     }
     bj = json.dumps(body)
     try:
@@ -226,4 +229,4 @@ def place_spot_market_sell_qty(symbol: str, qty: float) -> Dict:
             return {"code": f"HTTP_{res.status_code}", "msg": res.text}
         return res.json()
     except Exception as e:
-        return {"code":"LOCAL_EXCEPTION","msg":str(e)}
+        return {"code": "LOCAL_EXCEPTION", "msg": str(e)}
