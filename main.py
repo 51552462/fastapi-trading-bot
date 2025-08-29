@@ -46,6 +46,7 @@ def _infer_side(side: str, default: str = "long") -> str:
 def _norm_symbol(sym: str) -> str:
     return convert_symbol(sym)
 
+# ── tolerant payload parser ───────────────────────────────────
 async def _parse_any(req: Request) -> Dict[str, Any]:
     try:
         return await req.json()
@@ -54,15 +55,18 @@ async def _parse_any(req: Request) -> Dict[str, Any]:
     try:
         raw = (await req.body()).decode(errors="ignore").strip()
         if raw:
-            try: return json.loads(raw)
+            try:
+                return json.loads(raw)
             except Exception:
-                fixed = raw.replace("'", '"'); return json.loads(fixed)
+                fixed = raw.replace("'", '"')
+                return json.loads(fixed)
     except Exception:
         pass
     try:
         form = await req.form()
         payload = form.get("payload") or form.get("data")
-        if payload: return json.loads(payload)
+        if payload:
+            return json.loads(payload)
     except Exception:
         pass
     try:
@@ -70,59 +74,86 @@ async def _parse_any(req: Request) -> Dict[str, Any]:
         d: Dict[str, Any] = {}
         for part in re.split(r"[\n,]+", txt):
             if ":" in part:
-                k, v = part.split(":", 1); d[k.strip()] = v.strip()
-        if d: return d
+                k, v = part.split(":", 1)
+                d[k.strip()] = v.strip()
+        if d:
+            return d
     except Exception:
         pass
     raise ValueError("cannot parse request")
 
+# ── signal handler ────────────────────────────────────────────
 def _handle_signal(data: Dict[str, Any]):
-    typ    = (data.get("type") or "").strip()
+    typ0   = (data.get("type") or "").strip()
     symbol = _norm_symbol(data.get("symbol", ""))
     side   = _infer_side(data.get("side"), "long")
 
     amount   = float(data.get("amount", DEFAULT_AMOUNT))
     leverage = float(data.get("leverage", LEVERAGE))
 
+    # 금액 결정 우선순위: SYMBOL_AMOUNT → FORCE_DEFAULT → payload/default
     resolved_amount = float(amount)
     if (symbol in SYMBOL_AMOUNT) and (str(SYMBOL_AMOUNT[symbol]).strip() != ""):
-        try: resolved_amount = float(SYMBOL_AMOUNT[symbol])
-        except Exception: resolved_amount = float(DEFAULT_AMOUNT)
+        try:
+            resolved_amount = float(SYMBOL_AMOUNT[symbol])
+        except Exception:
+            resolved_amount = float(DEFAULT_AMOUNT)
     elif FORCE_DEFAULT_AMOUNT:
         resolved_amount = float(DEFAULT_AMOUNT)
 
     if not symbol:
-        send_telegram("⚠️ symbol 없음: " + json.dumps(data)); return
+        send_telegram("⚠️ symbol 없음: " + json.dumps(data))
+        return
 
-    legacy = {"tp_1":"tp1","tp_2":"tp2","tp_3":"tp3","sl_1":"sl1","sl_2":"sl2","ema_exit":"emaExit","failcut":"failCut"}
-    typ = legacy.get(typ.lower(), typ)
+    # 키 정규화 (legacy/synonym)
+    t = typ0.lower().replace(" ", "")
+    legacy_map = {
+        "tp_1": "tp1", "tp_2": "tp2", "tp_3": "tp3",
+        "sl_1": "sl1", "sl_2": "sl2",
+        "ema_exit": "emaExit", "failcut": "failCut",
+    }
+    t = legacy_map.get(t, t)
+
+    # stoploss 동의어 모두 처리 → 즉시 전체 청산
+    STOP_KEYS = {"stoploss", "stop_loss", "sl", "stop", "stopall", "stopfull"}
+    if t in STOP_KEYS:
+        t = "stoploss"
 
     now = time.time()
-    bk = f"{typ}:{symbol}:{side}"
+    bk = _biz_key(t, symbol, side)
     tprev = _BIZDEDUP.get(bk, 0.0)
-    if now - tprev < BIZDEDUP_TTL: return
+    if now - tprev < BIZDEDUP_TTL:
+        return
     _BIZDEDUP[bk] = now
 
     if LOG_INGRESS:
-        try: send_telegram(f"📥 {typ} {symbol} {side} amt={resolved_amount}")
-        except: pass
+        try:
+            send_telegram(f"📥 {t} {symbol} {side} amt={resolved_amount}")
+        except Exception:
+            pass
 
-    if typ == "entry":
+    # 라우팅
+    if t == "entry":
         enter_position(symbol, resolved_amount, side=side, leverage=leverage); return
 
-    if typ in ("tp1","tp2","tp3"):
-        pct = float(os.getenv("TP1_PCT","0.30")) if typ=="tp1" else float(os.getenv("TP2_PCT","0.40")) if typ=="tp2" else float(os.getenv("TP3_PCT","0.30"))
+    if t in ("tp1", "tp2", "tp3"):
+        pct = float(os.getenv("TP1_PCT", "0.30")) if t == "tp1" else \
+              float(os.getenv("TP2_PCT", "0.40")) if t == "tp2" else \
+              float(os.getenv("TP3_PCT", "0.30"))
         take_partial_profit(symbol, pct, side=side); return
 
-    if typ in ("sl1","sl2","failCut","emaExit","liquidation","fullExit","close","exit"):
-        close_position(symbol, side=side, reason=typ); return
+    if t in ("sl1", "sl2", "failCut", "emaExit", "liquidation", "fullExit", "close", "exit", "stoploss"):
+        # stoploss 포함: 즉시 전체 포지션 종료
+        close_position(symbol, side=side, reason=t); return
 
-    if typ == "reduceByContracts":
+    if t == "reduceByContracts":
         contracts = float(data.get("contracts", 0))
-        if contracts > 0: reduce_by_contracts(symbol, contracts, side=side)
+        if contracts > 0:
+            reduce_by_contracts(symbol, contracts, side=side)
         return
 
-    if typ in ("tailTouch","info","debug"): return
+    if t in ("tailTouch", "info", "debug"):
+        return
 
     send_telegram("❓ 알 수 없는 신호: " + json.dumps(data))
 
@@ -130,13 +161,15 @@ def _worker_loop(idx: int):
     while True:
         try:
             data = _task_q.get()
-            if data is None: continue
+            if data is None:
+                continue
             _handle_signal(data)
         except Exception as e:
             print(f"[worker-{idx}] error:", e)
         finally:
             _task_q.task_done()
 
+# ── ingress endpoints ─────────────────────────────────────────
 async def _ingest(req: Request):
     now = time.time()
     try:
@@ -144,22 +177,26 @@ async def _ingest(req: Request):
     except Exception as e:
         return {"ok": False, "error": f"bad_payload: {e}"}
 
-    dk = hashlib.sha1(json.dumps(data, sort_keys=True).encode()).hexdigest()
+    dk = _dedup_key(data)
     if dk in _DEDUP and now - _DEDUP[dk] < DEDUP_TTL:
         return {"ok": True, "dedup": True}
     _DEDUP[dk] = now
 
-    INGRESS_LOG.append({"ts": now, "ip": (req.client.host if req and req.client else "?"), "data": data})
+    INGRESS_LOG.append({
+        "ts": now,
+        "ip": (req.client.host if req and req.client else "?"),
+        "data": data
+    })
+
     try:
         _task_q.put_nowait(data)
     except queue.Full:
         send_telegram("⚠️ queue full → drop signal: " + json.dumps(data))
         return {"ok": False, "queued": False, "reason": "queue_full"}
+
     return {"ok": True, "queued": True, "qsize": _task_q.qsize()}
 
-from fastapi import status
-from fastapi.responses import JSONResponse
-
+# ── FastAPI routes ────────────────────────────────────────────
 app.get("/")
 def root():
     return {"ok": True}
@@ -207,6 +244,7 @@ def config():
 def pending():
     return get_pending_snapshot()
 
+# ── startup ───────────────────────────────────────────────────
 @app.on_event("startup")
 def on_startup():
     for i in range(WORKERS):
@@ -216,8 +254,10 @@ def on_startup():
     start_watchdogs()
     start_reconciler()
     try:
-        threading.Thread(target=send_telegram,
-                         args=("✅ FastAPI up (workers + watchdog + reconciler + capacity-guard)",),
-                         daemon=True).start()
-    except:
+        threading.Thread(
+            target=send_telegram,
+            args=("✅ FastAPI up (workers + watchdog + reconciler + capacity-guard)",),
+            daemon=True
+        ).start()
+    except Exception:
         pass
