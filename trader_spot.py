@@ -29,18 +29,22 @@ MAX_OPEN_COINS = int(os.getenv("MAX_OPEN_COINS", "60"))
 CAP_CHECK_SEC  = float(os.getenv("CAP_CHECK_SEC", "10"))
 
 # 잔고 리트라이(환경변수로 조절 가능)
-BALANCE_RETRY       = int(os.getenv("BALANCE_RETRY", "3"))
-BALANCE_RETRY_DELAY = float(os.getenv("BALANCE_RETRY_DELAY", "1.5"))
+BALANCE_RETRY       = int(os.getenv("BALANCE_RETRY", "10"))   # << 권장 강화
+BALANCE_RETRY_DELAY = float(os.getenv("BALANCE_RETRY_DELAY", "2"))
 
 _POS_LOCK = threading.RLock()
-held_marks: Dict[str, float] = {}  # symbol -> last_buy_ts
+held_marks_ts: Dict[str, float] = {}   # symbol -> last_buy_ts
+held_marks_qty: Dict[str, float] = {}  # symbol -> cached base qty (매수 직후 잔고 스냅샷)
 
 _CAP = {"blocked": False, "last_count": 0, "ts": 0.0}
 _CAP_LOCK = threading.Lock()
 
+
 def _count_open_coins() -> int:
     with _POS_LOCK:
-        return len(held_marks)
+        # 캐시에 수량이 남아 있는 심볼만 카운트
+        return sum(1 for s, q in held_marks_qty.items() if q > 0)
+
 
 def start_capacity_guard():
     def _loop():
@@ -63,87 +67,108 @@ def start_capacity_guard():
             time.sleep(CAP_CHECK_SEC)
     threading.Thread(target=_loop, daemon=True, name="spot-capacity").start()
 
+
 def capacity_status():
     with _CAP_LOCK:
         return dict(_CAP)
 
-def _mark_hold(symbol: str):
-    with _POS_LOCK:
-        held_marks[symbol] = time.time()
 
-def _unmark_hold(symbol: str):
+def _cache_qty(symbol: str, qty: float):
     with _POS_LOCK:
-        held_marks.pop(symbol, None)
+        held_marks_ts[symbol] = time.time()
+        held_marks_qty[symbol] = max(0.0, float(qty))
 
+
+def _clear_cache(symbol: str):
+    with _POS_LOCK:
+        held_marks_ts.pop(symbol, None)
+        held_marks_qty.pop(symbol, None)
+
+
+def _refresh_free_qty(symbol: str) -> float:
+    """잔고 API 재조회 (리트라이 포함)"""
+    free = 0.0
+    tries = max(1, BALANCE_RETRY)
+    for i in range(tries):
+        free = get_spot_free_qty(symbol)
+        if free > 0:
+            break
+        if i < tries - 1:
+            time.sleep(BALANCE_RETRY_DELAY)
+    return float(free)
+
+
+# ===== 트레이딩 동작 =====
 def enter_spot(symbol: str, usdt_amount: float):
     symbol = convert_symbol(symbol)
     st = capacity_status()
     if st.get("blocked"):
         send_telegram(f"[SPOT] ENTRY HOLD {symbol} {st['last_count']}/{MAX_OPEN_COINS}")
         return
+
     if TRACE_LOG:
         send_telegram(f"[SPOT] ENTRY req {symbol} amt={usdt_amount}")
+
     resp = place_spot_market_buy(symbol, usdt_amount)
     code = str(resp.get("code", ""))
     if code in ("00000", "0"):
-        _mark_hold(symbol)
-        send_telegram(f"[SPOT] BUY {symbol} approx {usdt_amount} USDT")
+        # 매수 직후 실제 잔고를 스냅샷으로 캐싱 (지연 대비)
+        free_after = _refresh_free_qty(symbol)
+        _cache_qty(symbol, free_after)
+        send_telegram(f"[SPOT] BUY {symbol} approx {usdt_amount} USDT (qty~{free_after})")
     else:
         send_telegram(f"[SPOT] BUY fail {symbol} -> {resp}")
+
 
 def _sell_pct(symbol: str, pct: float):
     symbol = convert_symbol(symbol)
 
-    # --- 잔고 재확인 리트라이 ---
-    free = 0.0
-    tries = max(1, BALANCE_RETRY)
-    for i in range(tries):
-        free = get_spot_free_qty(symbol)
-        if free > 0:
-            break
-        if i < tries - 1:
-            time.sleep(BALANCE_RETRY_DELAY)
+    # 1) 캐시 잔고
+    cached = float(held_marks_qty.get(symbol, 0.0))
+    # 2) 실시간 잔고(리트라이 포함)
+    free = _refresh_free_qty(symbol)
 
-    if free <= 0:
+    # 둘 중 더 작은 값으로 안전 매도
+    base_qty = max(0.0, min(cached if cached > 0 else float("inf"), free))
+    if base_qty <= 0:
         send_telegram(f"[SPOT] SELL skip (no free balance) {symbol}")
         return
 
     step = float(get_symbol_spec_spot(symbol).get("qtyStep", 1e-6))
-    qty  = round_down_step(free * pct, step)
+    qty  = round_down_step(base_qty * pct, step)
     if qty <= 0:
         send_telegram(f"[SPOT] SELL qty=0 after step {symbol}")
         return
 
     resp = place_spot_market_sell_qty(symbol, qty)
     if str(resp.get("code", "")) in ("00000", "0"):
+        # 캐시에서 차감
+        remaining = max(0.0, cached - qty)
+        _cache_qty(symbol, remaining)
         send_telegram(f"[SPOT] SELL {symbol} qty approx {qty} ({int(pct * 100)}%)")
     else:
         send_telegram(f"[SPOT] SELL fail {symbol} -> {resp}")
 
+
 def take_partial_spot(symbol: str, pct: float):
     _sell_pct(symbol, pct)
+
 
 def close_spot(symbol: str, reason: str = "manual"):
     symbol = convert_symbol(symbol)
 
-    # --- 잔고 재확인 리트라이 ---
-    free = 0.0
-    tries = max(1, BALANCE_RETRY)
-    for i in range(tries):
-        free = get_spot_free_qty(symbol)
-        if free > 0:
-            break
-        if i < tries - 1:
-            time.sleep(BALANCE_RETRY_DELAY)
+    cached = float(held_marks_qty.get(symbol, 0.0))
+    free   = _refresh_free_qty(symbol)
+    base_qty = max(0.0, max(cached, free))  # 전량 종료는 안전하게 더 큰 쪽을 시도
 
-    if free <= 0:
-        _unmark_hold(symbol)
+    if base_qty <= 0:
+        _clear_cache(symbol)
         send_telegram(f"[SPOT] CLOSE skip (no free balance) {symbol} ({reason})")
         return
 
-    resp = place_spot_market_sell_qty(symbol, free)
+    resp = place_spot_market_sell_qty(symbol, base_qty)
     if str(resp.get("code", "")) in ("00000", "0"):
-        _unmark_hold(symbol)
+        _clear_cache(symbol)
         send_telegram(f"[SPOT] CLOSE {symbol} ({reason})")
     else:
         send_telegram(f"[SPOT] CLOSE fail {symbol} -> {resp}")
