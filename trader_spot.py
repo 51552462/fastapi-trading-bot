@@ -113,7 +113,7 @@ def enter_spot(symbol: str, usdt_amount: float):
     code = str(resp.get("code", ""))
     if code in ("00000", "0"):
         # 매수 직후 실제 잔고를 스냅샷으로 캐싱 (지연 대비)
-        free_after = _refresh_free_qty(symbol)
+       free_after = get_spot_free_qty(symbol, fresh=True)
         _cache_qty(symbol, free_after)
         send_telegram(f"[SPOT] BUY {symbol} approx {usdt_amount} USDT (qty~{free_after})")
     else:
@@ -126,7 +126,7 @@ def _sell_pct(symbol: str, pct: float):
     # 1) 캐시 잔고
     cached = float(held_marks_qty.get(symbol, 0.0))
     # 2) 실시간 잔고(리트라이 포함)
-    free = _refresh_free_qty(symbol)
+    free = get_spot_free_qty(symbol, fresh=True)
 
     # 둘 중 더 작은 값으로 안전 매도
     base_qty = max(0.0, min(cached if cached > 0 else float("inf"), free))
@@ -172,3 +172,4 @@ def close_spot(symbol: str, reason: str = "manual"):
         send_telegram(f"[SPOT] CLOSE {symbol} ({reason})")
     else:
         send_telegram(f"[SPOT] CLOSE fail {symbol} -> {resp}")
+
