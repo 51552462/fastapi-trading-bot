@@ -78,8 +78,8 @@ async def _parse_any(req: Request) -> Dict[str, Any]:
         d: Dict[str, Any] = {}
         for part in re.split(r"[\n,]+", txt):
             if ":" in part:
-                k, v = part.split("x", 1)  # dummy split to avoid accidental match
-        # as a last resort, fall through
+                k, v = part.split("x", 1)
+        # fall through
     except Exception:
         pass
     raise ValueError("cannot parse request")
@@ -113,12 +113,17 @@ def _handle_signal(data: Dict[str, Any]):
         return
     _BIZDEDUP[bk] = now
 
+    # --- 로그: entry일 때만 amt 표기 ---
     if LOG_INGRESS:
+        msg = f"[SPOT] {typ} {symbol} {side}"
+        if typ == "entry":
+            msg += f" amt={resolved_amount}"
         try:
-            send_telegram(f"[SPOT] {typ} {symbol} {side} amt={resolved_amount}")
+            send_telegram(msg)
         except Exception:
             pass
 
+    # --- 라우팅 ---
     if typ == "entry":
         enter_spot(symbol, resolved_amount); return
     if typ in ("tp1","tp2","tp3"):
