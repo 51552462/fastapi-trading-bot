@@ -26,15 +26,15 @@ TP2_PCT = float(os.getenv("TP2_PCT", "0.40"))
 TP3_PCT = float(os.getenv("TP3_PCT", "0.30"))
 
 MAX_OPEN_COINS = int(os.getenv("MAX_OPEN_COINS", "60"))
-CAP_CHECK_SEC  = float(os.getenv("CAP_CHECK_SEC", "10"))
+CAP_CHECK_SEC = float(os.getenv("CAP_CHECK_SEC", "10"))
 
 # 잔고 리트라이(환경변수로 조절 가능)
-BALANCE_RETRY       = int(os.getenv("BALANCE_RETRY", "10"))   # << 권장 강화
+BALANCE_RETRY = int(os.getenv("BALANCE_RETRY", "10"))
 BALANCE_RETRY_DELAY = float(os.getenv("BALANCE_RETRY_DELAY", "2"))
 
 _POS_LOCK = threading.RLock()
-held_marks_ts: Dict[str, float] = {}   # symbol -> last_buy_ts
-held_marks_qty: Dict[str, float] = {}  # symbol -> cached base qty (매수 직후 잔고 스냅샷)
+held_marks_ts: Dict[str, float] = {}     # symbol -> last_buy_ts
+held_marks_qty: Dict[str, float] = {}    # symbol -> cached base qty (매수 직후 스냅샷)
 
 _CAP = {"blocked": False, "last_count": 0, "ts": 0.0}
 _CAP_LOCK = threading.Lock()
@@ -42,8 +42,7 @@ _CAP_LOCK = threading.Lock()
 
 def _count_open_coins() -> int:
     with _POS_LOCK:
-        # 캐시에 수량이 남아 있는 심볼만 카운트
-        return sum(1 for s, q in held_marks_qty.items() if q > 0)
+        return sum(1 for _, q in held_marks_qty.items() if q > 0)
 
 
 def start_capacity_guard():
@@ -65,6 +64,7 @@ def start_capacity_guard():
             except Exception as e:
                 print("[spot] capacity guard error:", e)
             time.sleep(CAP_CHECK_SEC)
+
     threading.Thread(target=_loop, daemon=True, name="spot-capacity").start()
 
 
@@ -86,11 +86,11 @@ def _clear_cache(symbol: str):
 
 
 def _refresh_free_qty(symbol: str) -> float:
-    """잔고 API 재조회 (리트라이 포함)"""
+    """잔고 API 재조회 (리트라이 포함: v2 단일코인 fresh 경로를 내부에서 사용하도록 변경 가능)"""
     free = 0.0
     tries = max(1, BALANCE_RETRY)
     for i in range(tries):
-        free = get_spot_free_qty(symbol)
+        free = get_spot_free_qty(symbol, fresh=True)  # v2 단일코인 신선 조회
         if free > 0:
             break
         if i < tries - 1:
@@ -113,7 +113,7 @@ def enter_spot(symbol: str, usdt_amount: float):
     code = str(resp.get("code", ""))
     if code in ("00000", "0"):
         # 매수 직후 실제 잔고를 스냅샷으로 캐싱 (지연 대비)
-       free_after = get_spot_free_qty(symbol, fresh=True)
+        free_after = _refresh_free_qty(symbol)
         _cache_qty(symbol, free_after)
         send_telegram(f"[SPOT] BUY {symbol} approx {usdt_amount} USDT (qty~{free_after})")
     else:
@@ -126,24 +126,24 @@ def _sell_pct(symbol: str, pct: float):
     # 1) 캐시 잔고
     cached = float(held_marks_qty.get(symbol, 0.0))
     # 2) 실시간 잔고(리트라이 포함)
-    free = get_spot_free_qty(symbol, fresh=True)
+    free = _refresh_free_qty(symbol)
 
-    # 둘 중 더 작은 값으로 안전 매도
+    # 둘 중 “작은 값”으로 안전 매도
     base_qty = max(0.0, min(cached if cached > 0 else float("inf"), free))
     if base_qty <= 0:
         send_telegram(f"[SPOT] SELL skip (no free balance) {symbol}")
         return
 
     step = float(get_symbol_spec_spot(symbol).get("qtyStep", 1e-6))
-    qty  = round_down_step(base_qty * pct, step)
+    qty = round_down_step(base_qty * pct, step)
     if qty <= 0:
         send_telegram(f"[SPOT] SELL qty=0 after step {symbol}")
         return
 
     resp = place_spot_market_sell_qty(symbol, qty)
     if str(resp.get("code", "")) in ("00000", "0"):
-        # 캐시에서 차감
-        remaining = max(0.0, cached - qty)
+        # 캐시 차감
+        remaining = max(0.0, cached - qty) if cached > 0 else max(0.0, free - qty)
         _cache_qty(symbol, remaining)
         send_telegram(f"[SPOT] SELL {symbol} qty approx {qty} ({int(pct * 100)}%)")
     else:
@@ -158,8 +158,8 @@ def close_spot(symbol: str, reason: str = "manual"):
     symbol = convert_symbol(symbol)
 
     cached = float(held_marks_qty.get(symbol, 0.0))
-    free   = _refresh_free_qty(symbol)
-    base_qty = max(0.0, max(cached, free))  # 전량 종료는 안전하게 더 큰 쪽을 시도
+    free = _refresh_free_qty(symbol)
+    base_qty = max(0.0, max(cached, free))  # 전량 종료는 더 큰 쪽 시도
 
     if base_qty <= 0:
         _clear_cache(symbol)
@@ -172,4 +172,3 @@ def close_spot(symbol: str, reason: str = "manual"):
         send_telegram(f"[SPOT] CLOSE {symbol} ({reason})")
     else:
         send_telegram(f"[SPOT] CLOSE fail {symbol} -> {resp}")
-
