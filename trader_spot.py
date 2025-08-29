@@ -28,6 +28,10 @@ TP3_PCT = float(os.getenv("TP3_PCT", "0.30"))
 MAX_OPEN_COINS = int(os.getenv("MAX_OPEN_COINS", "60"))
 CAP_CHECK_SEC  = float(os.getenv("CAP_CHECK_SEC", "10"))
 
+# 잔고 리트라이(환경변수로 조절 가능)
+BALANCE_RETRY       = int(os.getenv("BALANCE_RETRY", "3"))
+BALANCE_RETRY_DELAY = float(os.getenv("BALANCE_RETRY_DELAY", "1.5"))
+
 _POS_LOCK = threading.RLock()
 held_marks: Dict[str, float] = {}  # symbol -> last_buy_ts
 
@@ -89,15 +93,27 @@ def enter_spot(symbol: str, usdt_amount: float):
 
 def _sell_pct(symbol: str, pct: float):
     symbol = convert_symbol(symbol)
-    free = get_spot_free_qty(symbol)
+
+    # --- 잔고 재확인 리트라이 ---
+    free = 0.0
+    tries = max(1, BALANCE_RETRY)
+    for i in range(tries):
+        free = get_spot_free_qty(symbol)
+        if free > 0:
+            break
+        if i < tries - 1:
+            time.sleep(BALANCE_RETRY_DELAY)
+
     if free <= 0:
         send_telegram(f"[SPOT] SELL skip (no free balance) {symbol}")
         return
+
     step = float(get_symbol_spec_spot(symbol).get("qtyStep", 1e-6))
     qty  = round_down_step(free * pct, step)
     if qty <= 0:
         send_telegram(f"[SPOT] SELL qty=0 after step {symbol}")
         return
+
     resp = place_spot_market_sell_qty(symbol, qty)
     if str(resp.get("code", "")) in ("00000", "0"):
         send_telegram(f"[SPOT] SELL {symbol} qty approx {qty} ({int(pct * 100)}%)")
@@ -109,11 +125,22 @@ def take_partial_spot(symbol: str, pct: float):
 
 def close_spot(symbol: str, reason: str = "manual"):
     symbol = convert_symbol(symbol)
-    free = get_spot_free_qty(symbol)
+
+    # --- 잔고 재확인 리트라이 ---
+    free = 0.0
+    tries = max(1, BALANCE_RETRY)
+    for i in range(tries):
+        free = get_spot_free_qty(symbol)
+        if free > 0:
+            break
+        if i < tries - 1:
+            time.sleep(BALANCE_RETRY_DELAY)
+
     if free <= 0:
         _unmark_hold(symbol)
         send_telegram(f"[SPOT] CLOSE skip (no free balance) {symbol} ({reason})")
         return
+
     resp = place_spot_market_sell_qty(symbol, free)
     if str(resp.get("code", "")) in ("00000", "0"):
         _unmark_hold(symbol)
