@@ -28,19 +28,26 @@ RECON_INTERVAL_SEC = float(os.getenv("RECON_INTERVAL_SEC", "40"))
 TP_EPSILON_RATIO   = float(os.getenv("TP_EPSILON_RATIO", "0.001"))
 RECON_DEBUG        = os.getenv("RECON_DEBUG", "0") == "1"
 
-MAX_OPEN_POSITIONS = int(os.getenv("MAX_OPEN_POSITIONS", "60"))
+# cap 기본 40 (숏만 적용), 롱은 바이패스
+MAX_OPEN_POSITIONS = int(os.getenv("MAX_OPEN_POSITIONS", "40"))
 CAP_CHECK_SEC      = float(os.getenv("CAP_CHECK_SEC", "10"))
+LONG_BYPASS_CAP    = os.getenv("LONG_BYPASS_CAP", "1") == "1"
 
-# ✅ 롱 cap 우회(기본 ON)
-LONG_BYPASS_CAP = os.getenv("LONG_BYPASS_CAP", "1") == "1"
-
-# ✅ 중복 진입 방지용 TTL
+# 중복 진입 가드 TTL
 ENTRY_INFLIGHT_TTL_SEC = float(os.getenv("ENTRY_INFLIGHT_TTL_SEC", "30"))
 ENTRY_DUP_TTL_SEC      = float(os.getenv("ENTRY_DUP_TTL_SEC", "60"))
 
-_CAPACITY = {"blocked": False, "last_count": 0, "ts": 0.0}
+# ── capacity state (숏 기준) ─────────────────────────────────
+_CAPACITY = {
+    "blocked": False,         # 하위호환
+    "last_count": 0,          # 하위호환(전체)
+    "short_blocked": False,   # 숏 기준
+    "short_count": 0,         # 숏 기준
+    "ts": 0.0
+}
 _CAP_LOCK = threading.Lock()
 
+# ── local state & locks ───────────────────────────────────────
 position_data: Dict[str, dict] = {}
 _POS_LOCK = threading.RLock()
 
@@ -60,6 +67,10 @@ def _local_open_count() -> int:
     with _POS_LOCK:
         return len(position_data)
 
+def _local_short_count() -> int:
+    with _POS_LOCK:
+        return sum(1 for k in position_data.keys() if k.endswith("_short"))
+
 def _local_has_any(symbol: str) -> bool:
     symbol = convert_symbol(symbol)
     with _POS_LOCK:
@@ -68,17 +79,19 @@ def _local_has_any(symbol: str) -> bool:
                 return True
     return False
 
-# ── 즉시 손절 쿨다운 ──────────────────────────────────────────
+# ── stop 쿨다운 ───────────────────────────────────────────────
 _STOP_FIRED: Dict[str, float] = {}
 _STOP_LOCK = threading.Lock()
 def _should_fire_stop(key: str) -> bool:
     now = time.time()
     with _STOP_LOCK:
         last = _STOP_FIRED.get(key, 0.0)
-        if now - last < STOP_COOLDOWN_SEC: return False
-        _STOP_FIRED[key] = now; return True
+        if now - last < STOP_COOLDOWN_SEC:
+            return False
+        _STOP_FIRED[key] = now
+        return True
 
-# ── Pending registry ──────────────────────────────────────────
+# ── pending registry ──────────────────────────────────────────
 _PENDING = {"entry": {}, "close": {}, "tp": {}}
 _PENDING_LOCK = threading.RLock()
 
@@ -89,7 +102,8 @@ def _pending_key_tp3(symbol: str, side: str)   -> str: return f"{_key(symbol, si
 def _mark_done(typ: str, pkey: str, note: str = ""):
     with _PENDING_LOCK:
         _PENDING.get(typ, {}).pop(pkey, None)
-    if RECON_DEBUG and note: send_telegram(f"✅ pending done [{typ}] {pkey} {note}")
+    if RECON_DEBUG and note:
+        send_telegram(f"✅ pending done [{typ}] {pkey} {note}")
 
 def get_pending_snapshot() -> Dict[str, Dict]:
     with _PENDING_LOCK, _CAP_LOCK, _POS_LOCK:
@@ -103,8 +117,8 @@ def get_pending_snapshot() -> Dict[str, Dict]:
             "capacity": {
                 "blocked": _CAPACITY["blocked"],
                 "last_count": _CAPACITY["last_count"],
-                "local_open": _local_open_count(),
-                "effective_now": _CAPACITY["last_count"],
+                "short_blocked": _CAPACITY["short_blocked"],
+                "short_count": _CAPACITY["short_count"],
                 "max": MAX_OPEN_POSITIONS,
                 "interval": CAP_CHECK_SEC,
                 "ts": _CAPACITY["ts"],
@@ -112,7 +126,7 @@ def get_pending_snapshot() -> Dict[str, Dict]:
             "local_keys": list(position_data.keys()),
         }
 
-# ── 원격 포지션 헬퍼 ─────────────────────────────────────────
+# ── remote helpers ────────────────────────────────────────────
 def _get_remote(symbol: str, side: Optional[str] = None):
     symbol = convert_symbol(symbol)
     for p in get_open_positions():
@@ -137,28 +151,58 @@ def _loss_ratio_on_margin(entry: float, last: float, size: float, side: str, lev
     margin = max(1e-9, notional / max(1.0, leverage))
     return max(0.0, -pnl) / margin
 
-# ── Capacity guard ────────────────────────────────────────────
+# ── capacity guard (숏만 cap) ─────────────────────────────────
+def _count_remote_shorts() -> int:
+    try:
+        return sum(1 for p in get_open_positions() if (p.get("side") or "").lower() == "short")
+    except Exception:
+        return 0
+
 def capacity_status():
     with _CAP_LOCK:
-        return {"blocked": _CAPACITY["blocked"], "last_count": _CAPACITY["last_count"],
-                "max": MAX_OPEN_POSITIONS, "interval": CAP_CHECK_SEC, "ts": _CAPACITY["ts"]}
+        return {
+            "blocked": _CAPACITY["blocked"],
+            "last_count": _CAPACITY["last_count"],
+            "short_blocked": _CAPACITY["short_blocked"],
+            "short_count": _CAPACITY["short_count"],
+            "max": MAX_OPEN_POSITIONS,
+            "interval": CAP_CHECK_SEC,
+            "ts": _CAPACITY["ts"],
+        }
 
-def can_enter_now() -> bool:
-    with _CAP_LOCK: return not _CAPACITY["blocked"]
+def can_enter_now(side: str) -> bool:
+    if side == "long" and LONG_BYPASS_CAP:
+        return True
+    with _CAP_LOCK:
+        return not _CAPACITY["short_blocked"]
 
 def _capacity_loop():
-    prev_blocked = None
+    prev_short_blocked = None
     while True:
         try:
-            count = len(get_open_positions()) + _local_open_count()
-            now = time.time(); blocked = count >= MAX_OPEN_POSITIONS
+            remote_shorts = _count_remote_shorts()
+            local_shorts  = _local_short_count()
+            short_count   = remote_shorts + local_shorts
+
+            total_count = len(get_open_positions()) + _local_open_count()  # 하위호환
+
+            now = time.time()
+            short_blocked = short_count >= MAX_OPEN_POSITIONS
+
             with _CAP_LOCK:
-                _CAPACITY.update({"blocked": blocked, "last_count": count, "ts": now})
-            if prev_blocked is None or prev_blocked != blocked:
-                state = "BLOCKED (>= cap)" if blocked else "UNBLOCKED (< cap)"
-                try: send_telegram(f"ℹ️ Position capacity {state} | {count}/{MAX_OPEN_POSITIONS}")
-                except: pass
-                prev_blocked = blocked
+                _CAPACITY["short_blocked"] = short_blocked
+                _CAPACITY["short_count"]   = short_count
+                _CAPACITY["last_count"]    = total_count
+                _CAPACITY["blocked"]       = short_blocked  # 하위호환: 숏 기준
+                _CAPACITY["ts"]            = now
+
+            if prev_short_blocked is None or prev_short_blocked != short_blocked:
+                state = "BLOCKED (short>=cap)" if short_blocked else "UNBLOCKED (short<cap)"
+                try:
+                    send_telegram(f"ℹ️ Short capacity {state} | {short_count}/{MAX_OPEN_POSITIONS}")
+                except Exception:
+                    pass
+                prev_short_blocked = short_blocked
         except Exception as e:
             print("capacity guard error:", e)
         time.sleep(CAP_CHECK_SEC)
@@ -166,22 +210,32 @@ def _capacity_loop():
 def start_capacity_guard():
     threading.Thread(target=_capacity_loop, name="capacity-guard", daemon=True).start()
 
-# ── STRICT gate(실시간 예약) ─────────────────────────────────
-_RESERVE = {"count": 0}
+# ── STRICT gate(실시간 예약) → 숏만 적용 ─────────────────────
+_RESERVE = {"short": 0}
 _RES_LOCK = threading.Lock()
-def _strict_try_reserve() -> bool:
-    try: open_now_remote = len(get_open_positions())
-    except: open_now_remote = 0
-    local_now = _local_open_count()
-    with _RES_LOCK, _CAP_LOCK:
-        effective = open_now_remote + local_now + _RESERVE["count"]
-        if effective >= MAX_OPEN_POSITIONS: return False
-        _RESERVE["count"] += 1; return True
-def _strict_release():
+def _strict_try_reserve(side: str) -> bool:
+    if side == "long" and LONG_BYPASS_CAP:
+        return True
+    try:
+        remote_shorts = _count_remote_shorts()
+    except Exception:
+        remote_shorts = 0
+    local_shorts = _local_short_count()
     with _RES_LOCK:
-        if _RESERVE["count"] > 0: _RESERVE["count"] -= 1
+        effective = remote_shorts + local_shorts + _RESERVE["short"]
+        if effective >= MAX_OPEN_POSITIONS:
+            return False
+        _RESERVE["short"] += 1
+        return True
 
-# ✅ 중복 진입 가드: inflight & recent-success
+def _strict_release(side: str):
+    if side == "long" and LONG_BYPASS_CAP:
+        return
+    with _RES_LOCK:
+        if _RESERVE["short"] > 0:
+            _RESERVE["short"] -= 1
+
+# ── 중복 진입 가드: inflight & recent-success ─────────────────
 _ENTRY_BUSY: Dict[str, float] = {}
 _RECENT_OK: Dict[str, float]  = {}
 _ENTRY_G_LOCK = threading.Lock()
@@ -200,7 +254,7 @@ def _recent_ok(key: str) -> bool:
         ts = _RECENT_OK.get(key, 0.0)
     return (time.time() - ts) < ENTRY_DUP_TTL_SEC
 
-# ── Trading ops ───────────────────────────────────────────────
+# ── trading ops ───────────────────────────────────────────────
 def enter_position(symbol: str, usdt_amount: float, side: str = "long", leverage: float = None):
     symbol = convert_symbol(symbol); side = (side or "long").lower()
     key = _key(symbol, side); lev = float(leverage or LEVERAGE)
@@ -210,22 +264,21 @@ def enter_position(symbol: str, usdt_amount: float, side: str = "long", leverage
     if TRACE_LOG:
         send_telegram(f"🔎 ENTRY request trace={trace} {symbol} {side} amt={usdt_amount}")
 
-    bypass = (LONG_BYPASS_CAP and side == "long")
-
-    # inflight/recent-success 가드
+    # inflight/recent guard
     if _is_busy(key) or _recent_ok(key):
         if RECON_DEBUG: send_telegram(f"⏸️ skip entry (busy/recent) {key}")
         return
 
-    # STRICT gate (롱이면 우회)
-    if not bypass and not _strict_try_reserve():
+    # strict gate (숏만 적용)
+    if not _strict_try_reserve(side):
         st = capacity_status()
-        send_telegram(f"🧱 STRICT HOLD {symbol} {side} {st['last_count']}/{MAX_OPEN_POSITIONS} trace={trace}")
+        send_telegram(f"⏸️ retry_hold STRICT {symbol} {side} {st['short_count']}/{MAX_OPEN_POSITIONS}")
         return
     try:
-        if not bypass and not can_enter_now():
+        # periodic capacity (숏만 적용)
+        if not can_enter_now(side):
             st = capacity_status()
-            send_telegram(f"⏳ ENTRY HOLD (periodic) {symbol} {side} {st['last_count']}/{MAX_OPEN_POSITIONS} trace={trace}")
+            send_telegram(f"⏳ ENTRY HOLD (periodic) {symbol} {side} {st['short_count']}/{MAX_OPEN_POSITIONS}")
             return
 
         with _PENDING_LOCK:
@@ -234,16 +287,16 @@ def enter_position(symbol: str, usdt_amount: float, side: str = "long", leverage
         if RECON_DEBUG: send_telegram(f"📌 pending add [entry] {pkey}")
 
         with _lock_for(key):
-            # 이미 보유 or 최근 성공 → 차단
             if _local_has_any(symbol) or _get_remote_any_side(symbol) or _recent_ok(key):
-                _mark_done("entry", pkey, "(exists/recent)"); return
+                _mark_done("entry", pkey, "(exists/recent)")
+                return
 
             _set_busy(key)
 
             last = get_last_price(symbol)
             if not last or last <= 0:
                 if TRACE_LOG: send_telegram(f"❗ ticker_fail {symbol} trace={trace}")
-                return  # 리컨실러 재시도
+                return  # 리컨실러가 재시도
 
             resp = place_market_order(symbol, usdt_amount,
                                       side=("buy" if side == "long" else "sell"),
@@ -266,19 +319,22 @@ def enter_position(symbol: str, usdt_amount: float, side: str = "long", leverage
                 # 실패는 리컨실러에 맡김
     finally:
         _clear_busy(key)
-        if not bypass: _strict_release()
+        _strict_release(side)
 
 def _sweep_full_close(symbol: str, side: str, reason: str, max_retry: int = 5, sleep_s: float = 0.3):
     for _ in range(max_retry):
-        p = _get_remote(symbol, side); size = float(p["size"]) if p and p.get("size") else 0.0
-        if size <= 0: return True
-        place_reduce_by_size(symbol, size, side); time.sleep(sleep_s)
+        p = _get_remote(symbol, side)
+        size = float(p["size"]) if p and p.get("size") else 0.0
+        if size <= 0:
+            return True
+        place_reduce_by_size(symbol, size, side)
+        time.sleep(sleep_s)
     p = _get_remote(symbol, side)
     return (not p) or float(p.get("size", 0)) <= 0
 
-# ── Breakeven(본절) 스톱 ───────────────────────────────────────
+# ── breakeven (TP1/TP2 이후 본절 도달 시 전체 종료) ───────────
 BE_ENABLE        = os.getenv("BE_ENABLE", "1") == "1"
-BE_AFTER_STAGE   = int(os.getenv("BE_AFTER_STAGE", "1"))
+BE_AFTER_STAGE   = int(os.getenv("BE_AFTER_STAGE", "1"))       # 1=TP1부터
 BE_EPSILON_RATIO = float(os.getenv("BE_EPSILON_RATIO", "0.0005"))
 
 def take_partial_profit(symbol: str, pct: float, side: str = "long"):
@@ -288,21 +344,27 @@ def take_partial_profit(symbol: str, pct: float, side: str = "long"):
     with _lock_for(key):
         p = _get_remote(symbol, side)
         if not p or float(p.get("size", 0)) <= 0:
-            send_telegram(f"⚠️ TP 스킵: 원격 포지션 없음 {_key(symbol, side)}"); return
+            send_telegram(f"⚠️ TP 스킵: 원격 포지션 없음 {_key(symbol, side)}")
+            return
 
         size_step = float(get_symbol_spec(symbol).get("sizeStep", 0.001))
         cur_size  = float(p["size"])
         cut_size  = round_down_step(cur_size * float(pct), size_step)
         if cut_size <= 0:
-            send_telegram(f"⚠️ TP 스킵: 계산된 사이즈=0 ({_key(symbol, side)})"); return
+            send_telegram(f"⚠️ TP 스킵: 계산된 사이즈=0 ({_key(symbol, side)})")
+            return
 
+        # TP3는 펜딩 등록 (부분청산 보강 재시도)
         if abs(float(pct) - TP3_PCT) <= 1e-6:
             with _PENDING_LOCK:
                 pk = _pending_key_tp3(symbol, side)
-                _PENDING["tp"][pk] = {"symbol": symbol, "side": side, "stage": 3, "pct": float(pct),
-                                      "init_size": cur_size, "cut_size": cut_size, "size_step": size_step,
-                                      "created": time.time(), "last_try": 0.0, "attempts": 0}
-            if RECON_DEBUG: send_telegram(f"📌 pending add [tp] {pk}")
+                _PENDING["tp"][pk] = {
+                    "symbol": symbol, "side": side, "stage": 3, "pct": float(pct),
+                    "init_size": cur_size, "cut_size": cut_size, "size_step": size_step,
+                    "created": time.time(), "last_try": 0.0, "attempts": 0,
+                }
+            if RECON_DEBUG:
+                send_telegram(f"📌 pending add [tp] {pk}")
 
         resp = place_reduce_by_size(symbol, cut_size, side)
         exit_price = get_last_price(symbol) or float(p.get("entry_price", 0))
@@ -313,9 +375,10 @@ def take_partial_profit(symbol: str, pct: float, side: str = "long"):
                 f"🤑 TP {int(pct*100)}% {side.upper()} {symbol}\n"
                 f"• Exit: {exit_price}\n• Cut size: {cut_size}\n• Realized≈ {realized:+.2f} USDT"
             )
+            # 본절 무장
             try:
                 stage = 1 if abs(float(pct) - TP1_PCT) <= 1e-6 else (2 if abs(float(pct) - TP2_PCT) <= 1e-6 else 0)
-                if BE_ENABLE and stage in (1,2) and stage >= BE_AFTER_STAGE:
+                if BE_ENABLE and stage in (1, 2) and stage >= BE_AFTER_STAGE:
                     profited = (exit_price > entry) if side == "long" else (exit_price < entry)
                     if profited:
                         with _POS_LOCK:
@@ -323,7 +386,8 @@ def take_partial_profit(symbol: str, pct: float, side: str = "long"):
                             st.update({"be_armed": True, "be_entry": entry, "be_from_stage": stage})
                             position_data[key] = st
                         send_telegram(f"🧷 Breakeven ARMED at entry≈{entry} ({symbol} {side}, from TP{stage})")
-            except: pass
+            except Exception:
+                pass
 
 def close_position(symbol: str, side: str = "long", reason: str = "manual"):
     symbol = convert_symbol(symbol); side = (side or "long").lower()
@@ -338,11 +402,13 @@ def close_position(symbol: str, side: str = "long", reason: str = "manual"):
         p = None
         for _ in range(3):
             p = _get_remote(symbol, side)
-            if p and float(p.get("size", 0)) > 0: break
+            if p and float(p.get("size", 0)) > 0:
+                break
             time.sleep(0.15)
 
         if not p or float(p.get("size", 0)) <= 0:
-            with _POS_LOCK: position_data.pop(key, None)
+            with _POS_LOCK:
+                position_data.pop(key, None)
             _mark_done("close", pkey, "(no-remote)")
             send_telegram(f"⚠️ CLOSE 스킵: 원격 포지션 없음 {key} ({reason})")
             return
@@ -356,13 +422,14 @@ def close_position(symbol: str, side: str = "long", reason: str = "manual"):
         if success or ok:
             entry = float(p.get("entry_price", 0))
             realized = _pnl_usdt(entry, exit_price, entry * size, side)
-            with _POS_LOCK: position_data.pop(key, None)
+            with _POS_LOCK:
+                position_data.pop(key, None)
             _mark_done("close", pkey)
             send_telegram(
                 f"✅ CLOSE {side.upper()} {symbol} ({reason})\n"
                 f"• Exit: {exit_price}\n• Size: {size}\n• Realized≈ {realized:+.2f} USDT"
             )
-            # 엔트리 중복 방지(닫힌 직후 잠깐 recent_ok) — 필요 없으면 주석
+            # 막 닫힌 직후 재진입 중복 방지 (짧게)
             _mark_recent_ok(key)
 
 def reduce_by_contracts(symbol: str, contracts: float, side: str = "long"):
@@ -371,21 +438,27 @@ def reduce_by_contracts(symbol: str, contracts: float, side: str = "long"):
     with _lock_for(key):
         step = float(get_symbol_spec(symbol).get("sizeStep", 0.001))
         qty  = round_down_step(float(contracts), step)
-        if qty <= 0: send_telegram(f"⚠️ reduceByContracts 스킵: step 미달 {key}"); return
+        if qty <= 0:
+            send_telegram(f"⚠️ reduceByContracts 스킵: step 미달 {key}")
+            return
         resp = place_reduce_by_size(symbol, qty, side)
-        if str(resp.get("code", "")) == "00000": send_telegram(f"🔻 Reduce {qty} {side.upper()} {symbol}")
-        else: send_telegram(f"❌ Reduce 실패 {key} → {resp}")
+        if str(resp.get("code", "")) == "00000":
+            send_telegram(f"🔻 Reduce {qty} {side.upper()} {symbol}")
+        else:
+            send_telegram(f"❌ Reduce 실패 {key} → {resp}")
 
-# ── Emergency watchdog ────────────────────────────────────────
+# ── watchdogs ─────────────────────────────────────────────────
 def _watchdog_loop():
     while True:
         try:
             for p in get_open_positions():
                 symbol = p.get("symbol"); side = (p.get("side") or "").lower()
                 entry  = float(p.get("entry_price") or 0); size = float(p.get("size") or 0)
-                if not symbol or side not in ("long","short") or entry <= 0 or size <= 0: continue
+                if not symbol or side not in ("long","short") or entry <= 0 or size <= 0:
+                    continue
                 last = get_last_price(symbol)
-                if not last: continue
+                if not last:
+                    continue
                 loss_ratio = _loss_ratio_on_margin(entry, last, size, side, leverage=LEVERAGE)
                 if loss_ratio >= STOP_PCT:
                     k = _key(symbol, side)
@@ -396,22 +469,26 @@ def _watchdog_loop():
             print("watchdog error:", e)
         time.sleep(STOP_CHECK_SEC)
 
-# ── Breakeven watchdog ────────────────────────────────────────
 def _breakeven_watchdog():
-    if not BE_ENABLE: return
+    if not BE_ENABLE:
+        return
     while True:
         try:
             for p in get_open_positions():
                 symbol = p.get("symbol"); side = (p.get("side") or "").lower()
                 entry  = float(p.get("entry_price") or 0); size = float(p.get("size") or 0)
-                if not symbol or side not in ("long","short") or entry <= 0 or size <= 0: continue
+                if not symbol or side not in ("long","short") or entry <= 0 or size <= 0:
+                    continue
                 key = _key(symbol, side)
                 with _POS_LOCK:
                     st = position_data.get(key, {}) or {}
-                    be_armed = bool(st.get("be_armed")); be_entry = float(st.get("be_entry") or 0.0)
-                if not (be_armed and be_entry > 0): continue
+                    be_armed = bool(st.get("be_armed"))
+                    be_entry = float(st.get("be_entry") or 0.0)
+                if not (be_armed and be_entry > 0):
+                    continue
                 last = get_last_price(symbol)
-                if not last: continue
+                if not last:
+                    continue
                 eps = max(be_entry * BE_EPSILON_RATIO, 0.0)
                 trigger = (last <= be_entry - eps) if side == "long" else (last >= be_entry + eps)
                 if trigger:
@@ -421,7 +498,6 @@ def _breakeven_watchdog():
             print("breakeven watchdog error:", e)
         time.sleep(0.8)
 
-# ── Reconciler ────────────────────────────────────────────────
 def _reconciler_loop():
     while True:
         time.sleep(RECON_INTERVAL_SEC)
@@ -433,24 +509,21 @@ def _reconciler_loop():
                 sym, side = item["symbol"], item["side"]
                 key = _key(sym, side)
 
-                # 이미 보유/최근 성공 → 정리
                 if _local_has_any(sym) or _get_remote_any_side(sym) or _recent_ok(key):
                     _mark_done("entry", pkey, "(exists/recent)")
                     continue
 
-                bypass = (LONG_BYPASS_CAP and side == "long")
-                if _is_busy(key):  # 다른 쓰레드가 처리 중
+                if _is_busy(key):
                     continue
 
-                # STRICT gate (롱이면 우회)
-                if not bypass and not _strict_try_reserve():
+                if not _strict_try_reserve(side):
                     if TRACE_LOG:
                         st = capacity_status()
-                        send_telegram(f"⏸️ retry_hold STRICT {sym} {side} {st['last_count']}/{MAX_OPEN_POSITIONS}")
+                        send_telegram(f"⏸️ retry_hold STRICT {sym} {side} {st['short_count']}/{MAX_OPEN_POSITIONS}")
                     continue
 
                 try:
-                    if not bypass and not can_enter_now():
+                    if not can_enter_now(side):
                         continue
 
                     with _lock_for(key):
@@ -480,7 +553,7 @@ def _reconciler_loop():
                             send_telegram(f"⛔ ENTRY 재시도 스킵 {sym} {side} → {resp}")
                 finally:
                     _clear_busy(key)
-                    if not bypass: _strict_release()
+                    _strict_release(side)
 
             # CLOSE 재시도
             with _PENDING_LOCK:
@@ -491,13 +564,15 @@ def _reconciler_loop():
                 p = _get_remote(sym, side)
                 if not p or float(p.get("size", 0)) <= 0:
                     _mark_done("close", pkey, "(no-remote)")
-                    with _POS_LOCK: position_data.pop(key, None)
+                    with _POS_LOCK:
+                        position_data.pop(key, None)
                     continue
                 with _lock_for(key):
                     now = time.time()
                     if now - item.get("last_try", 0.0) < RECON_INTERVAL_SEC - 1:
                         continue
-                    if RECON_DEBUG: send_telegram(f"🔁 retry [close] {pkey}")
+                    if RECON_DEBUG:
+                        send_telegram(f"🔁 retry [close] {pkey}")
                     size = float(p["size"])
                     resp = place_reduce_by_size(sym, size, side)
                     item["last_try"] = now
@@ -506,7 +581,8 @@ def _reconciler_loop():
                         ok = _sweep_full_close(sym, side, "reconcile")
                         if ok:
                             _mark_done("close", pkey)
-                            with _POS_LOCK: position_data.pop(key, None)
+                            with _POS_LOCK:
+                                position_data.pop(key, None)
                             send_telegram(f"🔁 CLOSE 재시도 성공 {side.upper()} {sym}")
 
             # TP3 재시도
@@ -517,7 +593,8 @@ def _reconciler_loop():
                 key = _key(sym, side)
                 p = _get_remote(sym, side)
                 if not p or float(p.get("size", 0)) <= 0:
-                    _mark_done("tp", pkey, "(no-remote)"); continue
+                    _mark_done("tp", pkey, "(no-remote)")
+                    continue
 
                 cur_size  = float(p["size"])
                 init_size = float(item.get("init_size") or cur_size)
@@ -526,17 +603,22 @@ def _reconciler_loop():
                 achieved  = max(0.0, init_size - cur_size)
                 eps = max(size_step * 2.0, init_size * TP_EPSILON_RATIO)
                 if achieved + eps >= cut_size:
-                    _mark_done("tp", pkey); continue
+                    _mark_done("tp", pkey)
+                    continue
                 remain = round_down_step(cut_size - achieved, size_step)
                 if remain <= 0:
-                    _mark_done("tp", pkey); continue
+                    _mark_done("tp", pkey)
+                    continue
 
                 with _lock_for(key):
                     now = time.time()
-                    if now - item.get("last_try", 0.0) < RECON_INTERVAL_SEC - 1: continue
-                    if RECON_DEBUG: send_telegram(f"🔁 retry [tp3] {pkey} remain≈{remain}")
+                    if now - item.get("last_try", 0.0) < RECON_INTERVAL_SEC - 1:
+                        continue
+                    if RECON_DEBUG:
+                        send_telegram(f"🔁 retry [tp3] {pkey} remain≈{remain}")
                     resp = place_reduce_by_size(sym, remain, side)
-                    item["last_try"] = now; item["attempts"] = item.get("attempts", 0) + 1
+                    item["last_try"] = now
+                    item["attempts"] = item.get("attempts", 0) + 1
                     if str(resp.get("code", "")) == "00000":
                         send_telegram(f"🔁 TP3 재시도 감축 {side.upper()} {sym} remain≈{remain}")
         except Exception as e:
