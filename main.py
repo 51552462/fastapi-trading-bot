@@ -48,20 +48,19 @@ def _infer_side(side: str, default: str = "long") -> str:
 
 def _norm_type(typ: str) -> str:
     """
-    type 문자열을 소문자로 만들고, 공백/언더스코어/대시 등을 제거해 표준화.
+    type 문자열을 소문자로 만들고, 공백/언더스코어/대시 제거해 표준화.
     예) 'emaExit'/'ema_exit'/'EMA-EXIT' -> 'emaexit'
     """
     t = (typ or "").strip().lower()
     t = re.sub(r"[\s_\-]+", "", t)
-    # 널리 쓰는 별칭을 표준 토큰으로 통일
     aliases = {
         "tp_1": "tp1", "tp_2": "tp2", "tp_3": "tp3",
         "takeprofit1": "tp1", "takeprofit2": "tp2", "takeprofit3": "tp3",
         "sl_1": "sl1", "sl_2": "sl2",
         "stopfull": "stoploss", "stopall": "stoploss", "stop": "stoploss",
         "fullexit": "stoploss", "exitall": "stoploss",
-        "emaexit": "emaexit",  # 그대로
-        "failcut": "failcut",  # 그대로
+        "emaexit": "emaexit",
+        "failcut": "failcut",
         "closeposition": "close", "closeall": "close",
         "reducecontracts": "reducebycontracts",
         "reduce_by_contracts": "reducebycontracts",
@@ -103,7 +102,7 @@ async def _parse_any(req: Request) -> Dict[str, Any]:
         for part in re.split(r"[\n,]+", txt):
             if ":" in part:
                 k, v = part.split(":", 1)
-                d[k.strip()] = v.strip()
+                d[k.strip()] = v.strip()          # ← FIX: 잘못된 d[k].strip() 제거
         if d:
             return d
     except Exception:
@@ -135,7 +134,7 @@ def _handle_signal(data: Dict[str, Any]):
         send_telegram("⚠️ symbol 없음: " + json.dumps(data))
         return
 
-    t = _norm_type(typ_raw)  # ← 핵심: 표준 토큰으로 변환
+    t = _norm_type(typ_raw)
 
     # 너무 잦은 동일 비즈니스 이벤트 차단
     now = time.time()
@@ -151,7 +150,7 @@ def _handle_signal(data: Dict[str, Any]):
         except Exception:
             pass
 
-    # 라우팅 (모두 소문자 기준)
+    # 라우팅
     if t == "entry":
         enter_position(symbol, resolved_amount, side=side, leverage=leverage)
         return
@@ -163,10 +162,10 @@ def _handle_signal(data: Dict[str, Any]):
         take_partial_profit(symbol, pct, side=side)
         return
 
-    # 즉시 전체 종료에 포함되는 키들(전부 소문자)
+    # 즉시 전체 종료 키들
     CLOSE_KEYS = {
         "stoploss", "emaexit", "failcut", "fullexit", "close", "exit", "liquidation",
-        "sl1", "sl2"  # 부분 손절 신호도 전체 종료로 동작시키고 싶다는 요청 반영
+        "sl1", "sl2"
     }
     if t in CLOSE_KEYS:
         close_position(symbol, side=side, reason=t)
@@ -181,7 +180,6 @@ def _handle_signal(data: Dict[str, Any]):
     if t in ("tailtouch", "info", "debug"):
         return
 
-    # 여기까지 매칭이 안 되면 알 수 없는 신호
     send_telegram("❓ 알 수 없는 신호: " + json.dumps(data))
 
 # ──────────────────────────────────────────────────────────────
@@ -207,7 +205,8 @@ async def _ingest(req: Request):
         return {"ok": False, "error": f"bad_payload: {e}"}
 
     dk = _dedup_key(data)
-    if dk in _DEDU P and now - _DEDUP[dk] < DEDUP_TTL:
+    # ← FIX: 오타 수정 (_DEDU P → _DEDUP)
+    if dk in _DEDUP and now - _DEDUP[dk] < DEDUP_TTL:
         return {"ok": True, "dedup": True}
     _DEDUP[dk] = now
 
@@ -219,8 +218,6 @@ async def _ingest(req: Request):
         return {"ok": False, "queued": False, "reason": "queue_full"}
 
     return {"ok": True, "queued": True, "qsize": _task_q.qsize()}
-
-app = FastAPI()
 
 @app.get("/")
 def root():
