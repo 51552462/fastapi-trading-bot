@@ -163,7 +163,6 @@ def _loop():
                     size  = float(p.get("size") or 0)
                 except: continue
                 if entry <= 0 or size <= 0: continue
-
                 last = get_last_price(symbol)
                 if not last or last <= 0: continue
 
