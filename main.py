@@ -33,119 +33,171 @@ _DEDUP: Dict[str, float] = {}
 _BIZDEDUP: Dict[str, float] = {}
 _task_q: "queue.Queue[Dict[str, Any]]" = queue.Queue(maxsize=QUEUE_MAX)
 
-def _biz_key(typ: str, symbol: str, side: str) -> str:
-    return f"{typ}:{symbol}:{side}"
+# ──────────────────────────────────────────────────────────────
+# 유틸
+# ──────────────────────────────────────────────────────────────
+def _dedup_key(d: Dict[str, Any]) -> str:
+    return hashlib.sha1(json.dumps(d, sort_keys=True).encode()).hexdigest()
+
+def _norm_symbol(sym: str) -> str:
+    return convert_symbol(sym)
 
 def _infer_side(side: str, default: str = "long") -> str:
     s = (side or "").strip().lower()
     return s if s in ("long", "short") else default
 
-def _norm_symbol(sym: str) -> str:
-    return convert_symbol(sym)
+def _norm_type(typ: str) -> str:
+    """
+    type 문자열을 소문자로 만들고, 공백/언더스코어/대시 등을 제거해 표준화.
+    예) 'emaExit'/'ema_exit'/'EMA-EXIT' -> 'emaexit'
+    """
+    t = (typ or "").strip().lower()
+    t = re.sub(r"[\s_\-]+", "", t)
+    # 널리 쓰는 별칭을 표준 토큰으로 통일
+    aliases = {
+        "tp_1": "tp1", "tp_2": "tp2", "tp_3": "tp3",
+        "takeprofit1": "tp1", "takeprofit2": "tp2", "takeprofit3": "tp3",
+        "sl_1": "sl1", "sl_2": "sl2",
+        "stopfull": "stoploss", "stopall": "stoploss", "stop": "stoploss",
+        "fullexit": "stoploss", "exitall": "stoploss",
+        "emaexit": "emaexit",  # 그대로
+        "failcut": "failcut",  # 그대로
+        "closeposition": "close", "closeall": "close",
+        "reducecontracts": "reducebycontracts",
+        "reduce_by_contracts": "reducebycontracts",
+    }
+    return aliases.get(t, t)
 
+# ──────────────────────────────────────────────────────────────
+# Payload 파서(느슨하게)
+# ──────────────────────────────────────────────────────────────
 async def _parse_any(req: Request) -> Dict[str, Any]:
+    # JSON
     try:
         return await req.json()
     except Exception:
         pass
+    # Raw body
     try:
         raw = (await req.body()).decode(errors="ignore").strip()
         if raw:
-            try: return json.loads(raw)
+            try:
+                return json.loads(raw)
             except Exception:
-                fixed = raw.replace("'", '"'); return json.loads(fixed)
+                fixed = raw.replace("'", '"')
+                return json.loads(fixed)
     except Exception:
         pass
+    # Form
     try:
         form = await req.form()
         payload = form.get("payload") or form.get("data")
-        if payload: return json.loads(payload)
+        if payload:
+            return json.loads(payload)
     except Exception:
         pass
+    # Key:Value 텍스트
     try:
         txt = (await req.body()).decode(errors="ignore")
         d: Dict[str, Any] = {}
         for part in re.split(r"[\n,]+", txt):
             if ":" in part:
-                k, v = part.split(":", 1); d[k].strip(); d[k.strip()] = v.strip()
-        if d: return d
+                k, v = part.split(":", 1)
+                d[k.strip()] = v.strip()
+        if d:
+            return d
     except Exception:
         pass
     raise ValueError("cannot parse request")
 
+# ──────────────────────────────────────────────────────────────
+# 시그널 라우팅
+# ──────────────────────────────────────────────────────────────
 def _handle_signal(data: Dict[str, Any]):
-    typ0   = (data.get("type") or "").strip()
-    symbol = _norm_symbol(data.get("symbol", ""))
-    side   = _infer_side(data.get("side"), "long")
+    typ_raw = (data.get("type") or "")
+    symbol  = _norm_symbol(data.get("symbol", ""))
+    side    = _infer_side(data.get("side"), "long")
 
     amount   = float(data.get("amount", DEFAULT_AMOUNT))
     leverage = float(data.get("leverage", LEVERAGE))
 
+    # 심볼별 금액 우선
     resolved_amount = float(amount)
     if (symbol in SYMBOL_AMOUNT) and (str(SYMBOL_AMOUNT[symbol]).strip() != ""):
-        try: resolved_amount = float(SYMBOL_AMOUNT[symbol])
-        except Exception: resolved_amount = float(DEFAULT_AMOUNT)
+        try:
+            resolved_amount = float(SYMBOL_AMOUNT[symbol])
+        except Exception:
+            resolved_amount = float(DEFAULT_AMOUNT)
     elif FORCE_DEFAULT_AMOUNT:
         resolved_amount = float(DEFAULT_AMOUNT)
 
     if not symbol:
-        send_telegram("⚠️ symbol 없음: " + json.dumps(data)); return
-
-    t = typ0.lower().replace(" ", "")
-    legacy_map = {
-        "tp_1": "tp1", "tp_2": "tp2", "tp_3": "tp3",
-        "sl_1": "sl1", "sl_2": "sl2",
-        "ema_exit": "emaExit", "failcut": "failCut",
-    }
-    t = legacy_map.get(t, t)
-
-    # stoploss 동의어 → 즉시 전체 청산
-    STOP_KEYS = {"stoploss", "stop_loss", "sl", "stop", "stopall", "stopfull"}
-    if t in STOP_KEYS:
-        t = "stoploss"
-
-    now = time.time()
-    bk = _biz_key(t, symbol, side)
-    if bk in _BIZDEDUP and now - _BIZDEDUP[bk] < BIZDEDUP_TTL:
+        send_telegram("⚠️ symbol 없음: " + json.dumps(data))
         return
-    _BIZDEDUP[bk] = now
+
+    t = _norm_type(typ_raw)  # ← 핵심: 표준 토큰으로 변환
+
+    # 너무 잦은 동일 비즈니스 이벤트 차단
+    now = time.time()
+    bizkey = f"{t}:{symbol}:{side}"
+    last = _BIZDEDUP.get(bizkey, 0.0)
+    if now - last < BIZDEDUP_TTL:
+        return
+    _BIZDEDUP[bizkey] = now
 
     if LOG_INGRESS:
-        try: send_telegram(f"📥 {t} {symbol} {side} amt={resolved_amount}")
-        except: pass
+        try:
+            send_telegram(f"📥 {t} {symbol} {side} amt={resolved_amount}")
+        except Exception:
+            pass
 
+    # 라우팅 (모두 소문자 기준)
     if t == "entry":
-        enter_position(symbol, resolved_amount, side=side, leverage=leverage); return
-
-    if t in ("tp1","tp2","tp3"):
-        pct = float(os.getenv("TP1_PCT","0.30")) if t=="tp1" else float(os.getenv("TP2_PCT","0.40")) if t=="tp2" else float(os.getenv("TP3_PCT","0.30"))
-        take_partial_profit(symbol, pct, side=side); return
-
-    if t in ("sl1","sl2","failCut","emaExit","liquidation","fullExit","close","exit","stoploss"):
-        close_position(symbol, side=side, reason=t); return
-
-    if t == "reduceByContracts":
-        contracts = float(data.get("contracts", 0))
-        if contracts > 0: reduce_by_contracts(symbol, contracts, side=side)
+        enter_position(symbol, resolved_amount, side=side, leverage=leverage)
         return
 
-    if t in ("tailTouch","info","debug"): return
+    if t in ("tp1", "tp2", "tp3"):
+        pct = float(os.getenv("TP1_PCT", "0.30")) if t == "tp1" else \
+              float(os.getenv("TP2_PCT", "0.40")) if t == "tp2" else \
+              float(os.getenv("TP3_PCT", "0.30"))
+        take_partial_profit(symbol, pct, side=side)
+        return
 
+    # 즉시 전체 종료에 포함되는 키들(전부 소문자)
+    CLOSE_KEYS = {
+        "stoploss", "emaexit", "failcut", "fullexit", "close", "exit", "liquidation",
+        "sl1", "sl2"  # 부분 손절 신호도 전체 종료로 동작시키고 싶다는 요청 반영
+    }
+    if t in CLOSE_KEYS:
+        close_position(symbol, side=side, reason=t)
+        return
+
+    if t == "reducebycontracts":
+        contracts = float(data.get("contracts", 0))
+        if contracts > 0:
+            reduce_by_contracts(symbol, contracts, side=side)
+        return
+
+    if t in ("tailtouch", "info", "debug"):
+        return
+
+    # 여기까지 매칭이 안 되면 알 수 없는 신호
     send_telegram("❓ 알 수 없는 신호: " + json.dumps(data))
 
+# ──────────────────────────────────────────────────────────────
+# 워커/엔드포인트/스타트업
+# ──────────────────────────────────────────────────────────────
 def _worker_loop(idx: int):
     while True:
         try:
             data = _task_q.get()
-            if data is None: continue
+            if data is None:
+                continue
             _handle_signal(data)
         except Exception as e:
             print(f"[worker-{idx}] error:", e)
         finally:
             _task_q.task_done()
-
-def _dedup_key(d: Dict[str, Any]) -> str:
-    return hashlib.sha1(json.dumps(d, sort_keys=True).encode()).hexdigest()
 
 async def _ingest(req: Request):
     now = time.time()
@@ -155,7 +207,7 @@ async def _ingest(req: Request):
         return {"ok": False, "error": f"bad_payload: {e}"}
 
     dk = _dedup_key(data)
-    if dk in _DEDUP and now - _DEDUP[dk] < DEDUP_TTL:
+    if dk in _DEDU P and now - _DEDUP[dk] < DEDUP_TTL:
         return {"ok": True, "dedup": True}
     _DEDUP[dk] = now
 
@@ -165,11 +217,12 @@ async def _ingest(req: Request):
     except queue.Full:
         send_telegram("⚠️ queue full → drop signal: " + json.dumps(data))
         return {"ok": False, "queued": False, "reason": "queue_full"}
+
     return {"ok": True, "queued": True, "qsize": _task_q.qsize()}
 
 app = FastAPI()
 
-app.get("/")
+@app.get("/")
 def root():
     return {"ok": True}
 
@@ -225,8 +278,10 @@ def on_startup():
     start_watchdogs()
     start_reconciler()
     try:
-        threading.Thread(target=send_telegram,
-                         args=("✅ FastAPI up (workers + watchdog + reconciler + capacity-guard)",),
-                         daemon=True).start()
-    except:
+        threading.Thread(
+            target=send_telegram,
+            args=("✅ FastAPI up (workers + watchdog + reconciler + capacity-guard)",),
+            daemon=True
+        ).start()
+    except Exception:
         pass
