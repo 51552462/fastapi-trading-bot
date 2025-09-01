@@ -1,5 +1,5 @@
 import os, time, json, hmac, hashlib, base64, requests, math, random
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 
 BASE_URL = "https://api.bitget.com"
 
@@ -33,7 +33,9 @@ def _headers(method: str, path_with_query: str, body: str = "") -> Dict[str, str
         "locale": "en-US",
     }
 
+# ──────────────────────────────────────────────────────────────
 # TradingView ↔ Bitget symbol alias
+# ──────────────────────────────────────────────────────────────
 ALIASES: Dict[str, str] = {}
 _alias_env = os.getenv("SYMBOL_ALIASES_JSON", "")
 if _alias_env:
@@ -48,7 +50,9 @@ def convert_symbol(sym: str) -> str:
 def _mix_symbol(sym: str) -> str:
     return f"{convert_symbol(sym)}_UMCBL"
 
+# ──────────────────────────────────────────────────────────────
 # ticker/price cache
+# ──────────────────────────────────────────────────────────────
 _TICKER_CACHE: Dict[str, tuple] = {}
 TICKER_TTL    = float(os.getenv("TICKER_TTL", "2.5"))
 STRICT_TICKER = os.getenv("STRICT_TICKER", "0") == "1"
@@ -215,8 +219,11 @@ def place_reduce_by_size(symbol: str, size: float, side: str) -> Dict:
         print("❌ reduce EXC", str(e))
         return {"code": "LOCAL_EXCEPTION", "msg": str(e)}
 
+# ──────────────────────────────────────────────────────────────
+# Positions
+# ──────────────────────────────────────────────────────────────
 _POS_CACHE = {"data": [], "ts": 0.0, "cooldown_until": 0.0}
-def _ffloat(x): 
+def _ffloat(x):
     try: return float(x)
     except: return 0.0
 
@@ -240,8 +247,17 @@ def _fetch_positions() -> List[Dict]:
         hold     = (it.get("holdSide") or it.get("side") or "").lower()
         sz       = _ffloat(it.get("total") or it.get("available") or it.get("size"))
         avg      = _ffloat(it.get("averageOpenPrice") or it.get("avgOpenPrice") or it.get("entryPrice"))
+        liq      = _ffloat(it.get("liquidationPrice") or it.get("liqPx") or 0.0)
+        lev      = _ffloat(it.get("fixedLeverage") or it.get("crossLeverage") or it.get("leverage") or 0.0)
         if sz > 0 and hold in ("long","short"):
-            out.append({"symbol": sym_core, "side": hold, "size": sz, "entry_price": avg})
+            out.append({
+                "symbol": sym_core,
+                "side": hold,
+                "size": sz,
+                "entry_price": avg,
+                "liq_price": liq,        # risk_guard가 있으면 사용, 없으면 DEFAULT_STOP_PCT로 폴백
+                "leverage": lev,
+            })
     return out
 
 def get_open_positions() -> List[Dict]:
@@ -256,3 +272,75 @@ def get_open_positions() -> List[Dict]:
         _POS_CACHE["cooldown_until"] = now + 90
         print("⚠️ position 새 조회 실패 → 캐시 반환(90s 쿨다운)")
     return _POS_CACHE["data"]
+
+# ──────────────────────────────────────────────────────────────
+# ★ 추가: 계좌/마진/잔고 조회 (risk_guard가 자동 사용)
+# ──────────────────────────────────────────────────────────────
+def _private_get(path: str, query: str = "", timeout: float = 10.0) -> Dict:
+    """서명 필요한 GET 헬퍼"""
+    q = f"?{query}" if query else ""
+    try:
+        _rl(path, 0.10)
+        r = requests.get(BASE_URL + path + q, headers=_headers("GET", path + q, ""), timeout=timeout)
+        return r.json() if r is not None else {}
+    except Exception as e:
+        print("❌ private_get 예외:", e)
+        return {}
+
+def get_account_equity() -> Optional[float]:
+    """
+    UMCBL(USDT 선물) 계좌 총자본(Equity) 조회.
+    - /api/mix/v1/account/accounts?productType=umcbl
+    """
+    j = _private_get("/api/mix/v1/account/accounts", "productType=umcbl", timeout=12)
+    data = j.get("data")
+    if not data: return None
+    # data가 배열/객체 모두 가능성 고려
+    def _pick(d):
+        for k in ("usdtEquity","equity","totalEquity","accountEquity"):
+            v = d.get(k)
+            if v not in (None, "", "0", 0): 
+                try: return float(v)
+                except: pass
+        return None
+    if isinstance(data, list):
+        for d in data:
+            v = _pick(d)
+            if v and v > 0: return v
+    elif isinstance(data, dict):
+        v = _pick(data)
+        if v and v > 0: return v
+    return None
+
+def get_wallet_balance(coin: str = "USDT") -> Dict[str, float]:
+    """
+    가용/총 잔고 근사: 선물 계정 기준.
+    - accounts 응답에서 available, equity 비슷한 키를 탐색.
+    """
+    j = _private_get("/api/mix/v1/account/accounts", "productType=umcbl", timeout=12)
+    data = j.get("data")
+    out = {"available": 0.0, "total": 0.0}
+    if not data: return out
+    arr = data if isinstance(data, list) else [data]
+    for d in arr:
+        try:
+            eq = float(d.get("usdtEquity") or d.get("equity") or d.get("totalEquity") or 0.0)
+            av = float(d.get("available") or d.get("availableMargin") or d.get("cashBal") or 0.0)
+            out["total"] = max(out["total"], eq)
+            out["available"] = max(out["available"], av)
+        except: 
+            continue
+    return out
+
+def get_margin_snapshot() -> Dict[str, float]:
+    """
+    사용중 증거금/가용증거금 스냅샷.
+    - 우선 accounts 응답으로 추정: used = equity - available
+    - 정확 API가 추후 필요하면 여기서 교체하면 됨(위험 없음).
+    반환 예: {"margin_used": 1234.5, "available": 6789.0, "equity": 8023.5}
+    """
+    bal = get_wallet_balance("USDT")
+    eq  = get_account_equity() or float(bal.get("total") or 0.0)
+    av  = float(bal.get("available") or 0.0)
+    used = max(0.0, eq - av)
+    return {"margin_used": used, "available": av, "equity": eq}
