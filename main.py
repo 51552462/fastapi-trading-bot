@@ -10,6 +10,13 @@ from trader import (
 from telegram_bot import send_telegram
 from bitget_api import convert_symbol, get_open_positions
 
+# [ADD] 정책/텔레메트리 추가 (비침투적)
+from policy.tf_policy import ingest_signal, start_policy_manager   # [ADD]
+try:
+    from telemetry.logger import log_event                        # [ADD]
+except Exception:
+    def log_event(*a, **kw): pass                                 # [ADD]
+
 DEFAULT_AMOUNT = float(os.getenv("DEFAULT_AMOUNT", "15"))
 LEVERAGE       = float(os.getenv("LEVERAGE", "5"))
 DEDUP_TTL      = float(os.getenv("DEDUP_TTL", "15"))
@@ -102,7 +109,7 @@ async def _parse_any(req: Request) -> Dict[str, Any]:
         for part in re.split(r"[\n,]+", txt):
             if ":" in part:
                 k, v = part.split(":", 1)
-                d[k.strip()] = v.strip()          # ← FIX: 잘못된 d[k].strip() 제거
+                d[k.strip()] = v.strip()    # ← FIX: 잘못된 d[k].strip() 제거 반영
         if d:
             return d
     except Exception:
@@ -116,6 +123,14 @@ def _handle_signal(data: Dict[str, Any]):
     typ_raw = (data.get("type") or "")
     symbol  = _norm_symbol(data.get("symbol", ""))
     side    = _infer_side(data.get("side"), "long")
+
+    # [ADD] 텔레메트리: 원본 신호 로그(선택)
+    try: log_event(data, stage="ingress")
+    except: pass
+
+    # [ADD] TF 힌트 수집 (실행 흐름 영향 없음)
+    try: ingest_signal(data)
+    except: pass
 
     amount   = float(data.get("amount", DEFAULT_AMOUNT))
     leverage = float(data.get("leverage", LEVERAGE))
@@ -205,7 +220,6 @@ async def _ingest(req: Request):
         return {"ok": False, "error": f"bad_payload: {e}"}
 
     dk = _dedup_key(data)
-    # ← FIX: 오타 수정 (_DEDU P → _DEDUP)
     if dk in _DEDUP and now - _DEDUP[dk] < DEDUP_TTL:
         return {"ok": True, "dedup": True}
     _DEDUP[dk] = now
@@ -218,6 +232,8 @@ async def _ingest(req: Request):
         return {"ok": False, "queued": False, "reason": "queue_full"}
 
     return {"ok": True, "queued": True, "qsize": _task_q.qsize()}
+
+app = FastAPI()
 
 @app.get("/")
 def root():
@@ -266,6 +282,46 @@ def config():
 def pending():
     return get_pending_snapshot()
 
+# [ADD] — 시간봉 강제 태깅 전용 엔드포인트 (Pine 수정 없이 URL만 변경)
+def _ingest_with_tf_override(data: Dict[str, Any], tf: str):
+    now = time.time()
+    d = dict(data or {})
+    d["timeframe"] = tf  # 핵심: 서버가 TF를 주입
+
+    dk = _dedup_key(d)
+    if dk in _DEDUP and now - _DEDUP[dk] < DEDUP_TTL:
+        return {"ok": True, "dedup": True, "tf": tf}
+    _DEDUP[dk] = now
+
+    INGRESS_LOG.append({"ts": now, "ip": "tf-override", "data": d})
+    try:
+        _task_q.put_nowait(d)
+    except queue.Full:
+        send_telegram("⚠️ queue full → drop signal(tf): " + json.dumps(d))
+        return {"ok": False, "queued": False, "reason": "queue_full"}
+
+    return {"ok": True, "queued": True, "qsize": _task_q.qsize(), "tf": tf}
+
+@app.post("/signal/1h")
+async def signal_1h(req: Request):
+    data = await _parse_any(req)
+    return _ingest_with_tf_override(data, "1H")
+
+@app.post("/signal/2h")
+async def signal_2h(req: Request):
+    data = await _parse_any(req)
+    return _ingest_with_tf_override(data, "2H")
+
+@app.post("/signal/3h")
+async def signal_3h(req: Request):
+    data = await _parse_any(req)
+    return _ingest_with_tf_override(data, "3H")
+
+@app.post("/signal/4h")
+async def signal_4h(req: Request):
+    data = await _parse_any(req)
+    return _ingest_with_tf_override(data, "4H")
+
 @app.on_event("startup")
 def on_startup():
     for i in range(WORKERS):
@@ -274,10 +330,12 @@ def on_startup():
     start_capacity_guard()
     start_watchdogs()
     start_reconciler()
+    start_policy_manager()   # [ADD] 정책 매니저 시작
+
     try:
         threading.Thread(
             target=send_telegram,
-            args=("✅ FastAPI up (workers + watchdog + reconciler + capacity-guard)",),
+            args=("✅ FastAPI up (workers + watchdog + reconciler + capacity-guard + policy)",),
             daemon=True
         ).start()
     except Exception:
