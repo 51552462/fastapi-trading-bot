@@ -242,6 +242,7 @@ def place_spot_market_buy(symbol: str, usdt_amount: float) -> Dict:
         return {"code": "LOCAL_EXCEPTION", "msg": str(e)}
 
 def place_spot_market_sell_qty(symbol: str, qty: float) -> Dict:
+    import re
     qty = float(qty)
     if qty <= 0:
         return {"code": "LOCAL_BAD_QTY", "msg": "qty<=0"}
@@ -249,10 +250,19 @@ def place_spot_market_sell_qty(symbol: str, qty: float) -> Dict:
     spec = get_symbol_spec_spot(symbol)
     step = float(spec.get("qtyStep", 1e-6))
 
-    qty = round_down_step(qty, step)
-    scale = _step_to_scale(step)  # e.g., 0.0001 -> 4
-    qty_str = (f"{qty:.{scale}f}").rstrip("0").rstrip(".") if scale > 0 else str(int(qty))
+    def _scale_from_step(s: float) -> int:
+        if s <= 0:
+            return 6
+        p = round(-math.log10(s))
+        return max(0, int(p))
 
+    def _fmt(q: float, s: float) -> str:
+        q = round_down_step(q, s)
+        scale = _scale_from_step(s)
+        return (f"{q:.{scale}f}").rstrip("0").rstrip(".") if scale > 0 else str(int(q))
+
+    # 1차 시도: products에서 받은 step 기준
+    qty_str = _fmt(qty, step)
     path = "/api/spot/v1/trade/orders"
     body = {
         "symbol": _spot_symbol(symbol),
@@ -262,11 +272,31 @@ def place_spot_market_sell_qty(symbol: str, qty: float) -> Dict:
         "quantity": qty_str
     }
     bj = json.dumps(body)
+
     try:
         _rl("spot_order", 0.12)
         res = requests.post(BASE_URL + path, headers=_headers("POST", path, bj), data=bj, timeout=15)
-        if res.status_code != 200:
-            return {"code": f"HTTP_{res.status_code}", "msg": res.text}
-        return res.json()
+        if res.status_code == 200:
+            return res.json()
+
+        # 2차 시도: 40808이면 checkScale로 재시도
+        #   응답 본문에서 checkScale=숫자 추출
+        txt = res.text
+        m = re.search(r"checkScale[\"']?\s*[:=]\s*([0-9]+)", txt)
+        if res.status_code == 400 and m:
+            chk = int(m.group(1))                 # 예: 4
+            step2 = 10 ** (-chk)                  # 0.0001
+            qty_str2 = _fmt(qty, step2)
+            body2 = dict(body, quantity=qty_str2)
+            bj2 = json.dumps(body2)
+
+            _rl("spot_order", 0.12)
+            res2 = requests.post(BASE_URL + path, headers=_headers("POST", path, bj2), data=bj2, timeout=15)
+            if res2.status_code == 200:
+                return res2.json()
+            return {"code": f"HTTP_{res2.status_code}", "msg": res2.text, "retry_with_scale": chk}
+
+        return {"code": f"HTTP_{res.status_code}", "msg": txt}
     except Exception as e:
         return {"code": "LOCAL_EXCEPTION", "msg": str(e)}
+
