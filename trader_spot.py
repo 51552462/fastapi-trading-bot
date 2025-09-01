@@ -24,11 +24,13 @@ TRACE_LOG = os.getenv("TRACE_LOG", "0") == "1"
 TP1_PCT = float(os.getenv("TP1_PCT", "0.30"))
 TP2_PCT = float(os.getenv("TP2_PCT", "0.40"))
 TP3_PCT = float(os.getenv("TP3_PCT", "0.30"))
+SL1_PCT = float(os.getenv("SL1_PCT", "0.50"))
+SL2_PCT = float(os.getenv("SL2_PCT", "1.00"))
 
 MAX_OPEN_COINS = int(os.getenv("MAX_OPEN_COINS", "60"))
-CAP_CHECK_SEC = float(os.getenv("CAP_CHECK_SEC", "10"))
+CAP_CHECK_SEC  = float(os.getenv("CAP_CHECK_SEC", "10"))
 
-BALANCE_RETRY = int(os.getenv("BALANCE_RETRY", "10"))
+BALANCE_RETRY       = int(os.getenv("BALANCE_RETRY", "10"))
 BALANCE_RETRY_DELAY = float(os.getenv("BALANCE_RETRY_DELAY", "2"))
 
 _POS_LOCK = threading.RLock()
@@ -118,42 +120,48 @@ def enter_spot(symbol: str, usdt_amount: float):
         send_telegram(f"[SPOT] BUY fail {symbol} -> {resp}")
 
 
-def _sell_pct(symbol: str, pct: float):
+def _sell_pct(symbol: str, pct: float, tag: str):
     symbol = convert_symbol(symbol)
 
     cached = float(held_marks_qty.get(symbol, 0.0))
-    free = _refresh_free_qty(symbol)
+    free   = _refresh_free_qty(symbol)
 
     base_qty = max(0.0, min(cached if cached > 0 else float("inf"), free))
     if base_qty <= 0:
-        send_telegram(f"[SPOT] SELL skip (no free balance) {symbol}")
+        send_telegram(f"[SPOT] {tag} skip (no free balance) {symbol}")
         return
 
     step = float(get_symbol_spec_spot(symbol).get("qtyStep", 1e-6))
-    qty = round_down_step(base_qty * pct, step)
+    qty  = round_down_step(base_qty * pct, step)
     if qty <= 0:
-        send_telegram(f"[SPOT] SELL qty=0 after step {symbol}")
+        send_telegram(f"[SPOT] {tag} qty=0 after step {symbol}")
         return
 
     resp = place_spot_market_sell_qty(symbol, qty)
     if str(resp.get("code", "")) in ("00000", "0"):
         remaining = max(0.0, cached - qty) if cached > 0 else max(0.0, free - qty)
         _cache_qty(symbol, remaining)
-        send_telegram(f"[SPOT] SELL {symbol} qty approx {qty} ({int(pct * 100)}%)")
+        send_telegram(f"[SPOT] {tag} {symbol} qty~{qty} ({int(pct*100)}%)")
     else:
-        send_telegram(f"[SPOT] SELL fail {symbol} -> {resp}")
+        send_telegram(f"[SPOT] {tag} fail {symbol} -> {resp}")
 
 
 def take_partial_spot(symbol: str, pct: float):
-    _sell_pct(symbol, pct)
+    _sell_pct(symbol, pct, tag="SELL")
+
+
+def stop_partial_spot(symbol: str, pct: float):
+    """손절 신호용 부분 청산 (SL1/SL2)"""
+    # SL2_PCT=1.0이면 전량 청산과 동일
+    _sell_pct(symbol, pct, tag="STOP")
 
 
 def close_spot(symbol: str, reason: str = "manual"):
     symbol = convert_symbol(symbol)
 
     cached = float(held_marks_qty.get(symbol, 0.0))
-    free = _refresh_free_qty(symbol)
-    base_qty = max(0.0, max(cached, free))
+    free   = _refresh_free_qty(symbol)
+    base_qty = max(0.0, max(cached, free))  # 전량 종료는 더 큰 쪽 시도
 
     if base_qty <= 0:
         _clear_cache(symbol)
