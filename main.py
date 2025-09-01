@@ -1,7 +1,12 @@
-import os, time, json, hashlib, threading, queue, re
+import os, sys, time, json, hashlib, threading, queue, re
 from collections import deque
 from typing import Dict, Any
 from fastapi import FastAPI, Request
+
+# --- path guard (import 경로 안전) ---
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+if BASE_DIR not in sys.path:
+    sys.path.insert(0, BASE_DIR)
 
 from trader import (
     enter_position, take_partial_profit, close_position, reduce_by_contracts,
@@ -10,12 +15,13 @@ from trader import (
 from telegram_bot import send_telegram
 from bitget_api import convert_symbol, get_open_positions
 
-# [ADD] 정책/텔레메트리 추가 (비침투적)
-from policy.tf_policy import ingest_signal, start_policy_manager   # [ADD]
+# 정책/텔레메트리/리스크가드 (비침투적 추가)
+from policy.tf_policy import ingest_signal, start_policy_manager  # [ADD]
+from risk_guard import can_open                                   # [ADD]
 try:
-    from telemetry.logger import log_event                        # [ADD]
+    from telemetry.logger import log_event                        # [OPT]
 except Exception:
-    def log_event(*a, **kw): pass                                 # [ADD]
+    def log_event(*a, **kw): pass
 
 DEFAULT_AMOUNT = float(os.getenv("DEFAULT_AMOUNT", "15"))
 LEVERAGE       = float(os.getenv("LEVERAGE", "5"))
@@ -54,10 +60,6 @@ def _infer_side(side: str, default: str = "long") -> str:
     return s if s in ("long", "short") else default
 
 def _norm_type(typ: str) -> str:
-    """
-    type 문자열을 소문자로 만들고, 공백/언더스코어/대시 제거해 표준화.
-    예) 'emaExit'/'ema_exit'/'EMA-EXIT' -> 'emaexit'
-    """
     t = (typ or "").strip().lower()
     t = re.sub(r"[\s_\-]+", "", t)
     aliases = {
@@ -109,7 +111,7 @@ async def _parse_any(req: Request) -> Dict[str, Any]:
         for part in re.split(r"[\n,]+", txt):
             if ":" in part:
                 k, v = part.split(":", 1)
-                d[k.strip()] = v.strip()    # ← FIX: 잘못된 d[k].strip() 제거 반영
+                d[k.strip()] = v.strip()
         if d:
             return d
     except Exception:
@@ -124,11 +126,11 @@ def _handle_signal(data: Dict[str, Any]):
     symbol  = _norm_symbol(data.get("symbol", ""))
     side    = _infer_side(data.get("side"), "long")
 
-    # [ADD] 텔레메트리: 원본 신호 로그(선택)
+    # 원본 로그(선택)
     try: log_event(data, stage="ingress")
     except: pass
 
-    # [ADD] TF 힌트 수집 (실행 흐름 영향 없음)
+    # TF 힌트 수집
     try: ingest_signal(data)
     except: pass
 
@@ -138,10 +140,8 @@ def _handle_signal(data: Dict[str, Any]):
     # 심볼별 금액 우선
     resolved_amount = float(amount)
     if (symbol in SYMBOL_AMOUNT) and (str(SYMBOL_AMOUNT[symbol]).strip() != ""):
-        try:
-            resolved_amount = float(SYMBOL_AMOUNT[symbol])
-        except Exception:
-            resolved_amount = float(DEFAULT_AMOUNT)
+        try: resolved_amount = float(SYMBOL_AMOUNT[symbol])
+        except Exception: resolved_amount = float(DEFAULT_AMOUNT)
     elif FORCE_DEFAULT_AMOUNT:
         resolved_amount = float(DEFAULT_AMOUNT)
 
@@ -167,6 +167,14 @@ def _handle_signal(data: Dict[str, Any]):
 
     # 라우팅
     if t == "entry":
+        # === 리스크 예산 체크 (자본 자동 반영) ===
+        if not can_open({
+            "symbol": symbol,
+            "side": side,
+            "entry_price": data.get("entry_price") or 0,
+            "size": resolved_amount
+        }):
+            return
         enter_position(symbol, resolved_amount, side=side, leverage=leverage)
         return
 
@@ -233,8 +241,6 @@ async def _ingest(req: Request):
 
     return {"ok": True, "queued": True, "qsize": _task_q.qsize()}
 
-app = FastAPI()
-
 @app.get("/")
 def root():
     return {"ok": True}
@@ -282,11 +288,10 @@ def config():
 def pending():
     return get_pending_snapshot()
 
-# [ADD] — 시간봉 강제 태깅 전용 엔드포인트 (Pine 수정 없이 URL만 변경)
+# === 시간봉 강제 태깅 웹훅 (Pine 수정 없이 URL만 바꿈) ===
 def _ingest_with_tf_override(data: Dict[str, Any], tf: str):
     now = time.time()
-    d = dict(data or {})
-    d["timeframe"] = tf  # 핵심: 서버가 TF를 주입
+    d = dict(data or {}); d["timeframe"] = tf  # 핵심: 서버가 TF 주입
 
     dk = _dedup_key(d)
     if dk in _DEDUP and now - _DEDUP[dk] < DEDUP_TTL:
@@ -304,23 +309,23 @@ def _ingest_with_tf_override(data: Dict[str, Any], tf: str):
 
 @app.post("/signal/1h")
 async def signal_1h(req: Request):
-    data = await _parse_any(req)
-    return _ingest_with_tf_override(data, "1H")
+    d = await _parse_any(req)
+    return _ingest_with_tf_override(d, "1H")
 
 @app.post("/signal/2h")
 async def signal_2h(req: Request):
-    data = await _parse_any(req)
-    return _ingest_with_tf_override(data, "2H")
+    d = await _parse_any(req)
+    return _ingest_with_tf_override(d, "2H")
 
 @app.post("/signal/3h")
 async def signal_3h(req: Request):
-    data = await _parse_any(req)
-    return _ingest_with_tf_override(data, "3H")
+    d = await _parse_any(req)
+    return _ingest_with_tf_override(d, "3H")
 
 @app.post("/signal/4h")
 async def signal_4h(req: Request):
-    data = await _parse_any(req)
-    return _ingest_with_tf_override(data, "4H")
+    d = await _parse_any(req)
+    return _ingest_with_tf_override(d, "4H")
 
 @app.on_event("startup")
 def on_startup():
@@ -330,7 +335,7 @@ def on_startup():
     start_capacity_guard()
     start_watchdogs()
     start_reconciler()
-    start_policy_manager()   # [ADD] 정책 매니저 시작
+    start_policy_manager()   # 정책 매니저 시작
 
     try:
         threading.Thread(
