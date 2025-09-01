@@ -6,30 +6,34 @@ from fastapi import FastAPI, Request
 
 from trader_spot import (
     enter_spot, take_partial_spot, close_spot,
-    start_capacity_guard
+    stop_partial_spot, start_capacity_guard
 )
 from telegram_bot import send_telegram
 from bitget_api_spot import convert_symbol, get_spot_balances
 
+# 기본 진입 금액과 중복 처리
 DEFAULT_AMOUNT = float(os.getenv("DEFAULT_AMOUNT", "15"))
 DEDUP_TTL      = float(os.getenv("DEDUP_TTL", "15"))
 BIZDEDUP_TTL   = float(os.getenv("BIZDEDUP_TTL", "3"))
 
 WORKERS        = int(os.getenv("WORKERS", "4"))
 QUEUE_MAX      = int(os.getenv("QUEUE_MAX", "1000"))
-
 LOG_INGRESS    = os.getenv("LOG_INGRESS", "0") == "1"
 FORCE_DEFAULT_AMOUNT = os.getenv("FORCE_DEFAULT_AMOUNT", "0") == "1"
 
+# TP/SL 비율
+TP1_PCT = float(os.getenv("TP1_PCT", "0.30"))
+TP2_PCT = float(os.getenv("TP2_PCT", "0.40"))
+TP3_PCT = float(os.getenv("TP3_PCT", "0.30"))
+SL1_PCT = float(os.getenv("SL1_PCT", "0.50"))  # 손절1: 50% 청산
+SL2_PCT = float(os.getenv("SL2_PCT", "1.00"))  # 손절2: 100% 청산(전량)
+
+# 심볼별 강제 금액 (선택)
 SYMBOL_AMOUNT_JSON = os.getenv("SYMBOL_AMOUNT_JSON", "")
 try:
     SYMBOL_AMOUNT = json.loads(SYMBOL_AMOUNT_JSON) if SYMBOL_AMOUNT_JSON else {}
 except Exception:
     SYMBOL_AMOUNT = {}
-
-TP1_PCT = float(os.getenv("TP1_PCT", "0.30"))
-TP2_PCT = float(os.getenv("TP2_PCT", "0.40"))
-TP3_PCT = float(os.getenv("TP3_PCT", "0.30"))
 
 app = FastAPI()
 
@@ -52,10 +56,12 @@ def _norm_symbol(sym: str) -> str:
     return convert_symbol(sym)
 
 async def _parse_any(req: Request) -> Dict[str, Any]:
+    # JSON 우선
     try:
         return await req.json()
     except Exception:
         pass
+    # raw body에서 JSON 다시 시도
     try:
         raw = (await req.body()).decode(errors="ignore").strip()
         if raw:
@@ -66,20 +72,12 @@ async def _parse_any(req: Request) -> Dict[str, Any]:
                 return json.loads(fixed)
     except Exception:
         pass
+    # form → payload
     try:
         form = await req.form()
         payload = form.get("payload") or form.get("data")
         if payload:
             return json.loads(payload)
-    except Exception:
-        pass
-    try:
-        txt = (await req.body()).decode(errors="ignore")
-        d: Dict[str, Any] = {}
-        for part in re.split(r"[\n,]+", txt):
-            if ":" in part:
-                k, v = part.split("x", 1)
-        # fall through
     except Exception:
         pass
     raise ValueError("cannot parse request")
@@ -103,9 +101,15 @@ def _handle_signal(data: Dict[str, Any]):
         send_telegram("[SPOT] symbol missing: " + json.dumps(data))
         return
 
-    legacy = {"tp_1":"tp1","tp_2":"tp2","tp_3":"tp3","sl_1":"sl1","sl_2":"sl2","ema_exit":"emaExit","failcut":"failCut"}
+    # 레거시 명칭 매핑
+    legacy = {
+        "tp_1":"tp1","tp_2":"tp2","tp_3":"tp3",
+        "sl_1":"sl1","sl_2":"sl2",
+        "ema_exit":"emaExit","failcut":"failCut"
+    }
     typ = legacy.get(typ.lower(), typ)
 
+    # 비즈 dedup
     now = time.time()
     bk = _biz_key(typ, symbol, side)
     tprev = _BIZDEDUP.get(bk, 0.0)
@@ -113,7 +117,7 @@ def _handle_signal(data: Dict[str, Any]):
         return
     _BIZDEDUP[bk] = now
 
-    # --- 로그: entry일 때만 amt 표기 ---
+    # 표시는 entry 때만 amt 출력
     if LOG_INGRESS:
         msg = f"[SPOT] {typ} {symbol} {side}"
         if typ == "entry":
@@ -123,14 +127,21 @@ def _handle_signal(data: Dict[str, Any]):
         except Exception:
             pass
 
-    # --- 라우팅 ---
+    # 라우팅
     if typ == "entry":
         enter_spot(symbol, resolved_amount); return
+
     if typ in ("tp1","tp2","tp3"):
         pct = TP1_PCT if typ == "tp1" else (TP2_PCT if typ == "tp2" else TP3_PCT)
         take_partial_spot(symbol, pct); return
-    if typ in ("sl1","sl2","failCut","emaExit","liquidation","fullExit","close","exit"):
+
+    if typ in ("sl1","sl2"):
+        pct = SL1_PCT if typ == "sl1" else SL2_PCT
+        stop_partial_spot(symbol, pct); return
+
+    if typ in ("failCut","emaExit","liquidation","fullExit","close","exit"):
         close_spot(symbol, reason=typ); return
+
     if typ in ("tailTouch","info","debug"):
         return
 
@@ -204,7 +215,8 @@ def config():
         "LOG_INGRESS": LOG_INGRESS,
         "FORCE_DEFAULT_AMOUNT": FORCE_DEFAULT_AMOUNT,
         "SYMBOL_AMOUNT": SYMBOL_AMOUNT,
-        "TP1_PCT": TP1_PCT, "TP2_PCT": TP2_PCT, "TP3_PCT": TP3_PCT
+        "TP1_PCT": TP1_PCT, "TP2_PCT": TP2_PCT, "TP3_PCT": TP3_PCT,
+        "SL1_PCT": SL1_PCT, "SL2_PCT": SL2_PCT
     }
 
 @app.on_event("startup")
