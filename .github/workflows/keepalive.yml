@@ -2,7 +2,7 @@ name: KeepAlive Ping
 
 on:
   schedule:
-    - cron: "1-59/3 * * * *"    # 01,04,07,...,58 (UTC) → 정각(:00) 절대 미포함
+    - cron: "*/1 * * * *"     # 매 분(UTC)
   workflow_dispatch:
 
 concurrency:
@@ -16,10 +16,11 @@ jobs:
     permissions: {}
 
     steps:
-      - name: Random jitter (spread load)
-        run: sleep $((RANDOM % 45))   # 0~44초 랜덤 대기
+      # 분마다 실행되지만, 초 단위는 랜덤으로 밀어 충돌 완화
+      - name: Random jitter
+        run: sleep $((20 + RANDOM % 25))   # 20~44초 대기 후 요청
 
-      - name: Show schedule tick (debug)
+      - name: Show tick (UTC)
         run: date -u +"UTC %Y-%m-%d %H:%M:%S"
 
       - name: Ping /health
@@ -33,5 +34,4 @@ jobs:
             [ "$code" = "200" ] && exit 0
             sleep 6
           done
-          echo "Ping failed."
-          exit 1
+          echo "Ping failed."; exit 1
