@@ -1,5 +1,5 @@
 # bitget_api_spot.py
-import os, time, json, hmac, hashlib, base64, requests, math, random
+import os, time, json, hmac, hashlib, base64, requests, math
 from typing import Dict, Optional
 
 BASE_URL = "https://api.bitget.com"
@@ -42,8 +42,10 @@ def _headers(method: str, path_with_query: str, body: str = "") -> Dict[str, str
 ALIASES: Dict[str, str] = {}
 _alias_env = os.getenv("SYMBOL_ALIASES_JSON", "")
 if _alias_env:
-    try: ALIASES.update(json.loads(_alias_env))
-    except: pass
+    try:
+        ALIASES.update(json.loads(_alias_env))
+    except Exception:
+        pass
 
 def convert_symbol(sym: str) -> str:
     s = (sym or "").upper().replace("/", "").replace("-", "").replace("_", "")
@@ -53,9 +55,9 @@ def convert_symbol(sym: str) -> str:
 
 def _spot_symbol(sym: str) -> str:
     base = convert_symbol(sym)
-    return base if base.endswith("_SPBL") else f"{base}_SPBL"  # BTCUSDT_SPBL
+    return base if base.endswith("_SPBL") else f"{base}_SPBL"  # e.g., BTCUSDT_SPBL
 
-# ---------- products(spec) ----------
+# ---------- spec cache ----------
 _PROD_CACHE = {"ts": 0.0, "data": {}}
 
 def _refresh_products_cache():
@@ -65,19 +67,24 @@ def _refresh_products_cache():
         r = requests.get(BASE_URL + path, timeout=12)
         j = r.json()
         arr = j.get("data") or []
-        m: Dict[str, Dict[str, float]] = {}
+        m = {}
         for it in arr:
-            sym_raw = (it.get("symbol") or "").upper()
+            sym_raw = (it.get("symbol") or "").upper()  # may be DOGEUSDT or DOGEUSDT_SPBL
             if not sym_raw:
                 continue
             qty_prec   = int(it.get("quantityPrecision") or 6)
             price_prec = int(it.get("pricePrecision") or 6)
-            min_amt    = float(it.get("minTradeAmount") or 0.0)  # 최소주문(quote=USDT)
-            m[sym_raw] = {
+            min_amt    = float(it.get("minTradeAmount") or 0.0)  # min quote(USDT)
+            spec = {
                 "qtyStep": 10 ** (-qty_prec),
                 "priceStep": 10 ** (-price_prec),
                 "minQuote": min_amt,
             }
+            # put multiple keys to avoid mismatches
+            m[sym_raw] = spec
+            base_key = sym_raw[:-5] if sym_raw.endswith("_SPBL") else sym_raw
+            m[base_key] = spec
+            m[base_key.replace("/", "").replace("-", "")] = spec
         _PROD_CACHE["data"] = m
         _PROD_CACHE["ts"] = time.time()
     except Exception as e:
@@ -87,18 +94,26 @@ def get_symbol_spec_spot(symbol: str) -> Dict[str, float]:
     now = time.time()
     if now - _PROD_CACHE["ts"] > 600 or not _PROD_CACHE["data"]:
         _refresh_products_cache()
-    key = _spot_symbol(symbol)
-    spec = _PROD_CACHE["data"].get(key)
+    base = convert_symbol(symbol)
+    key1 = _spot_symbol(symbol)
+    key2 = base
+    spec = _PROD_CACHE["data"].get(key1) or _PROD_CACHE["data"].get(key2)
     if not spec:
         spec = {"qtyStep": 0.000001, "priceStep": 0.000001, "minQuote": 5.0}
-        _PROD_CACHE["data"][key] = spec
+        _PROD_CACHE["data"][key1] = spec
     return spec
 
 def round_down_step(x: float, step: float) -> float:
     if step <= 0:
-        return round(x, 8)
+        return round(float(x), 8)
     k = math.floor(float(x) / step)
-    return round(k * step, 8)
+    return round(k * step, 12)
+
+def _step_to_scale(step: float) -> int:
+    if step <= 0:
+        return 6
+    p = round(-math.log10(step))
+    return max(0, int(p))
 
 # ---------- ticker ----------
 _SPOT_TICKER_CACHE: Dict[str, tuple] = {}
@@ -136,10 +151,10 @@ def get_last_price_spot(symbol: str, retries: int = 5, sleep_base: float = 0.18)
         time.sleep(sleep_base * (2 ** i))
     return None
 
-# ---------- balances (v2 우선, v1 폴백) ----------
+# ---------- balances (v2 fresh, v1 fallback) ----------
 _BAL_CACHE = {"ts": 0.0, "data": {}}
 
-def _fetch_assets_v2(coin: str | None = None) -> dict:
+def _fetch_assets_v2(coin: Optional[str] = None) -> Dict[str, float]:
     path = "/api/v2/spot/account/assets"
     if coin:
         path += f"?coin={coin}"
@@ -147,7 +162,7 @@ def _fetch_assets_v2(coin: str | None = None) -> dict:
     r = requests.get(BASE_URL + path, headers=_headers("GET", path, ""), timeout=12)
     j = r.json()
     arr = j.get("data") or []
-    m = {}
+    m: Dict[str, float] = {}
     for it in arr:
         c = (it.get("coin") or "").upper()
         if not c:
@@ -156,13 +171,13 @@ def _fetch_assets_v2(coin: str | None = None) -> dict:
         m[c] = avail
     return m
 
-def _fetch_assets_v1() -> dict:
+def _fetch_assets_v1() -> Dict[str, float]:
     path = "/api/spot/v1/account/assets"
     _rl("spot_bal_v1", 0.15)
     r = requests.get(BASE_URL + path, headers=_headers("GET", path, ""), timeout=12)
     j = r.json()
     arr = j.get("data") or []
-    m = {}
+    m: Dict[str, float] = {}
     for it in arr:
         c = (it.get("coin") or "").upper()
         if not c:
@@ -171,11 +186,7 @@ def _fetch_assets_v1() -> dict:
         m[c] = avail
     return m
 
-def get_spot_balances(force: bool = False, coin: str | None = None) -> Dict[str, float]:
-    """
-    coin가 주어지면 v2로 단일코인만 조회(신선). force=True면 캐시 무시.
-    그 외엔 캐시 → v2 전체 → v1 전체 순서로 시도.
-    """
+def get_spot_balances(force: bool = False, coin: Optional[str] = None) -> Dict[str, float]:
     now = time.time()
     if not force and not coin:
         if now - _BAL_CACHE["ts"] < 5.0 and _BAL_CACHE["data"]:
@@ -183,9 +194,7 @@ def get_spot_balances(force: bool = False, coin: str | None = None) -> Dict[str,
 
     try:
         if coin:
-            # 단일 코인 강제 신선 조회
             return _fetch_assets_v2(coin)
-        # 전체 조회 (v2 우선)
         m = _fetch_assets_v2(None)
         if not m:
             m = _fetch_assets_v1()
@@ -202,24 +211,17 @@ def get_spot_free_qty(symbol: str, fresh: bool = False) -> float:
     if fresh:
         m = get_spot_balances(force=True, coin=base)
         return float(m.get(base, 0.0))
-    # 일반 캐시 사용 경로
     m = get_spot_balances()
     return float(m.get(base, 0.0))
 
-
 # ---------- orders ----------
 def place_spot_market_buy(symbol: str, usdt_amount: float) -> Dict:
-    """
-    Market-Buy: Bitget는 'quantity/size'를 'quote 금액(USDT)'으로 해석함.
-    따라서 가격으로 나누지 말고 usdt_amount 그대로 전송.
-    """
-    # 최소 주문 금액 검증
+    # min-quote check
     spec = get_symbol_spec_spot(symbol)
     min_quote = float(spec.get("minQuote", 5.0))
     if usdt_amount < min_quote:
         return {"code": "LOCAL_MIN_QUOTE", "msg": f"need>={min_quote}USDT"}
 
-    # 일부 API는 소수 자리 너무 길면 거부하므로 6자리로 제한
     amt_str = f"{float(usdt_amount):.6f}".rstrip("0").rstrip(".")
     path = "/api/spot/v1/trade/orders"
     body = {
@@ -227,7 +229,7 @@ def place_spot_market_buy(symbol: str, usdt_amount: float) -> Dict:
         "side": "buy",
         "orderType": "market",
         "force": "gtc",
-        "quantity": amt_str  # 금액(USDT) 그대로
+        "quantity": amt_str   # market-buy expects quote amount
     }
     bj = json.dumps(body)
     try:
@@ -240,19 +242,17 @@ def place_spot_market_buy(symbol: str, usdt_amount: float) -> Dict:
         return {"code": "LOCAL_EXCEPTION", "msg": str(e)}
 
 def place_spot_market_sell_qty(symbol: str, qty: float) -> Dict:
-    """
-    Market-Sell: base 수량으로 전송.
-    """
     qty = float(qty)
     if qty <= 0:
         return {"code": "LOCAL_BAD_QTY", "msg": "qty<=0"}
+
     spec = get_symbol_spec_spot(symbol)
     step = float(spec.get("qtyStep", 1e-6))
-    qty  = round_down_step(qty, step)
-    if qty <= 0:
-        return {"code": "LOCAL_STEP_ZERO", "msg": "after_step=0"}
 
-    qty_str = f"{qty:.8f}".rstrip("0").rstrip(".")
+    qty = round_down_step(qty, step)
+    scale = _step_to_scale(step)  # e.g., 0.0001 -> 4
+    qty_str = (f"{qty:.{scale}f}").rstrip("0").rstrip(".") if scale > 0 else str(int(qty))
+
     path = "/api/spot/v1/trade/orders"
     body = {
         "symbol": _spot_symbol(symbol),
@@ -270,4 +270,3 @@ def place_spot_market_sell_qty(symbol: str, qty: float) -> Dict:
         return res.json()
     except Exception as e:
         return {"code": "LOCAL_EXCEPTION", "msg": str(e)}
-
