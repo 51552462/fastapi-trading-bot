@@ -28,13 +28,12 @@ TP3_PCT = float(os.getenv("TP3_PCT", "0.30"))
 MAX_OPEN_COINS = int(os.getenv("MAX_OPEN_COINS", "60"))
 CAP_CHECK_SEC = float(os.getenv("CAP_CHECK_SEC", "10"))
 
-# 잔고 리트라이(환경변수로 조절 가능)
 BALANCE_RETRY = int(os.getenv("BALANCE_RETRY", "10"))
 BALANCE_RETRY_DELAY = float(os.getenv("BALANCE_RETRY_DELAY", "2"))
 
 _POS_LOCK = threading.RLock()
-held_marks_ts: Dict[str, float] = {}     # symbol -> last_buy_ts
-held_marks_qty: Dict[str, float] = {}    # symbol -> cached base qty (매수 직후 스냅샷)
+held_marks_ts: Dict[str, float] = {}   # symbol -> last_buy_ts
+held_marks_qty: Dict[str, float] = {}  # symbol -> cached base qty
 
 _CAP = {"blocked": False, "last_count": 0, "ts": 0.0}
 _CAP_LOCK = threading.Lock()
@@ -86,11 +85,11 @@ def _clear_cache(symbol: str):
 
 
 def _refresh_free_qty(symbol: str) -> float:
-    """잔고 API 재조회 (리트라이 포함: v2 단일코인 fresh 경로를 내부에서 사용하도록 변경 가능)"""
+    """fresh 잔고 API를 리트라이로 재조회"""
     free = 0.0
     tries = max(1, BALANCE_RETRY)
     for i in range(tries):
-        free = get_spot_free_qty(symbol, fresh=True)  # v2 단일코인 신선 조회
+        free = get_spot_free_qty(symbol, fresh=True)
         if free > 0:
             break
         if i < tries - 1:
@@ -98,7 +97,7 @@ def _refresh_free_qty(symbol: str) -> float:
     return float(free)
 
 
-# ===== 트레이딩 동작 =====
+# ===== trading =====
 def enter_spot(symbol: str, usdt_amount: float):
     symbol = convert_symbol(symbol)
     st = capacity_status()
@@ -112,7 +111,6 @@ def enter_spot(symbol: str, usdt_amount: float):
     resp = place_spot_market_buy(symbol, usdt_amount)
     code = str(resp.get("code", ""))
     if code in ("00000", "0"):
-        # 매수 직후 실제 잔고를 스냅샷으로 캐싱 (지연 대비)
         free_after = _refresh_free_qty(symbol)
         _cache_qty(symbol, free_after)
         send_telegram(f"[SPOT] BUY {symbol} approx {usdt_amount} USDT (qty~{free_after})")
@@ -123,12 +121,9 @@ def enter_spot(symbol: str, usdt_amount: float):
 def _sell_pct(symbol: str, pct: float):
     symbol = convert_symbol(symbol)
 
-    # 1) 캐시 잔고
     cached = float(held_marks_qty.get(symbol, 0.0))
-    # 2) 실시간 잔고(리트라이 포함)
     free = _refresh_free_qty(symbol)
 
-    # 둘 중 “작은 값”으로 안전 매도
     base_qty = max(0.0, min(cached if cached > 0 else float("inf"), free))
     if base_qty <= 0:
         send_telegram(f"[SPOT] SELL skip (no free balance) {symbol}")
@@ -142,7 +137,6 @@ def _sell_pct(symbol: str, pct: float):
 
     resp = place_spot_market_sell_qty(symbol, qty)
     if str(resp.get("code", "")) in ("00000", "0"):
-        # 캐시 차감
         remaining = max(0.0, cached - qty) if cached > 0 else max(0.0, free - qty)
         _cache_qty(symbol, remaining)
         send_telegram(f"[SPOT] SELL {symbol} qty approx {qty} ({int(pct * 100)}%)")
@@ -159,7 +153,7 @@ def close_spot(symbol: str, reason: str = "manual"):
 
     cached = float(held_marks_qty.get(symbol, 0.0))
     free = _refresh_free_qty(symbol)
-    base_qty = max(0.0, max(cached, free))  # 전량 종료는 더 큰 쪽 시도
+    base_qty = max(0.0, max(cached, free))
 
     if base_qty <= 0:
         _clear_cache(symbol)
