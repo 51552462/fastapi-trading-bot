@@ -80,7 +80,7 @@ def _refresh_products_cache():
                 "priceStep": 10 ** (-price_prec),
                 "minQuote": min_amt,
             }
-            # put multiple keys to avoid mismatches
+            # 여러 키로 저장해서 키 미스매치 방지
             m[sym_raw] = spec
             base_key = sym_raw[:-5] if sym_raw.endswith("_SPBL") else sym_raw
             m[base_key] = spec
@@ -216,7 +216,9 @@ def get_spot_free_qty(symbol: str, fresh: bool = False) -> float:
 
 # ---------- orders ----------
 def place_spot_market_buy(symbol: str, usdt_amount: float) -> Dict:
-    # min-quote check
+    """
+    Market-Buy: Bitget는 size/quantity를 'quote 금액(USDT)'로 해석
+    """
     spec = get_symbol_spec_spot(symbol)
     min_quote = float(spec.get("minQuote", 5.0))
     if usdt_amount < min_quote:
@@ -242,6 +244,10 @@ def place_spot_market_buy(symbol: str, usdt_amount: float) -> Dict:
         return {"code": "LOCAL_EXCEPTION", "msg": str(e)}
 
 def place_spot_market_sell_qty(symbol: str, qty: float) -> Dict:
+    """
+    Market-Sell: base 수량으로 전송.
+    40808(Parameter verification ... checkScale=*)가 오면 그 자리수로 잘라 '자동 재시도' 후 결과 반환.
+    """
     import re
     qty = float(qty)
     if qty <= 0:
@@ -261,7 +267,7 @@ def place_spot_market_sell_qty(symbol: str, qty: float) -> Dict:
         scale = _scale_from_step(s)
         return (f"{q:.{scale}f}").rstrip("0").rstrip(".") if scale > 0 else str(int(q))
 
-    # 1차 시도: products에서 받은 step 기준
+    # 1차: products step 기준
     qty_str = _fmt(qty, step)
     path = "/api/spot/v1/trade/orders"
     body = {
@@ -279,17 +285,21 @@ def place_spot_market_sell_qty(symbol: str, qty: float) -> Dict:
         if res.status_code == 200:
             return res.json()
 
-        # 2차 시도: 40808이면 checkScale로 재시도
-        #   응답 본문에서 checkScale=숫자 추출
-        txt = res.text
-        m = re.search(r"checkScale[\"']?\s*[:=]\s*([0-9]+)", txt)
+        # 2차: HTTP 400 + checkScale(or checkBDScale) 있으면 그 자리수로 재시도
+        txt = res.text or ""
+        m = re.search(r"(?:checkBDScale|checkScale)[\"']?\s*[:=]\s*([0-9]+)", txt)
         if res.status_code == 400 and m:
-            chk = int(m.group(1))                 # 예: 4
-            step2 = 10 ** (-chk)                  # 0.0001
+            chk = int(m.group(1))           # 예: 4
+            step2 = 10 ** (-chk)            # 0.0001
             qty_str2 = _fmt(qty, step2)
             body2 = dict(body, quantity=qty_str2)
             bj2 = json.dumps(body2)
-
+            # (옵션) 디버깅 로그
+            try:
+                from telegram_bot import send_telegram
+                send_telegram(f"[SPOT] retry sell {symbol} scale-> {chk} qty={qty_str2}")
+            except Exception:
+                pass
             _rl("spot_order", 0.12)
             res2 = requests.post(BASE_URL + path, headers=_headers("POST", path, bj2), data=bj2, timeout=15)
             if res2.status_code == 200:
@@ -299,4 +309,3 @@ def place_spot_market_sell_qty(symbol: str, qty: float) -> Dict:
         return {"code": f"HTTP_{res.status_code}", "msg": txt}
     except Exception as e:
         return {"code": "LOCAL_EXCEPTION", "msg": str(e)}
-
