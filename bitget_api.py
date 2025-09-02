@@ -43,8 +43,23 @@ if _alias_env:
     except: pass
 
 def convert_symbol(sym: str) -> str:
-    s = (sym or "").upper().replace("/", "").replace("-", "").replace("_", "")
-    if s.endswith("PERP"): s = s[:-4]
+    """
+    트뷰에서 오는 다양한 변형을 안정적으로 Bitget UMCBL 코어심볼로 정규화.
+    (기존 로직 유지 + 보정만 추가)
+    """
+    s = (sym or "").upper().strip()
+    # 흔한 구분자 제거
+    for ch in ("/", "-", "_", " "):
+        s = s.replace(ch, "")
+    # PERP 표기/변형 보정
+    if s.endswith("PERP"):
+        s = s[:-4]
+    # TradingView 선물 접미사 보정 (예: DOGEUSDT.P, BTCUSDTP 등)
+    if s.endswith("USDT.P"):
+        s = s[:-6] + "USDT"
+    if s.endswith("USDTP"):
+        s = s[:-5] + "USDT"
+    # 추가 커스텀 매핑
     return ALIASES.get(s, s)
 
 def _mix_symbol(sym: str) -> str:
@@ -56,6 +71,7 @@ def _mix_symbol(sym: str) -> str:
 _TICKER_CACHE: Dict[str, tuple] = {}
 TICKER_TTL    = float(os.getenv("TICKER_TTL", "2.5"))
 STRICT_TICKER = os.getenv("STRICT_TICKER", "0") == "1"
+ALLOW_DEPTH_FALLBACK = os.getenv("ALLOW_DEPTH_FALLBACK", "1") == "1"  # 추가: 오더북 미드가 허용되면 True
 
 def _depth_midprice(symbol: str) -> Optional[float]:
     try:
@@ -91,10 +107,13 @@ def _refresh_symbols_cache():
 
 def get_symbol_spec(symbol: str) -> Dict[str, float]:
     now = time.time()
-    if now - _SYMBOLS_CACHE["ts"] > 600 or not _SYMBOLS_CACHE["data"]: _refresh_symbols_cache()
+    if now - _SYMBOLS_CACHE["ts"] > 600 or not _SYMBOLS_CACHE["data"]:
+        _refresh_symbols_cache()
     sym = convert_symbol(symbol)
     spec = _SYMBOLS_CACHE["data"].get(sym)
     if not spec:
+        # 기존 인터페이스 유지 + 안전한 폴백
+        print(f"⚠️ {sym} 심볼 스펙 없음 → fallback(sizeStep=0.001,minQty=0.001)")
         spec = {"sizeStep": 0.001, "minQty": 0.001}
         _SYMBOLS_CACHE["data"][sym] = spec
     return spec
@@ -105,16 +124,16 @@ def round_down_step(qty: float, step: float) -> float:
 
 def get_last_price(symbol: str, retries: int = 6, base: float = 0.20) -> Optional[float]:
     """
-    1) /market/ticker.last → 2) /market/mark-price → 3) 오더북 mid → 4) (STRICT_TICKER=0) 캐시 폴백
+    1) /market/ticker → 2) /market/mark-price → 3) 오더북 mid(옵션) → 4) (STRICT_TICKER=0) 캐시 폴백
+    기존 동작을 유지하되, 심볼 캐시 미스 상황에서 재시도/폴백만 강화.
     """
     sym = convert_symbol(symbol)
     c = _TICKER_CACHE.get(sym); now = time.time()
     if c and now - c[0] <= TICKER_TTL: return float(c[1])
 
-    if not _SYMBOLS_CACHE["data"] or (now - _SYMBOLS_CACHE["ts"] > 600): _refresh_symbols_cache()
-    if sym not in _SYMBOLS_CACHE["data"]:
-        try: _refresh_symbols_cache()
-        except: pass
+    # 캐시에 심볼이 없다면 한 번 더 갱신 시도
+    if not _SYMBOLS_CACHE["data"] or (now - _SYMBOLS_CACHE["ts"] > 600) or (sym not in _SYMBOLS_CACHE["data"]):
+        _refresh_symbols_cache()
         if sym not in _SYMBOLS_CACHE["data"]:
             print(f"⚠️ symbol_not_found_umcbl: {sym} (check SYMBOL_ALIASES_JSON)")
 
@@ -132,6 +151,7 @@ def get_last_price(symbol: str, retries: int = 6, base: float = 0.20) -> Optiona
                     if px > 0:
                         _TICKER_CACHE[sym] = (time.time(), px); return px
 
+            # mark 가격 폴백
             try:
                 _rl("mark", 0.06)
                 rm = requests.get(url_mark, timeout=10)
@@ -144,12 +164,15 @@ def get_last_price(symbol: str, retries: int = 6, base: float = 0.20) -> Optiona
                             _TICKER_CACHE[sym] = (time.time(), px); return px
             except: pass
 
-            alt = _depth_midprice(sym)
-            if alt and alt > 0:
-                _TICKER_CACHE[sym] = (time.time(), alt); return alt
+            # 오더북 mid 폴백(옵션)
+            if ALLOW_DEPTH_FALLBACK:
+                alt = _depth_midprice(sym)
+                if alt and alt > 0:
+                    _TICKER_CACHE[sym] = (time.time(), alt); return alt
         except: pass
         time.sleep(base * (2 ** i) + random.uniform(0, 0.1))
 
+    # 캐시 폴백(STRICT_TICKER=0일 때만)
     if not STRICT_TICKER:
         c = _TICKER_CACHE.get(sym)
         if c: return float(c[1])
@@ -255,7 +278,7 @@ def _fetch_positions() -> List[Dict]:
                 "side": hold,
                 "size": sz,
                 "entry_price": avg,
-                "liq_price": liq,        # risk_guard가 있으면 사용, 없으면 DEFAULT_STOP_PCT로 폴백
+                "liq_price": liq,
                 "leverage": lev,
             })
     return out
@@ -274,10 +297,9 @@ def get_open_positions() -> List[Dict]:
     return _POS_CACHE["data"]
 
 # ──────────────────────────────────────────────────────────────
-# ★ 추가: 계좌/마진/잔고 조회 (risk_guard가 자동 사용)
+# 계좌/마진/잔고 조회
 # ──────────────────────────────────────────────────────────────
 def _private_get(path: str, query: str = "", timeout: float = 10.0) -> Dict:
-    """서명 필요한 GET 헬퍼"""
     q = f"?{query}" if query else ""
     try:
         _rl(path, 0.10)
@@ -288,18 +310,13 @@ def _private_get(path: str, query: str = "", timeout: float = 10.0) -> Dict:
         return {}
 
 def get_account_equity() -> Optional[float]:
-    """
-    UMCBL(USDT 선물) 계좌 총자본(Equity) 조회.
-    - /api/mix/v1/account/accounts?productType=umcbl
-    """
     j = _private_get("/api/mix/v1/account/accounts", "productType=umcbl", timeout=12)
     data = j.get("data")
     if not data: return None
-    # data가 배열/객체 모두 가능성 고려
     def _pick(d):
         for k in ("usdtEquity","equity","totalEquity","accountEquity"):
             v = d.get(k)
-            if v not in (None, "", "0", 0): 
+            if v not in (None, "", "0", 0):
                 try: return float(v)
                 except: pass
         return None
@@ -313,10 +330,6 @@ def get_account_equity() -> Optional[float]:
     return None
 
 def get_wallet_balance(coin: str = "USDT") -> Dict[str, float]:
-    """
-    가용/총 잔고 근사: 선물 계정 기준.
-    - accounts 응답에서 available, equity 비슷한 키를 탐색.
-    """
     j = _private_get("/api/mix/v1/account/accounts", "productType=umcbl", timeout=12)
     data = j.get("data")
     out = {"available": 0.0, "total": 0.0}
@@ -328,17 +341,11 @@ def get_wallet_balance(coin: str = "USDT") -> Dict[str, float]:
             av = float(d.get("available") or d.get("availableMargin") or d.get("cashBal") or 0.0)
             out["total"] = max(out["total"], eq)
             out["available"] = max(out["available"], av)
-        except: 
+        except:
             continue
     return out
 
 def get_margin_snapshot() -> Dict[str, float]:
-    """
-    사용중 증거금/가용증거금 스냅샷.
-    - 우선 accounts 응답으로 추정: used = equity - available
-    - 정확 API가 추후 필요하면 여기서 교체하면 됨(위험 없음).
-    반환 예: {"margin_used": 1234.5, "available": 6789.0, "equity": 8023.5}
-    """
     bal = get_wallet_balance("USDT")
     eq  = get_account_equity() or float(bal.get("total") or 0.0)
     av  = float(bal.get("available") or 0.0)
