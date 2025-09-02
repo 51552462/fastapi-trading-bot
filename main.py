@@ -1,7 +1,8 @@
-import os, sys, time, json, hashlib, threading, queue, re
+# main.py — FastAPI entrypoint (ADD-ONLY)
+import os, sys, time, json, hashlib, threading, queue, re, glob, subprocess
 from collections import deque
-from typing import Dict, Any
-from fastapi import FastAPI, Request
+from typing import Dict, Any, Optional
+from fastapi import FastAPI, Request, Query, HTTPException
 
 # --- path guard (import 경로 안전) ---
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -38,6 +39,11 @@ try:
     SYMBOL_AMOUNT = json.loads(SYMBOL_AMOUNT_JSON) if SYMBOL_AMOUNT_JSON else {}
 except Exception:
     SYMBOL_AMOUNT = {}
+
+# 무료플랜 로그/리포트 열람용(선택)
+LOG_DIR = os.getenv("TRADE_LOG_DIR", "./logs")
+REPORT_DIR = "./reports"
+LOGS_API_TOKEN = os.getenv("LOGS_API_TOKEN", "")
 
 app = FastAPI()
 
@@ -76,6 +82,11 @@ def _norm_type(typ: str) -> str:
     }
     return aliases.get(t, t)
 
+def _canon_tf(s: Optional[str]) -> Optional[str]:
+    if not s: return None
+    s = s.strip().lower()
+    return s if s in ("1h","2h","3h","4h","d") else None
+
 # ──────────────────────────────────────────────────────────────
 # Payload 파서(느슨하게)
 # ──────────────────────────────────────────────────────────────
@@ -85,7 +96,7 @@ async def _parse_any(req: Request) -> Dict[str, Any]:
         return await req.json()
     except Exception:
         pass
-    # Raw body
+    # Raw body (json-like)
     try:
         raw = (await req.body()).decode(errors="ignore").strip()
         if raw:
@@ -104,7 +115,7 @@ async def _parse_any(req: Request) -> Dict[str, Any]:
             return json.loads(payload)
     except Exception:
         pass
-    # Key:Value 텍스트
+    # key:value lines
     try:
         txt = (await req.body()).decode(errors="ignore")
         d: Dict[str, Any] = {}
@@ -168,12 +179,18 @@ def _handle_signal(data: Dict[str, Any]):
     # 라우팅
     if t == "entry":
         # === 리스크 예산 체크 (자본 자동 반영) ===
-        if not can_open({
+        allowed = can_open({
             "symbol": symbol,
             "side": side,
             "entry_price": data.get("entry_price") or 0,
             "size": resolved_amount
-        }):
+        })
+        if not allowed:
+            # [ADD-ONLY] 막힐 때 조용히 사라지지 않도록 알림/파일로그만 추가
+            try: send_telegram(f"⛔ RiskGuard block {symbol} {side} amt={resolved_amount} tf={_canon_tf(str(data.get('timeframe') or ''))}")
+            except Exception: pass
+            try: log_event({"event":"guard_block","symbol":symbol,"side":side,"amount":resolved_amount,"timeframe":data.get("timeframe")}, stage="guard")
+            except Exception: pass
             return
         enter_position(symbol, resolved_amount, side=side, leverage=leverage)
         return
@@ -327,6 +344,94 @@ async def signal_4h(req: Request):
     d = await _parse_any(req)
     return _ingest_with_tf_override(d, "4H")
 
+# [ADD-ONLY] 트레일링 슬래시 호환 라우트들
+@app.post("/signal/1h/")
+async def signal_1h_slash(req: Request):
+    d = await _parse_any(req); return _ingest_with_tf_override(d, "1H")
+
+@app.post("/signal/2h/")
+async def signal_2h_slash(req: Request):
+    d = await _parse_any(req); return _ingest_with_tf_override(d, "2H")
+
+@app.post("/signal/3h/")
+async def signal_3h_slash(req: Request):
+    d = await _parse_any(req); return _ingest_with_tf_override(d, "3H")
+
+@app.post("/signal/4h/")
+async def signal_4h_slash(req: Request):
+    d = await _parse_any(req); return _ingest_with_tf_override(d, "4H")
+
+# ──────────────────────────────────────────────────────────────
+# (선택) 무료 플랜에서도 파일 확인/요약 돌리기 위한 경량 API
+# ──────────────────────────────────────────────────────────────
+def _auth_or_raise(token: Optional[str]):
+    if LOGS_API_TOKEN and token != LOGS_API_TOKEN:
+        raise HTTPException(status_code=401, detail="invalid token")
+
+@app.get("/logs/list")
+def list_logs(token: Optional[str] = Query(None)):
+    _auth_or_raise(token)
+    try:
+        files = sorted(glob.glob(os.path.join(LOG_DIR, "*")))
+        return {"dir": LOG_DIR, "files": [os.path.basename(f) for f in files]}
+    except Exception as e:
+        return {"error": str(e), "dir": LOG_DIR}
+
+@app.get("/logs/tail")
+def tail_log(file: str, lines: int = 50, token: Optional[str] = Query(None)):
+    _auth_or_raise(token)
+    path = os.path.join(LOG_DIR, file)
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            buf = f.readlines()[-max(1, min(lines, 1000)):]
+        return {"file": file, "lines": buf}
+    except FileNotFoundError:
+        raise HTTPException(status_code=404, detail=f"not found: {file}")
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/reports/run")
+def run_summary(days: Optional[int] = None, token: Optional[str] = Query(None)):
+    _auth_or_raise(token)
+    cmd = ["python3", "tools/summarize_logs.py"]
+    if days is not None:
+        cmd += ["--days", str(days)]
+    try:
+        os.makedirs(REPORT_DIR, exist_ok=True)
+        res = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
+        return {
+            "ok": (res.returncode == 0),
+            "stdout": (res.stdout or "")[-4000:],
+            "stderr": (res.stderr or "")[-2000:],
+            "reports": sorted([os.path.basename(p) for p in glob.glob(os.path.join(REPORT_DIR, "*"))])
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/reports/kpis")
+def get_kpis(token: Optional[str] = Query(None)):
+    _auth_or_raise(token)
+    path = os.path.join(REPORT_DIR, "kpis.json")
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except FileNotFoundError:
+        raise HTTPException(status_code=404, detail="kpis.json not found (먼저 /reports/run 호출)")
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/reports/download")
+def download_report(name: str, token: Optional[str] = Query(None)):
+    _auth_or_raise(token)
+    path = os.path.join(REPORT_DIR, name)
+    if not os.path.isfile(path):
+        raise HTTPException(status_code=404, detail=f"report not found: {name}")
+    with open(path, "r", encoding="utf-8") as f:
+        return {"name": name, "content": f.read()}
+
+# ──────────────────────────────────────────────────────────────
+# 스타트업 훅
+# ──────────────────────────────────────────────────────────────
 @app.on_event("startup")
 def on_startup():
     for i in range(WORKERS):
@@ -336,7 +441,6 @@ def on_startup():
     start_watchdogs()
     start_reconciler()
     start_policy_manager()   # 정책 매니저 시작
-
     try:
         threading.Thread(
             target=send_telegram,
