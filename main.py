@@ -40,7 +40,7 @@ try:
 except Exception:
     SYMBOL_AMOUNT = {}
 
-# 무료플랜 로그/리포트 열람용(선택)
+# 무료플랜 파일 확인/리포트용(선택)
 LOG_DIR = os.getenv("TRADE_LOG_DIR", "./logs")
 REPORT_DIR = "./reports"
 LOGS_API_TOKEN = os.getenv("LOGS_API_TOKEN", "")
@@ -87,6 +87,10 @@ def _canon_tf(s: Optional[str]) -> Optional[str]:
     s = s.strip().lower()
     return s if s in ("1h","2h","3h","4h","d") else None
 
+def _auth_or_raise(token: Optional[str]):
+    if LOGS_API_TOKEN and token != LOGS_API_TOKEN:
+        raise HTTPException(status_code=401, detail="invalid token")
+
 # ──────────────────────────────────────────────────────────────
 # Payload 파서(느슨하게)
 # ──────────────────────────────────────────────────────────────
@@ -96,7 +100,7 @@ async def _parse_any(req: Request) -> Dict[str, Any]:
         return await req.json()
     except Exception:
         pass
-    # Raw body (json-like)
+    # Raw body(JSON-like)
     try:
         raw = (await req.body()).decode(errors="ignore").strip()
         if raw:
@@ -186,10 +190,11 @@ def _handle_signal(data: Dict[str, Any]):
             "size": resolved_amount
         })
         if not allowed:
-            # [ADD-ONLY] 막힐 때 조용히 사라지지 않도록 알림/파일로그만 추가
+            # [ADD-ONLY] 막힐 때 조용히 사라지지 않도록 알림/파일로그
             try: send_telegram(f"⛔ RiskGuard block {symbol} {side} amt={resolved_amount} tf={_canon_tf(str(data.get('timeframe') or ''))}")
             except Exception: pass
-            try: log_event({"event":"guard_block","symbol":symbol,"side":side,"amount":resolved_amount,"timeframe":data.get("timeframe")}, stage="guard")
+            try: log_event({"event":"guard_block","symbol":symbol,"side":side,
+                            "amount":resolved_amount,"timeframe":data.get("timeframe")}, stage="guard")
             except Exception: pass
             return
         enter_position(symbol, resolved_amount, side=side, leverage=leverage)
@@ -203,10 +208,7 @@ def _handle_signal(data: Dict[str, Any]):
         return
 
     # 즉시 전체 종료 키들
-    CLOSE_KEYS = {
-        "stoploss", "emaexit", "failcut", "fullexit", "close", "exit", "liquidation",
-        "sl1", "sl2"
-    }
+    CLOSE_KEYS = {"stoploss","emaexit","failcut","fullexit","close","exit","liquidation","sl1","sl2"}
     if t in CLOSE_KEYS:
         close_position(symbol, side=side, reason=t)
         return
@@ -344,7 +346,7 @@ async def signal_4h(req: Request):
     d = await _parse_any(req)
     return _ingest_with_tf_override(d, "4H")
 
-# [ADD-ONLY] 트레일링 슬래시 호환 라우트들
+# [ADD-ONLY] 트레일링 슬래시 호환 라우트들 (/signal/{tf}/)
 @app.post("/signal/1h/")
 async def signal_1h_slash(req: Request):
     d = await _parse_any(req); return _ingest_with_tf_override(d, "1H")
@@ -364,10 +366,6 @@ async def signal_4h_slash(req: Request):
 # ──────────────────────────────────────────────────────────────
 # (선택) 무료 플랜에서도 파일 확인/요약 돌리기 위한 경량 API
 # ──────────────────────────────────────────────────────────────
-def _auth_or_raise(token: Optional[str]):
-    if LOGS_API_TOKEN and token != LOGS_API_TOKEN:
-        raise HTTPException(status_code=401, detail="invalid token")
-
 @app.get("/logs/list")
 def list_logs(token: Optional[str] = Query(None)):
     _auth_or_raise(token)
@@ -390,6 +388,17 @@ def tail_log(file: str, lines: int = 50, token: Optional[str] = Query(None)):
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
+# [ADD] 로그 자가진단: 파일에 테스트 이벤트 1줄 쓰기
+@app.get("/logs/selftest")
+def logs_selftest(token: Optional[str] = Query(None)):
+    _auth_or_raise(token)
+    try:
+        log_event({"event": "selftest", "msg": "hello", "stage": "self"}, stage="selftest")
+        return {"ok": True, "tip": "이후 /logs/list 로 파일 생겼는지 확인"}
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+
+# POST 전용이 불편하니 GET도 허용
 @app.post("/reports/run")
 def run_summary(days: Optional[int] = None, token: Optional[str] = Query(None)):
     _auth_or_raise(token)
@@ -407,6 +416,11 @@ def run_summary(days: Optional[int] = None, token: Optional[str] = Query(None)):
         }
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
+# [ADD] GET 호환: 브라우저에서 바로 리포트 실행
+@app.get("/reports/run")
+def run_summary_get(days: Optional[int] = None, token: Optional[str] = Query(None)):
+    return run_summary(days=days, token=token)
 
 @app.get("/reports/kpis")
 def get_kpis(token: Optional[str] = Query(None)):
@@ -432,11 +446,14 @@ def download_report(name: str, token: Optional[str] = Query(None)):
 # ──────────────────────────────────────────────────────────────
 # 스타트업 훅
 # ──────────────────────────────────────────────────────────────
-@app.on_event("startup")
-def on_startup():
+def _worker_boot():
     for i in range(WORKERS):
         t = threading.Thread(target=_worker_loop, args=(i,), daemon=True, name=f"signal-worker-{i}")
         t.start()
+
+@app.on_event("startup")
+def on_startup():
+    _worker_boot()
     start_capacity_guard()
     start_watchdogs()
     start_reconciler()
