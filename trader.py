@@ -1,4 +1,4 @@
-# trader.py — 원본 로직 유지 + BE(본절) 1안 + 로그 파일/텔레그램 보강
+# trader.py — BE는 TP 이후에만, 긴급종료는 레버리지 반영(가격임계 = STOP_PCT/LEVERAGE)
 import os, time, threading
 from typing import Dict, Optional
 
@@ -14,18 +14,12 @@ except Exception:
     def send_telegram(msg: str):
         print("[TG]", msg)
 
-# 파일 로깅 (없으면 콘솔로 대체)
+# 파일 로깅: log_event 하나만 사용(네가 올린 logger.py 기준)
 try:
-    from telemetry.logger import log_event, log_trade
+    from telemetry.logger import log_event
 except Exception:
-    def log_event(payload: dict, stage: str = "event"):
+    def log_event(payload: dict, stage: str = "trade"):
         print("[LOG]", stage, payload)
-    def log_trade(event: str, symbol: str, side: str, amount: float,
-                  reason: Optional[str] = None, extra: Optional[Dict] = None):
-        d = {"event": event, "symbol": symbol, "side": side, "amount": amount}
-        if reason: d["reason"] = reason
-        if extra: d.update(extra)
-        log_event(d, stage="trade")
 
 LEVERAGE = float(os.getenv("LEVERAGE", "5"))
 TRACE_LOG = os.getenv("TRACE_LOG", "0") == "1"
@@ -34,6 +28,7 @@ TP1_PCT = float(os.getenv("TP1_PCT", "0.30"))
 TP2_PCT = float(os.getenv("TP2_PCT", "0.40"))
 TP3_PCT = float(os.getenv("TP3_PCT", "0.30"))
 
+# STOP_PCT는 "마진(증거금) 손실률"로 해석 (예: 0.10 = -10% 마진 손실)
 STOP_PCT           = float(os.getenv("STOP_PCT", "0.10"))
 STOP_CHECK_SEC     = float(os.getenv("STOP_CHECK_SEC", "1.0"))
 STOP_COOLDOWN_SEC  = float(os.getenv("STOP_COOLDOWN_SEC", "5.0"))
@@ -42,7 +37,7 @@ RECON_INTERVAL_SEC = float(os.getenv("RECON_INTERVAL_SEC", "40"))
 TP_EPSILON_RATIO   = float(os.getenv("TP_EPSILON_RATIO", "0.001"))
 RECON_DEBUG        = os.getenv("RECON_DEBUG", "0") == "1"
 
-MAX_OPEN_POSITIONS = int(os.getenv("MAX_OPEN_POSITIONS", "40"))
+MAX_OPEN_POSITIONS = int(os.getenv("MAX_OPEN_POSITIONS", "100"))
 CAP_CHECK_SEC      = float(os.getenv("CAP_CHECK_SEC", "10"))
 LONG_BYPASS_CAP    = os.getenv("LONG_BYPASS_CAP", "1") == "1"
 
@@ -142,7 +137,7 @@ def _pnl_usdt(entry: float, exit: float, notional: float, side: str) -> float:
     else:
         return (entry - exit) / entry * notional
 
-# ── capacity / reservation
+# ── STRICT 예약 (entry race 방지: 숏 슬롯 보호)
 _RESERVE = {"short": 0}
 _RES_LOCK = threading.Lock()
 
@@ -163,7 +158,7 @@ def can_enter_now(side: str) -> bool:
 def _strict_try_reserve(side: str) -> bool:
     if side == "long" and LONG_BYPASS_CAP: return True
     with _RES_LOCK:
-        # 아주 간단한 short 보호 슬롯
+        # 간단 슬롯: 동시에 몰리는 숏 진입을 한 슬롯만 허용
         if _RESERVE["short"] < 1:
             _RESERVE["short"] += 1
             return True
@@ -222,18 +217,27 @@ def enter_position(symbol: str, usdt_amount: float, side: str = "long", leverage
 
         with _lock_for(key):
             if _local_has_any(symbol) or _get_remote_any_side(symbol) or _recent_ok(key):
-                _mark_done("entry", pkey, "(exists/recent)"); return
+                _mark_done("entry", pkey, "(exists/recent)")
+                return
 
             _set_busy(key)
 
             last = get_last_price(symbol)
             if not last or last <= 0:
-                if TRACE_LOG: send_telegram(f"❗ ticker_fail {symbol} trace={trace}")
-                return  # 리컨실러가 재시도
-
-            resp = place_market_order(symbol, usdt_amount,
-                                      side=("buy" if side == "long" else "sell"),
-                                      leverage=lev, reduce_only=False)
+                # 즉시 재시도 2회만 더
+                ok = False
+                for i in range(2):
+                    time.sleep(0.12 + 0.04 * i)
+                    last = get_last_price(symbol)
+                    if last and last > 0: ok = True; break
+                if not ok:
+                    if TRACE_LOG: send_telegram(f"❗ ticker_fail {symbol} trace={trace}")
+                    return  # 리컨실러 재시도
+            resp = place_market_order(
+                symbol, usdt_amount,
+                side=("buy" if side == "long" else "sell"),
+                leverage=lev, reduce_only=False
+            )
             code = str(resp.get("code", ""))
             if TRACE_LOG: send_telegram(f"📦 order_resp code={code} {symbol} {side} trace={trace}")
 
@@ -244,7 +248,7 @@ def enter_position(symbol: str, usdt_amount: float, side: str = "long", leverage
                 _mark_done("entry", pkey)
                 _mark_recent_ok(key)
                 send_telegram(f"🚀 ENTRY {side.upper()} {symbol}\n• Notional≈ {usdt_amount} USDT\n• Lvg: {lev}x")
-                log_trade("entry", symbol, side, usdt_amount, extra={"leverage": lev})
+                log_event({"event":"entry","symbol":symbol,"side":side,"amount":usdt_amount,"leverage":lev}, stage="trade")
             elif code.startswith("LOCAL_MIN_QTY") or code.startswith("LOCAL_BAD_QTY"):
                 _mark_done("entry", pkey, "(minQty/badQty)")
                 send_telegram(f"⛔ ENTRY 스킵 {symbol} {side} → {resp}")
@@ -301,9 +305,10 @@ def take_partial_profit(symbol: str, pct: float, side: str = "long"):
                 f"🤑 TP {int(pct*100)}% {side.upper()} {symbol}\n"
                 f"• Exit: {exit_price}\n• Cut size: {cut_size}\n• Realized≈ {realized:+.2f} USDT"
             )
-            log_trade("tp", symbol, side, amount=cut_size, extra={"pct": pct, "exit": exit_price, "realized": realized})
+            log_event({"event":"tp","symbol":symbol,"side":side,"cut_size":cut_size,
+                       "pct":pct,"exit":exit_price,"realized":realized}, stage="trade")
 
-            # === 1안: TP1/TP2 성공 시에만 BE 무장 ===
+            # === BE 무장: TP1/TP2 성공 후에만 ===
             try:
                 stage = 1 if abs(float(pct) - TP1_PCT) <= 1e-6 else (2 if abs(float(pct) - TP2_PCT) <= 1e-6 else 0)
                 if BE_ENABLE and stage in (1, 2) and stage >= BE_AFTER_STAGE:
@@ -314,6 +319,8 @@ def take_partial_profit(symbol: str, pct: float, side: str = "long"):
                             st.update({"be_armed": True, "be_entry": entry, "be_from_stage": stage})
                             position_data[key] = st
                         send_telegram(f"🧷 Breakeven ARMED at entry≈{entry} ({symbol} {side}, from TP{stage})")
+                        log_event({"event":"breakeven_arm","symbol":symbol,"side":side,
+                                   "entry":entry,"from_stage":stage}, stage="trade")
             except: pass
 
 def close_position(symbol: str, side: str = "long", reason: str = "manual"):
@@ -353,7 +360,8 @@ def close_position(symbol: str, side: str = "long", reason: str = "manual"):
                 f"✅ CLOSE {side.upper()} {symbol} ({reason})\n"
                 f"• Exit: {exit_price}\n• Size: {size}\n• Realized≈ {realized:+.2f} USDT"
             )
-            log_trade("close", symbol, side, amount=size, reason=reason, extra={"exit": exit_price, "realized": realized})
+            log_event({"event":"close","symbol":symbol,"side":side,"size":size,
+                       "exit":exit_price,"realized":realized,"reason":reason}, stage="trade")
             _mark_recent_ok(key)  # 직후 중복 재진입 방지
 
 def reduce_by_contracts(symbol: str, contracts: float, side: str = "long"):
@@ -370,12 +378,13 @@ def reduce_by_contracts(symbol: str, contracts: float, side: str = "long"):
         resp = place_reduce_by_size(symbol, qty, side)
         if str(resp.get("code", "")) == "00000":
             send_telegram(f"🔻 Reduce {qty} {side.upper()} {symbol}")
-            log_trade("reduce", symbol, side, amount=qty)
+            log_event({"event":"reduce","symbol":symbol,"side":side,"qty":qty}, stage="trade")
         else:
             send_telegram(f"❌ Reduce 실패 {key} → {resp}")
 
 # ── watchdogs
 def _watchdog_loop():
+    """긴급 종료: 레버리지 반영. 가격변동 임계 = STOP_PCT / LEVERAGE"""
     while True:
         try:
             for p in get_open_positions():
@@ -384,17 +393,25 @@ def _watchdog_loop():
                 if not symbol or side not in ("long","short") or entry <= 0 or size <= 0: continue
                 last = get_last_price(symbol)
                 if not last: continue
-                # 손실률이 STOP_PCT 이상이면 즉시 종료
-                if ((entry-last)/entry if side=="long" else (last-entry)/entry) >= STOP_PCT:
+
+                lev = float(os.getenv("LEVERAGE", str(LEVERAGE)))
+                price_move = ((entry - last) / entry) if side == "long" else ((last - entry) / entry)
+                stop_price_move = STOP_PCT / max(1.0, lev)   # ← 핵심
+
+                if price_move >= stop_price_move:
                     if not _stop_recently_fired(symbol, side):
                         _mark_stop_fired(symbol, side)
-                        send_telegram(f"⛔ {symbol} {side.upper()} emergencyStop ≥{int(STOP_PCT*100)}%")
+                        send_telegram(
+                            f"⛔ {symbol} {side.upper()} emergencyStop "
+                            f"(price≈{price_move*100:.2f}% ≥ {stop_price_move*100:.2f}%, lev={lev}x)"
+                        )
                         close_position(symbol, side=side, reason="emergencyStop")
         except Exception as e:
             print("watchdog error:", e)
         time.sleep(STOP_CHECK_SEC)
 
 def _breakeven_watchdog():
+    """BE는 TP 이후 무장한 포지션만 감시"""
     if os.getenv("BE_ENABLE", "1") != "1": return
     BE_EPS = float(os.getenv("BE_EPSILON_RATIO", "0.0005"))
     while True:
@@ -410,11 +427,13 @@ def _breakeven_watchdog():
                     st = position_data.get(key) or {}
                     be_armed = bool(st.get("be_armed"))
                 if not be_armed:
-                    continue  # ← 1안 핵심: TP로 무장되기 전에는 발동하지 않음
+                    continue  # ← TP 무장 전이면 발동 금지
                 eps = max(entry * BE_EPS, 0.0)
                 trigger = (last <= entry - eps) if side == "long" else (last >= entry + eps)
                 if trigger:
                     send_telegram(f"🧷 Breakeven stop → CLOSE {side.upper()} {symbol} @≈{last} (entry≈{entry})")
+                    log_event({"event":"breakeven","symbol":symbol,"side":side,
+                               "last":last,"entry":entry}, stage="trade")
                     close_position(symbol, side=side, reason="breakeven")
         except Exception as e:
             print("breakeven watchdog error:", e)
@@ -454,7 +473,7 @@ def _reconciler_loop():
                                 position_data[key] = {"symbol": sym, "side": side, "entry_usd": amt, "ts": time.time()}
                             _mark_recent_ok(key)
                             send_telegram(f"🔁 ENTRY 재시도 성공 {side.upper()} {sym}")
-                            log_trade("entry_retry", sym, side, amt, extra={"leverage": lev})
+                            log_event({"event":"entry_retry","symbol":sym,"side":side,"amount":amt,"leverage":lev}, stage="trade")
                 finally:
                     _clear_busy(key); _strict_release(side)
 
@@ -481,7 +500,7 @@ def _reconciler_loop():
                             _mark_done("close", pkey)
                             with _POS_LOCK: position_data.pop(key, None)
                             send_telegram(f"🔁 CLOSE 재시도 성공 {side.upper()} {sym}")
-                            log_trade("close_retry", sym, side, size)
+                            log_event({"event":"close_retry","symbol":sym,"side":side,"size":size}, stage="trade")
 
             # TP3 재시도(부분 종료 목표량 달성 확인)
             with _PENDING_LOCK:
@@ -502,6 +521,16 @@ def _reconciler_loop():
                 if achieved + eps >= cut_size:
                     _mark_done("tp", pkey)
                     if RECON_DEBUG: send_telegram(f"✅ TP3 달성 확인 {sym} {side} achieved≈{achieved} target≈{cut_size}")
+                else:
+                    remain = round_down_step(cut_size - achieved, size_step)
+                    if remain > 0:
+                        with _lock_for(key):
+                            now = time.time()
+                            if now - item.get("last_try", 0.0) < RECON_INTERVAL_SEC - 1: continue
+                            resp = place_reduce_by_size(sym, remain, side)
+                            item["last_try"] = now; item["attempts"] = item.get("attempts", 0) + 1
+                            if str(resp.get("code", "")) == "00000":
+                                send_telegram(f"🔁 TP3 재시도 감축 {side.upper()} {sym} remain≈{remain}")
         except Exception as e:
             print("reconciler error:", e)
 
@@ -511,8 +540,7 @@ def _capacity_loop():
         try:
             cnt = 0
             for p in get_open_positions():
-                if float(p.get("size") or 0) > 0:
-                    cnt += 1
+                if float(p.get("size") or 0) > 0: cnt += 1
             with _CAP_LOCK:
                 _CAPACITY["last_count"] = cnt
                 _CAPACITY["blocked"] = cnt >= MAX_OPEN_POSITIONS
