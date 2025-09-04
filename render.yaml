@@ -2,38 +2,42 @@ services:
   - type: web
     name: fastapi-trading-bot
     env: python
-    plan: starter                    # ★ 유료(Always On)
+    plan: starter                 # 유료 Always On
     region: oregon
     buildCommand: pip install -r requirements.txt
     startCommand: >
       gunicorn main:app
       -k uvicorn.workers.UvicornWorker
-      --workers 2
-      --bind 0.0.0.0:10000
-      --timeout 60
+      --workers 1                 # Starter 메모리에서 가장 안정적
+      --bind 0.0.0.0:$PORT        # ★ 고정포트(10000) 말고 Render가 준 $PORT에 바인드
+      --timeout 90                # 정각 피크에도 여유
+      --graceful-timeout 30
       --keep-alive 75
-    autoDeploy: true
-    healthCheckPath: /health
+      --max-requests 800          # 워커만 순환, 전체 프로세스 리셋 방지
+      --max-requests-jitter 80
+    autoDeploy: false             # 정각에 자동배포로 재시작되는 것 방지
+    healthCheckPath: /health      # 헬스체크는 가볍게 200만 리턴하도록 유지
     envVars:
       - key: PYTHONUNBUFFERED
         value: "1"
       - key: TRACE_LOG
         value: "1"
-      # ===== Bitget v2 우선 사용 플래그 =====
+
+      # === Bitget v2 사용 (필요시 경로만 바꿔 끼우면 됨) ===
       - key: BITGET_USE_V2
         value: "1"
-      # (필요 시 바꿔 쓸 수 있게 경로도 변수로 노출. 값이 비면 v1로 폴백됨)
       - key: BITGET_V2_TICKER_PATH
         value: "/api/v2/mix/market/ticker"
       - key: BITGET_V2_MARK_PATH
         value: "/api/v2/mix/market/mark-price"
       - key: BITGET_V2_DEPTH_PATH
         value: "/api/v2/mix/market/orderbook"
-      # ===== 기존에 쓰던 환경변수들(예시) =====
+
+      # === 네가 쓰는 운영 변수들(예시: 그대로 유지) ===
       - key: LEVERAGE
         value: "5"
       - key: STOP_PCT
-        value: "0.10"
+        value: "0.10"    # (레버리지 반영 긴급종료: 가격임계=STOP_PCT/LEVERAGE)
       - key: BE_ENABLE
         value: "1"
       - key: BE_AFTER_STAGE
