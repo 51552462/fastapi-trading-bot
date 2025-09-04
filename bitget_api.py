@@ -1,4 +1,4 @@
-# bitget_api.py — V2 ticker/mark/depth 우선 + V1 폴백, 기존 로직 보존
+# bitget_api.py — V2는 suffix 없이(core 심볼만), V1은 기존대로 _UMCBL 사용
 import os, time, json, hmac, hashlib, base64, requests, math, random
 from typing import Dict, List, Optional, Tuple
 
@@ -44,9 +44,6 @@ if _alias_env:
     except: pass
 
 def convert_symbol(sym: str) -> str:
-    """
-    트뷰에서 오는 다양한 변형을 안정적으로 Bitget UMCBL 코어심볼로 정규화.
-    """
     s = (sym or "").upper().strip()
     for ch in ("/", "-", "_", " "):
         s = s.replace(ch, "")
@@ -140,74 +137,67 @@ def _http_get(path: str, params: dict, timeout: float = 1.2) -> Tuple[Optional[d
     except Exception as e:
         return None, f"REQ_ERR:{str(e)}"
 
+# ★ 변경 포인트 1 : V2는 suffix 없이 core 심볼만
 def _v2_ticker(sym: str) -> Optional[float]:
     if not _BITGET_USE_V2 or not _V2_TICKER_PATH: return None
     core = convert_symbol(sym)
-    for inst in (f"{core}_UMCBL", core):
-        j, err = _http_get(_V2_TICKER_PATH, {"symbol": inst})
-        if err or not j: 
-            continue
-        d = j.get("data") or {}
-        last = d.get("last") or d.get("close")
-        try:
-            return float(last) if last not in (None, "", "0", 0, "0.0") else None
-        except:
-            continue
-    return None
+    j, err = _http_get(_V2_TICKER_PATH, {"symbol": core})
+    if err or not j: 
+        return None
+    d = j.get("data") or {}
+    last = d.get("last") or d.get("close")
+    try:
+        return float(last) if last not in (None, "", "0", 0, "0.0") else None
+    except:
+        return None
 
+# ★ 변경 포인트 2 : V2 mark-price도 core 심볼만
 def _v2_mark_price(sym: str) -> Optional[float]:
     if not _BITGET_USE_V2 or not _V2_MARK_PATH: return None
     core = convert_symbol(sym)
-    for inst in (f"{core}_UMCBL", core):
-        j, err = _http_get(_V2_MARK_PATH, {"symbol": inst})
-        if err or not j:
-            continue
-        d = j.get("data") or {}
-        mp = d.get("markPrice") or d.get("price")
-        try:
-            return float(mp) if mp not in (None, "", "0", 0, "0.0") else None
-        except:
-            continue
-    return None
+    j, err = _http_get(_V2_MARK_PATH, {"symbol": core})
+    if err or not j:
+        return None
+    d = j.get("data") or {}
+    mp = d.get("markPrice") or d.get("price")
+    try:
+        return float(mp) if mp not in (None, "", "0", 0, "0.0") else None
+    except:
+        return None
 
+# ★ 변경 포인트 3 : V2 orderbook도 core 심볼만
 def _v2_orderbook_mid(sym: str) -> Optional[float]:
     if not _BITGET_USE_V2 or not _V2_DEPTH_PATH: return None
     core = convert_symbol(sym)
-    for inst in (f"{core}_UMCBL", core):
-        j, err = _http_get(_V2_DEPTH_PATH, {"symbol": inst, "limit": 1})
-        if err or not j:
-            continue
-        d = j.get("data") or {}
-        bids = d.get("bids") or []
-        asks = d.get("asks") or []
-        try:
-            bid = float(bids[0][0]) if bids and bids[0] else None
-            ask = float(asks[0][0]) if asks and asks[0] else None
-            if bid and ask: 
-                return (bid + ask) / 2.0
-        except:
-            continue
+    j, err = _http_get(_V2_DEPTH_PATH, {"symbol": core, "limit": 1})
+    if err or not j:
+        return None
+    d = j.get("data") or {}
+    bids = d.get("bids") or []
+    asks = d.get("asks") or []
+    try:
+        bid = float(bids[0][0]) if bids and bids[0] else None
+        ask = float(asks[0][0]) if asks and asks[0] else None
+        if bid and ask: 
+            return (bid + ask) / 2.0
+    except:
+        return None
     return None
 
 # ──────────────────────────────────────────────────────────────
-# get_last_price: V2 → V1 순서로 조회 (짧은 재시도 + 캐시)
+# get_last_price: V2 → V1 순서 (짧은 재시도 + 캐시)
 # ──────────────────────────────────────────────────────────────
 def get_last_price(symbol: str, retries: int = 6, base: float = 0.20) -> Optional[float]:
-    """
-    1) v2 ticker → 2) v2 mark → 3) v2 depth(mid) → 4) v1 ticker → 5) v1 mark → 6) depth(mid)
-    + 3초 캐시 + 짧은 재시도 + (STRICT_TICKER=0) 캐시 폴백
-    """
     sym = convert_symbol(symbol)
     c = _TICKER_CACHE.get(sym); now = time.time()
     if c and now - c[0] <= TICKER_TTL:
         return float(c[1])
 
-    # v1 URL (기존 유지)
     url_ticker = f"{BASE_URL}/api/mix/v1/market/ticker?symbol={_mix_symbol(sym)}"
     url_mark   = f"{BASE_URL}/api/mix/v1/market/mark-price?symbol={_mix_symbol(sym)}"
 
     def _try_once() -> Optional[float]:
-        # v2 우선
+        # v2
         px = _v2_ticker(sym)
         if px: return px
         px = _v2_mark_price(sym)
@@ -215,7 +205,7 @@ def get_last_price(symbol: str, retries: int = 6, base: float = 0.20) -> Optiona
         px = _v2_orderbook_mid(sym)
         if px: return px
 
-        # v1 폴백 (기존 로직 그대로)
+        # v1
         try:
             _rl("ticker", 0.06)
             r = requests.get(url_ticker, timeout=10)
@@ -224,8 +214,7 @@ def get_last_price(symbol: str, retries: int = 6, base: float = 0.20) -> Optiona
                 if data and data.get("last") not in (None, "", "0", 0, "0.0"):
                     px = float(data["last"])
                     if px > 0: return px
-        except:
-            pass
+        except: pass
         try:
             _rl("mark", 0.06)
             rm = requests.get(url_mark, timeout=10)
@@ -235,11 +224,11 @@ def get_last_price(symbol: str, retries: int = 6, base: float = 0.20) -> Optiona
                 if mp not in (None, "", "0", 0, "0.0"):
                     px = float(mp)
                     if px > 0: return px
-        except:
-            pass
+        except: pass
+
         if ALLOW_DEPTH_FALLBACK:
             alt = _depth_midprice(sym)
-            if alt and alt > 0: 
+            if alt and alt > 0:
                 return alt
         return None
 
