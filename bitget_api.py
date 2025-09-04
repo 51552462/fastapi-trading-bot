@@ -1,3 +1,4 @@
+# bitget_api.py — V2 ticker/mark/depth 우선 + V1 폴백, 기존 로직 보존
 import os, time, json, hmac, hashlib, base64, requests, math, random
 from typing import Dict, List, Optional, Tuple
 
@@ -45,21 +46,16 @@ if _alias_env:
 def convert_symbol(sym: str) -> str:
     """
     트뷰에서 오는 다양한 변형을 안정적으로 Bitget UMCBL 코어심볼로 정규화.
-    (기존 로직 유지 + 보정만 추가)
     """
     s = (sym or "").upper().strip()
-    # 흔한 구분자 제거
     for ch in ("/", "-", "_", " "):
         s = s.replace(ch, "")
-    # PERP 표기/변형 보정
     if s.endswith("PERP"):
         s = s[:-4]
-    # TradingView 선물 접미사 보정 (예: DOGEUSDT.P, BTCUSDTP 등)
     if s.endswith("USDT.P"):
         s = s[:-6] + "USDT"
     if s.endswith("USDTP"):
         s = s[:-5] + "USDT"
-    # 추가 커스텀 매핑
     return ALIASES.get(s, s)
 
 def _mix_symbol(sym: str) -> str:
@@ -71,7 +67,7 @@ def _mix_symbol(sym: str) -> str:
 _TICKER_CACHE: Dict[str, tuple] = {}
 TICKER_TTL    = float(os.getenv("TICKER_TTL", "2.5"))
 STRICT_TICKER = os.getenv("STRICT_TICKER", "0") == "1"
-ALLOW_DEPTH_FALLBACK = os.getenv("ALLOW_DEPTH_FALLBACK", "1") == "1"  # 추가: 오더북 미드가 허용되면 True
+ALLOW_DEPTH_FALLBACK = os.getenv("ALLOW_DEPTH_FALLBACK", "1") == "1"
 
 def _depth_midprice(symbol: str) -> Optional[float]:
     try:
@@ -112,7 +108,6 @@ def get_symbol_spec(symbol: str) -> Dict[str, float]:
     sym = convert_symbol(symbol)
     spec = _SYMBOLS_CACHE["data"].get(sym)
     if not spec:
-        # 기존 인터페이스 유지 + 안전한 폴백
         print(f"⚠️ {sym} 심볼 스펙 없음 → fallback(sizeStep=0.001,minQty=0.001)")
         spec = {"sizeStep": 0.001, "minQty": 0.001}
         _SYMBOLS_CACHE["data"][sym] = spec
@@ -122,25 +117,105 @@ def round_down_step(qty: float, step: float) -> float:
     if step <= 0: return round(qty, 6)
     k = math.floor(qty / step); return round(k * step, 6)
 
+# ──────────────────────────────────────────────────────────────
+# ====== V2 endpoints (env로 경로 주입 가능) + V1 폴백 ======
+# ──────────────────────────────────────────────────────────────
+_BITGET_USE_V2 = os.getenv("BITGET_USE_V2", "1") == "1"
+_V2_TICKER_PATH = os.getenv("BITGET_V2_TICKER_PATH", "/api/v2/mix/market/ticker")
+_V2_MARK_PATH   = os.getenv("BITGET_V2_MARK_PATH",   "/api/v2/mix/market/mark-price")
+_V2_DEPTH_PATH  = os.getenv("BITGET_V2_DEPTH_PATH",  "/api/v2/mix/market/orderbook")
+
+def _http_get(path: str, params: dict, timeout: float = 1.2) -> Tuple[Optional[dict], Optional[str]]:
+    if not path:
+        return None, "EMPTY_PATH"
+    url = BASE_URL + path
+    try:
+        r = requests.get(url, params=params, timeout=timeout)
+        if r.status_code != 200:
+            return None, f"HTTP_{r.status_code}:{r.text[:160]}"
+        try:
+            return r.json(), None
+        except Exception as e:
+            return None, f"JSON_ERR:{str(e)}"
+    except Exception as e:
+        return None, f"REQ_ERR:{str(e)}"
+
+def _v2_ticker(sym: str) -> Optional[float]:
+    if not _BITGET_USE_V2 or not _V2_TICKER_PATH: return None
+    core = convert_symbol(sym)
+    for inst in (f"{core}_UMCBL", core):
+        j, err = _http_get(_V2_TICKER_PATH, {"symbol": inst})
+        if err or not j: 
+            continue
+        d = j.get("data") or {}
+        last = d.get("last") or d.get("close")
+        try:
+            return float(last) if last not in (None, "", "0", 0, "0.0") else None
+        except:
+            continue
+    return None
+
+def _v2_mark_price(sym: str) -> Optional[float]:
+    if not _BITGET_USE_V2 or not _V2_MARK_PATH: return None
+    core = convert_symbol(sym)
+    for inst in (f"{core}_UMCBL", core):
+        j, err = _http_get(_V2_MARK_PATH, {"symbol": inst})
+        if err or not j:
+            continue
+        d = j.get("data") or {}
+        mp = d.get("markPrice") or d.get("price")
+        try:
+            return float(mp) if mp not in (None, "", "0", 0, "0.0") else None
+        except:
+            continue
+    return None
+
+def _v2_orderbook_mid(sym: str) -> Optional[float]:
+    if not _BITGET_USE_V2 or not _V2_DEPTH_PATH: return None
+    core = convert_symbol(sym)
+    for inst in (f"{core}_UMCBL", core):
+        j, err = _http_get(_V2_DEPTH_PATH, {"symbol": inst, "limit": 1})
+        if err or not j:
+            continue
+        d = j.get("data") or {}
+        bids = d.get("bids") or []
+        asks = d.get("asks") or []
+        try:
+            bid = float(bids[0][0]) if bids and bids[0] else None
+            ask = float(asks[0][0]) if asks and asks[0] else None
+            if bid and ask: 
+                return (bid + ask) / 2.0
+        except:
+            continue
+    return None
+
+# ──────────────────────────────────────────────────────────────
+# get_last_price: V2 → V1 순서로 조회 (짧은 재시도 + 캐시)
+# ──────────────────────────────────────────────────────────────
 def get_last_price(symbol: str, retries: int = 6, base: float = 0.20) -> Optional[float]:
     """
-    1) /market/ticker → 2) /market/mark-price → 3) 오더북 mid(옵션) → 4) (STRICT_TICKER=0) 캐시 폴백
-    기존 동작을 유지하되, 심볼 캐시 미스 상황에서 재시도/폴백만 강화.
+    1) v2 ticker → 2) v2 mark → 3) v2 depth(mid) → 4) v1 ticker → 5) v1 mark → 6) depth(mid)
+    + 3초 캐시 + 짧은 재시도 + (STRICT_TICKER=0) 캐시 폴백
     """
     sym = convert_symbol(symbol)
     c = _TICKER_CACHE.get(sym); now = time.time()
-    if c and now - c[0] <= TICKER_TTL: return float(c[1])
+    if c and now - c[0] <= TICKER_TTL:
+        return float(c[1])
 
-    # 캐시에 심볼이 없다면 한 번 더 갱신 시도
-    if not _SYMBOLS_CACHE["data"] or (now - _SYMBOLS_CACHE["ts"] > 600) or (sym not in _SYMBOLS_CACHE["data"]):
-        _refresh_symbols_cache()
-        if sym not in _SYMBOLS_CACHE["data"]:
-            print(f"⚠️ symbol_not_found_umcbl: {sym} (check SYMBOL_ALIASES_JSON)")
-
+    # v1 URL (기존 유지)
     url_ticker = f"{BASE_URL}/api/mix/v1/market/ticker?symbol={_mix_symbol(sym)}"
     url_mark   = f"{BASE_URL}/api/mix/v1/market/mark-price?symbol={_mix_symbol(sym)}"
 
-    for i in range(retries):
+    def _try_once() -> Optional[float]:
+        # v2 우선
+        px = _v2_ticker(sym)
+        if px: return px
+        px = _v2_mark_price(sym)
+        if px: return px
+        px = _v2_orderbook_mid(sym)
+        if px: return px
+
+        # v1 폴백 (기존 로직 그대로)
         try:
             _rl("ticker", 0.06)
             r = requests.get(url_ticker, timeout=10)
@@ -148,31 +223,33 @@ def get_last_price(symbol: str, retries: int = 6, base: float = 0.20) -> Optiona
                 j = r.json(); data = j.get("data")
                 if data and data.get("last") not in (None, "", "0", 0, "0.0"):
                     px = float(data["last"])
-                    if px > 0:
-                        _TICKER_CACHE[sym] = (time.time(), px); return px
+                    if px > 0: return px
+        except:
+            pass
+        try:
+            _rl("mark", 0.06)
+            rm = requests.get(url_mark, timeout=10)
+            if rm.status_code == 200:
+                jm = rm.json(); dm = jm.get("data") or {}
+                mp = dm.get("markPrice") or dm.get("mark") or dm.get("price")
+                if mp not in (None, "", "0", 0, "0.0"):
+                    px = float(mp)
+                    if px > 0: return px
+        except:
+            pass
+        if ALLOW_DEPTH_FALLBACK:
+            alt = _depth_midprice(sym)
+            if alt and alt > 0: 
+                return alt
+        return None
 
-            # mark 가격 폴백
-            try:
-                _rl("mark", 0.06)
-                rm = requests.get(url_mark, timeout=10)
-                if rm.status_code == 200:
-                    jm = rm.json(); dm = jm.get("data") or {}
-                    mp = dm.get("markPrice") or dm.get("mark") or dm.get("price")
-                    if mp not in (None, "", "0", 0, "0.0"):
-                        px = float(mp)
-                        if px > 0:
-                            _TICKER_CACHE[sym] = (time.time(), px); return px
-            except: pass
-
-            # 오더북 mid 폴백(옵션)
-            if ALLOW_DEPTH_FALLBACK:
-                alt = _depth_midprice(sym)
-                if alt and alt > 0:
-                    _TICKER_CACHE[sym] = (time.time(), alt); return alt
-        except: pass
+    for i in range(retries):
+        px = _try_once()
+        if px and px > 0:
+            _TICKER_CACHE[sym] = (time.time(), px)
+            return px
         time.sleep(base * (2 ** i) + random.uniform(0, 0.1))
 
-    # 캐시 폴백(STRICT_TICKER=0일 때만)
     if not STRICT_TICKER:
         c = _TICKER_CACHE.get(sym)
         if c: return float(c[1])
@@ -180,6 +257,9 @@ def get_last_price(symbol: str, retries: int = 6, base: float = 0.20) -> Optiona
     print(f"❌ Ticker 실패(최종): {_mix_symbol(sym)}")
     return None
 
+# ──────────────────────────────────────────────────────────────
+# Orders
+# ──────────────────────────────────────────────────────────────
 def place_market_order(symbol: str, usdt_amount: float, side: str, leverage: float = 5, reduce_only: bool = False) -> Dict:
     last = get_last_price(symbol)
     if not last: return {"code": "LOCAL_TICKER_FAIL", "msg": "ticker_none"}
