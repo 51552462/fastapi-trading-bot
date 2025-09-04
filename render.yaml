@@ -2,28 +2,42 @@ services:
   - type: web
     name: fastapi-trading-bot
     env: python
-    plan: starter                 # 유료 Always On
+    plan: starter                # 유료 Always On
     region: oregon
+
     buildCommand: pip install -r requirements.txt
     startCommand: >
       gunicorn main:app
       -k uvicorn.workers.UvicornWorker
-      --workers 1                 # Starter 메모리에서 가장 안정적
-      --bind 0.0.0.0:$PORT        # ★ 고정포트(10000) 말고 Render가 준 $PORT에 바인드
-      --timeout 90                # 정각 피크에도 여유
+      --workers 1
+      --bind 0.0.0.0:$PORT      # Render가 제공하는 포트 사용
+      --timeout 90
       --graceful-timeout 30
       --keep-alive 75
-      --max-requests 800          # 워커만 순환, 전체 프로세스 리셋 방지
+      --max-requests 800
       --max-requests-jitter 80
-    autoDeploy: false             # 정각에 자동배포로 재시작되는 것 방지
-    healthCheckPath: /health      # 헬스체크는 가볍게 200만 리턴하도록 유지
+
+    autoDeploy: false            # 정각 자동 배포로 인한 재시작 방지
+    healthCheckPath: /health
+
+    # ★ 영구 디스크 (로그 보존용)
+    disks:
+      - name: data
+        mountPath: /var/data
+        sizeGB: 1
+
     envVars:
+      # 런타임 공통
       - key: PYTHONUNBUFFERED
         value: "1"
       - key: TRACE_LOG
         value: "1"
 
-      # === Bitget v2 사용 (필요시 경로만 바꿔 끼우면 됨) ===
+      # 로그 저장 위치 (영구 디스크)
+      - key: TRADE_LOG_DIR
+        value: "/var/data/trade_logs"
+
+      # Bitget v2 사용 (경로는 필요 시 지원팀 안내로 교체)
       - key: BITGET_USE_V2
         value: "1"
       - key: BITGET_V2_TICKER_PATH
@@ -33,14 +47,56 @@ services:
       - key: BITGET_V2_DEPTH_PATH
         value: "/api/v2/mix/market/orderbook"
 
-      # === 네가 쓰는 운영 변수들(예시: 그대로 유지) ===
+      # 티커 안정화 옵션
+      - key: STRICT_TICKER
+        value: "0"
+      - key: ALLOW_DEPTH_FALLBACK
+        value: "1"
+      - key: TICKER_TTL
+        value: "3"
+
+      # 리스크/워치독 관련 (필요 값만)
       - key: LEVERAGE
         value: "5"
       - key: STOP_PCT
-        value: "0.10"    # (레버리지 반영 긴급종료: 가격임계=STOP_PCT/LEVERAGE)
+        value: "0.10"    # 마진 -10% → 5배면 가격 -2%에서 컷
+      - key: STOP_CHECK_SEC
+        value: "1.0"
+
+      # BE/TP 설정 (네 기본값 유지)
+      - key: TP1_PCT
+        value: "0.30"
+      - key: TP2_PCT
+        value: "0.40"
+      - key: TP3_PCT
+        value: "0.30"
       - key: BE_ENABLE
         value: "1"
       - key: BE_AFTER_STAGE
         value: "1"
-      - key: TRADE_LOG_DIR
-        value: "./logs"
+      - key: BE_EPSILON_RATIO
+        value: "0.0005"
+
+      # 엔트리 재시도/중복 가드
+      - key: ENTRY_INFLIGHT_TTL_SEC
+        value: "30"
+      - key: ENTRY_DUP_TTL_SEC
+        value: "90"
+      - key: RECON_INTERVAL_SEC
+        value: "20"
+      - key: RECON_DEBUG
+        value: "0"
+
+      # 포지션 수 제한
+      - key: MAX_OPEN_POSITIONS
+        value: "120"
+      - key: LONG_BYPASS_CAP
+        value: "1"
+
+      # Bitget API 인증 (값은 Render 대시보드에서 직접 입력)
+      - key: BITGET_API_KEY
+        sync: false
+      - key: BITGET_API_SECRET
+        sync: false
+      - key: BITGET_API_PASSWORD
+        sync: false
