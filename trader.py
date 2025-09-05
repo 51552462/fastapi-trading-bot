@@ -1,12 +1,12 @@
 # -*- coding: utf-8 -*-
 """
-Trader core
+Trader core (drop-in)
 - 기존 엔트리/리콘실러/응급정지/브레이크이븐/적응형 큐레이션/텔레그램 알림 모두 유지
-- 변경/개선:
-  1) Python 3.13 문법 오류 수정: 한줄 with 제거 등
-  2) _loss_ratio_on_margin() 추가 → 응급정지 손실률 계산(레버리지 반영)
-  3) side.Upper() 오탈자 → side.upper()
-  4) close_position() 내 pkey 잘못 참조 제거
+- 추가/개선(기존 로직은 건드리지 않음):
+  1) 응급정지: 레버리지 반영 손실률(STOP_PCT) 또는 원시 가격불리폭(STOP_PRICE_MOVE) 중 하나라도 충족 시 컷
+  2) 2단계 청산(스테이징): 첫 트리거에서 30~70% 동적 청산 → 재트리거+MFE 되돌림 기준 충족 시 잔여 전량 종료
+  3) 1차 후 잔여분: 타이트 트레일링(MFE bp) + 브레이크이븐+α 락
+  4) 이전 문법/오탈자 오류 수정(한줄 with 제거 등)
 """
 
 import os
@@ -55,7 +55,8 @@ TP2_PCT = float(os.getenv("TP2_PCT", "0.40"))
 TP3_PCT = float(os.getenv("TP3_PCT", "0.30"))
 TP_EPSILON_RATIO = float(os.getenv("TP_EPSILON_RATIO", "0.0005"))
 
-STOP_PCT = float(os.getenv("STOP_PCT", os.getenv("DEFAULT_STOP_PCT", "0.10")))
+STOP_PCT = float(os.getenv("STOP_PCT", os.getenv("DEFAULT_STOP_PCT", "0.10")))  # 마진손실률 기준(예: 0.10=10%)
+STOP_PRICE_MOVE = float(os.getenv("STOP_PRICE_MOVE", "0.02"))  # 원시가격 불리폭(예: 0.02 = -2%)
 STOP_CHECK_SEC = float(os.getenv("STOP_CHECK_SEC", "1.0"))
 STOP_DEBOUNCE_SEC = float(os.getenv("STOP_DEBOUNCE_SEC", "0.8"))
 
@@ -74,10 +75,45 @@ BE_EPSILON_RATIO = float(os.getenv("BE_EPSILON_RATIO", "0.0005"))
 RECON_INTERVAL_SEC = float(os.getenv("RECON_INTERVAL_SEC", "25"))
 RECON_DEBUG = os.getenv("RECON_DEBUG", "0") == "1"
 
+# === 스테이징(강화판) ===
+PARTIAL_EXIT_ENABLE = os.getenv("PARTIAL_EXIT_ENABLE", "0") == "1"
+PARTIAL_EXIT_REASONS = tuple((os.getenv("PARTIAL_EXIT_REASONS", "trailing_stop,policy_roi,axe")
+                               .replace(" ", "").split(",")))
+PARTIAL_EXIT_DYNAMIC = os.getenv("PARTIAL_EXIT_DYNAMIC", "1") == "1"
+PARTIAL_EXIT_FIRST_MIN = float(os.getenv("PARTIAL_EXIT_FIRST_MIN", "0.30"))
+PARTIAL_EXIT_FIRST_MAX = float(os.getenv("PARTIAL_EXIT_FIRST_MAX", "0.70"))
+PARTIAL_EXIT_GRACE_MINUTES = float(os.getenv("PARTIAL_EXIT_GRACE_MINUTES", "8"))
+PARTIAL_EXIT_RETRIGGER_ADVERSE_BP = float(os.getenv("PARTIAL_EXIT_RETRIGGER_ADVERSE_BP", "25"))
+PARTIAL_EXIT_REARM_SEC = float(os.getenv("PARTIAL_EXIT_REARM_SEC", "90"))
+PARTIAL_EXIT_MIN_SIZE = float(os.getenv("PARTIAL_EXIT_MIN_SIZE", "10"))
+
+TRAIL_AFTER_STAGE_ENABLE = os.getenv("TRAIL_AFTER_STAGE_ENABLE", "1") == "1"
+TRAIL_AFTER_STAGE_MFE_BP = float(os.getenv("TRAIL_AFTER_STAGE_MFE_BP", "15"))
+TRAIL_AFTER_STAGE_STEP_BP = float(os.getenv("TRAIL_AFTER_STAGE_STEP_BP", "7"))
+
+BE_LOCK_AFTER_STAGE = os.getenv("BE_LOCK_AFTER_STAGE", "1") == "1"
+BE_LOCK_EPS_BP = float(os.getenv("BE_LOCK_EPS_BP", "5"))  # entry 대비 5bp
+
+# ROI/h 임계(동적 1차컷 계산용)
+def _roi_th_for_tf(tf: str) -> Optional[float]:
+    tf = (tf or "1h").lower()
+    m = {
+        "1h": os.getenv("ROI_PER_HOUR_THRESHOLD_1H"),
+        "2h": os.getenv("ROI_PER_HOUR_THRESHOLD_2H"),
+        "3h": os.getenv("ROI_PER_HOUR_THRESHOLD_3H"),
+        "4h": os.getenv("ROI_PER_HOUR_THRESHOLD_4H"),
+        "d" : os.getenv("ROI_PER_HOUR_THRESHOLD_D"),
+        "1d": os.getenv("ROI_PER_HOUR_THRESHOLD_D"),
+    }
+    v = m.get(tf)
+    try:
+        return float(v) if v not in (None, "",) else None
+    except:
+        return None
+
 # =======================
 #      Local caches
 # =======================
-# open position 부가메타(진입시간, TF, MFE 등)
 position_data: Dict[str, dict] = {}
 _POS_LOCK = threading.RLock()
 
@@ -107,7 +143,6 @@ def _local_has_any(symbol: str) -> bool:
 #        Utils
 # =======================
 def _pnl_usdt(entry: float, exitp: float, notion: float, side: str) -> float:
-    """대략적 실현손익(USDT). notion은 entry가격*계약수 등 '명목' 금액."""
     if entry <= 0 or notion <= 0:
         return 0.0
     if side == "long":
@@ -123,13 +158,45 @@ def _price_move_pct(entry: float, last: float, side: str) -> float:
     return raw if side == "long" else -raw
 
 def _loss_ratio_on_margin(entry: float, last: float, side: str, leverage: float) -> float:
-    """
-    레버리지 반영 손실률(양수=손실). 예: 5배, -2% → 10%(=0.10).
-    응급정지 기준 STOP_PCT(기본 0.10)과 비교.
-    """
+    """레버리지 반영 손실률(양수=손실). 예: 5배, -2% → 10%(=0.10)."""
     move = _price_move_pct(entry, last, side)  # 이익: +, 손실: -
     loss_on_price = max(0.0, -move)
     return loss_on_price * float(leverage)
+
+def _adverse_from_mfe(side: str, last: float, mfe_price: float) -> float:
+    """MFE 대비 불리한 bp(+가 불리). 롱=피크 대비 하락, 숏=저점 대비 상승."""
+    if mfe_price <= 0 or last <= 0:
+        return 0.0
+    if side == "long":
+        dd = (mfe_price - last) / mfe_price
+    else:
+        dd = (last - mfe_price) / mfe_price
+    return max(0.0, dd) * 10000.0
+
+def _roi_per_hour(entry: float, last: float, ts_entry: float) -> float:
+    if entry <= 0:
+        return 0.0
+    elapsed_h = max(1e-6, (time.time() - float(ts_entry)) / 3600.0)
+    roi = (float(last) - float(entry)) / float(entry)
+    return roi / elapsed_h  # 시간당 ROI
+
+def _dynamic_first_pct(tf: str, entry: float, last: float, ts_entry: float) -> float:
+    """추세 강하면 30~40%, 애매하면 60~70%로 동적 조절."""
+    if not PARTIAL_EXIT_DYNAMIC:
+        return PARTIAL_EXIT_FIRST_MIN
+    th = _roi_th_for_tf(tf) or 0.06  # 기본 6%/h
+    roi_h = _roi_per_hour(entry, last, ts_entry)
+    strength = max(0.0, min(1.0, roi_h / (th * 1.2)))
+    age_h = max(0.0, (time.time() - ts_entry) / 3600.0)
+    dur_weight = max(0.0, min(1.0, age_h / 12.0))
+    w = (strength * 0.7) - (dur_weight * 0.2)
+    w = max(0.0, min(1.0, w))
+    pct = PARTIAL_EXIT_FIRST_MIN + (1.0 - w) * (PARTIAL_EXIT_FIRST_MAX - PARTIAL_EXIT_FIRST_MIN)
+    return max(0.1, min(0.95, pct))
+
+def _is_staged_reason(reason: str) -> bool:
+    r = (reason or "").lower()
+    return any(x for x in PARTIAL_EXIT_REASONS if x and x in r)
 
 # =======================
 #    Capacity guard
@@ -317,7 +384,7 @@ def enter_position(symbol: str, usdt_amount: float, side: str = "long", leverage
             if not last or last <= 0:
                 if TRACE_LOG:
                     send_telegram(f"❗ ticker_fail {symbol} trace={trace}")
-                return  # 리컨실러가 재시도
+                return
 
             resp = place_market_order(
                 symbol,
@@ -335,7 +402,9 @@ def enter_position(symbol: str, usdt_amount: float, side: str = "long", leverage
                     position_data[key] = {
                         "symbol": symbol, "side": side, "entry_usd": usdt_amount,
                         "ts": time.time(), "entry_ts": time.time(),
-                        "tf": "1h", "mfe_price": float(last), "mfe_ts": time.time()
+                        "tf": "1h", "mfe_price": float(last), "mfe_ts": time.time(),
+                        # 2단계 청산 메타
+                        "stage_exit": 0, "stage_ts": 0.0, "trail_after_stage": 0,
                     }
                 send_telegram(f"✅ OPEN {side.upper()} {symbol} amt≈{usdt_amount} lev={lev} last≈{last}")
                 _mark_done("entry", pkey)
@@ -409,7 +478,6 @@ def close_position(symbol: str, side: str = "long", reason: str = "manual"):
 
         if success or ok:
             entry = float(p.get("entry_price", 0))
-            # notion: entry * size (rough)
             realized = _pnl_usdt(entry, float(exit_price), entry * size, side)
             with _POS_LOCK:
                 position_data.pop(key, None)
@@ -434,7 +502,7 @@ def reduce_by_contracts(symbol: str, contracts: float, side: str = "long"):
             return
         resp = place_reduce_by_size(symbol, qty, side)
         if str(resp.get("code", "")) == "00000":
-            send_telegram(f"🔻 Reduce {qty} {side.upper()} {symbol}")
+            send_telegram(f"🔻 Reduce {qty} {side.UPPER()} {symbol}")
 
 # =======================
 #        Watchdogs
@@ -449,8 +517,87 @@ def _should_fire_stop(key: str) -> bool:
     _STOP_FIRE_TS[key] = now
     return True
 
+def _staged_exit(symbol: str, side: str, reason: str) -> bool:
+    """
+    True → 1차 컷만 수행(전체 close는 하지 않음)
+    False → 스킵 또는 2차까지(전량 종료) 완료
+    """
+    if not PARTIAL_EXIT_ENABLE:
+        return False
+
+    key = _key(symbol, side)
+    p = _get_remote(symbol, side)
+    if not p or float(p.get("size", 0)) <= 0:
+        return False
+
+    entry = float(p.get("entry_price") or 0.0)
+    size  = float(p.get("size") or 0.0)
+    last  = float(get_last_price(symbol) or 0.0)
+    if entry <= 0 or size <= 0 or last <= 0:
+        return False
+
+    with _POS_LOCK:
+        meta = position_data.get(key, {}) or {}
+        stage = int(meta.get("stage_exit") or 0)
+        ts_entry = float(meta.get("entry_ts") or time.time())
+        tf = (meta.get("tf") or "1h").lower()
+        mfe_price = float(meta.get("mfe_price") or last)
+        last_stage_ts = float(meta.get("stage_ts") or 0.0)
+
+    # 진입 직후 그레이스 기간: 너무 빨리 잘라내지 않음
+    if (time.time() - ts_entry) < PARTIAL_EXIT_GRACE_MINUTES * 60.0:
+        return False
+
+    # 1차: 첫 트리거 시 동적 비율로 컷
+    if stage == 0 and _is_staged_reason(reason):
+        first_pct = _dynamic_first_pct(tf, entry, last, ts_entry)
+        if size < PARTIAL_EXIT_MIN_SIZE:
+            return False
+        take_partial_profit(symbol, first_pct, side=side)
+        with _POS_LOCK:
+            meta["stage_exit"] = 1
+            meta["stage_ts"] = time.time()
+            meta["trail_after_stage"] = 1 if TRAIL_AFTER_STAGE_ENABLE else 0
+            position_data[key] = meta
+
+        # 1차 직후 잔여분 보호(브레이크이븐+α)
+        if BE_LOCK_AFTER_STAGE:
+            be_eps = max(entry * (BE_LOCK_EPS_BP/10000.0), entry * 1e-5)
+            meta_be = position_data.get(key, {}) or {}
+            meta_be["be_armed"] = True
+            meta_be["be_entry"] = entry + be_eps if side == "long" else entry - be_eps
+            with _POS_LOCK:
+                position_data[key] = meta_be
+
+        try:
+            send_telegram(f"✂️ STAGED EXIT-1 {side.upper()} {symbol} "
+                          f"{int(first_pct*100)}% [{reason}]")
+        except Exception:
+            pass
+        return True
+
+    # 2차(전량 종료): 재무장 경과 + MFE 기준 되돌림
+    if stage == 1:
+        if time.time() - last_stage_ts < PARTIAL_EXIT_REARM_SEC:
+            return True  # 아직 재무장 전
+        adverse_bp = _adverse_from_mfe(side, last, mfe_price)
+        if _is_staged_reason(reason) and adverse_bp >= PARTIAL_EXIT_RETRIGGER_ADVERSE_BP:
+            try:
+                send_telegram(f"✂️ STAGED EXIT-2 {side.upper()} {symbol} 100% "
+                              f"[{reason}, adverse≈{adverse_bp:.0f}bp]")
+            except Exception:
+                pass
+            close_position(symbol, side=side, reason=f"staged_{reason}")
+            with _POS_LOCK:
+                meta["stage_exit"] = 2
+                position_data[key] = meta
+            return False
+        return True
+
+    return False
+
 def _watchdog_loop():
-    """응급정지(+MFE 업데이트)"""
+    """MFE 업데이트 + 응급정지 + (스테이징 잔여분) 트레일링"""
     while True:
         try:
             for p in get_open_positions():
@@ -464,6 +611,7 @@ def _watchdog_loop():
                 last = get_last_price(symbol)
                 if not last:
                     continue
+                last = float(last)
 
                 # MFE 갱신
                 try:
@@ -479,14 +627,35 @@ def _watchdog_loop():
                 except Exception:
                     pass
 
-                # 응급정지(레버리지 반영 손실률)
-                loss_ratio = _loss_ratio_on_margin(entry, float(last), side, leverage=LEVERAGE)
-                if loss_ratio >= STOP_PCT:
+                # 잔여분 타이트 트레일링(옵션)
+                try:
+                    k = _key(symbol, side)
+                    with _POS_LOCK:
+                        meta = position_data.get(k, {}) or {}
+                        trail_armed = int(meta.get("trail_after_stage") or 0)
+                        mfe_price = float(meta.get("mfe_price") or last)
+                    if trail_armed and TRAIL_AFTER_STAGE_ENABLE:
+                        adverse_bp = _adverse_from_mfe(side, last, mfe_price)
+                        if adverse_bp >= TRAIL_AFTER_STAGE_MFE_BP:
+                            try:
+                                send_telegram(f"✂️ AUTO CLOSE {side.upper()} {symbol} "
+                                              f"[trailing_after_stage, adverse≈{adverse_bp:.0f}bp]")
+                            except Exception:
+                                pass
+                            close_position(symbol, side=side, reason="trailing_after_stage")
+                except Exception as _e:
+                    print("trail-after-stage error:", _e)
+
+                # 응급정지(둘 중 하나라도 충족)
+                loss_ratio = _loss_ratio_on_margin(entry, last, side, leverage=LEVERAGE)
+                price_loss = max(0.0, -_price_move_pct(entry, last, side))
+                if (loss_ratio >= STOP_PCT) or (price_loss >= STOP_PRICE_MOVE):
                     k = _key(symbol, side)
                     if _should_fire_stop(k):
                         send_telegram(
                             f"⛔ {symbol} {side.upper()} emergencyStop "
-                            f"loss≈-{loss_ratio*100:.1f}% (th={STOP_PCT*100:.0f}%)"
+                            f"loss≈-{loss_ratio*100:.1f}% / price≈-{price_loss*100:.1f}% "
+                            f"(th={STOP_PCT*100:.0f}% or {STOP_PRICE_MOVE*100:.0f}%)"
                         )
                         close_position(symbol, side=side, reason="emergencyStop")
         except Exception as e:
@@ -593,6 +762,14 @@ def _curation_loop():
                     )
 
                 if action == "close":
+                    # 2단계 스테이징 훅
+                    try:
+                        staged_only = _staged_exit(symbol, side, reason)
+                        if staged_only:
+                            continue  # 1차 컷만 했고 전체 종료는 보류
+                    except Exception as _e:
+                        print("staged exit error:", _e)
+
                     try:
                         send_telegram(f"✂️ AUTO CLOSE {side.upper()} {symbol} [{reason}]")
                     except Exception:
@@ -688,7 +865,8 @@ def _reconciler_loop():
                                     "symbol": sym, "side": side, "entry_usd": amt,
                                     "ts": time.time(), "entry_ts": time.time(),
                                     "tf": "1h", "mfe_price": float(get_last_price(sym) or 0.0),
-                                    "mfe_ts": time.time()
+                                    "mfe_ts": time.time(),
+                                    "stage_exit": 0, "stage_ts": 0.0, "trail_after_stage": 0,
                                 }
                             send_telegram(f"✅ RETRY OPEN {side.upper()} {sym} amt≈{amt}")
                             _mark_done("entry", pkey)
@@ -759,6 +937,8 @@ def _reconciler_loop():
 
         except Exception as e:
             print("reconciler error:", e)
+
+        time.sleep(RECON_INTERVAL_SEC)
 
 # =======================
 #        Starters
