@@ -25,12 +25,12 @@ def _f(k, d=None, cast=float):
     except: return d
 
 # === ENV ===
-RISK_BUDGET_PCT       = _f("RISK_BUDGET_PCT", 1.2)       # 계좌 대비 총 위험 허용 %
-RISK_BUDGET_LONG_PCT  = _f("RISK_BUDGET_LONG_PCT", None) # (선택) 롱 상한
-RISK_BUDGET_SHORT_PCT = _f("RISK_BUDGET_SHORT_PCT", None)# (선택) 숏 상한
+RISK_BUDGET_PCT       = _f("RISK_BUDGET_PCT", 60.0)      # 총 위험 허용(%) — 기본 넉넉히
+RISK_BUDGET_LONG_PCT  = _f("RISK_BUDGET_LONG_PCT", None) # (선택) 롱 상한 — 비우면 해제
+RISK_BUDGET_SHORT_PCT = _f("RISK_BUDGET_SHORT_PCT", None)# (선택) 숏 상한 — 비우면 해제
 HEDGE_CREDIT_FACTOR   = _f("HEDGE_CREDIT_FACTOR", 0.50)  # 롱/숏 상쇄 인정(0~1)
 DEFAULT_STOP_PCT      = _f("DEFAULT_STOP_PCT", 0.10)     # 청산가 없을 때 위험 가정
-ACCOUNT_EQUITY_FALLBACK = _f("ACCOUNT_EQUITY", 10000.0)  # API 실패시 폴백
+ACCOUNT_EQUITY_FALLBACK = _f("ACCOUNT_EQUITY", 4000.0)   # API 실패시 폴백(네 시드)
 
 def _current_equity() -> float:
     # 1) 선호: 전계좌 자본 API
