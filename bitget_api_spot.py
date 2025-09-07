@@ -1,5 +1,5 @@
 # bitget_api_spot.py
-import os, time, json, hmac, hashlib, base64, requests, math
+import os, time, json, hmac, hashlib, base64, requests, math, re
 from typing import Dict, Optional
 
 BASE_URL = "https://api.bitget.com"
@@ -7,6 +7,9 @@ BASE_URL = "https://api.bitget.com"
 API_KEY        = os.getenv("BITGET_API_KEY", "")
 API_SECRET     = os.getenv("BITGET_API_SECRET", "")
 API_PASSPHRASE = os.getenv("BITGET_API_PASSWORD", "")
+
+# 심볼 제거(폐지/일시중단) 블록 유지 시간(초) - 기본 12시간
+REMOVED_BLOCK_TTL = int(os.getenv("REMOVED_BLOCK_TTL", "43200"))
 
 # ---------- rate limit ----------
 _last_call: Dict[str, float] = {}
@@ -57,6 +60,23 @@ def _spot_symbol(sym: str) -> str:
     base = convert_symbol(sym)
     return base if base.endswith("_SPBL") else f"{base}_SPBL"  # e.g., BTCUSDT_SPBL
 
+# ---------- removed symbol cache ----------
+_REMOVED: Dict[str, float] = {}  # key: base(symbol without _SPBL), value: until_ts
+
+def mark_symbol_removed(symbol: str):
+    base = convert_symbol(symbol)
+    _REMOVED[base] = time.time() + REMOVED_BLOCK_TTL
+
+def is_symbol_removed(symbol: str) -> bool:
+    base = convert_symbol(symbol)
+    until = _REMOVED.get(base, 0.0)
+    if until <= 0:
+        return False
+    if time.time() > until:
+        _REMOVED.pop(base, None)
+        return False
+    return True
+
 # ---------- spec cache ----------
 _PROD_CACHE = {"ts": 0.0, "data": {}}
 
@@ -69,18 +89,27 @@ def _refresh_products_cache():
         arr = j.get("data") or []
         m = {}
         for it in arr:
-            sym_raw = (it.get("symbol") or "").upper()  # may be DOGEUSDT or DOGEUSDT_SPBL
+            sym_raw = (it.get("symbol") or "").upper()  # DOGEUSDT or DOGEUSDT_SPBL
             if not sym_raw:
                 continue
             qty_prec   = int(it.get("quantityPrecision") or 6)
             price_prec = int(it.get("pricePrecision") or 6)
-            min_amt    = float(it.get("minTradeAmount") or 0.0)  # min quote(USDT)
+            min_amt    = float(it.get("minTradeAmount") or 0.0)  # quote 최소 USDT
+            # 일부 리전은 status, symbolStatus, online 등으로 표기 다름
+            status = (it.get("status") or it.get("symbolStatus") or it.get("online") or "").lower()
+            tradable = True
+            if isinstance(status, str) and status:
+                tradable = status in ("online", "enable", "enabled", "true", "tradable")
+            elif isinstance(status, bool):
+                tradable = bool(status)
+
             spec = {
                 "qtyStep": 10 ** (-qty_prec),
                 "priceStep": 10 ** (-price_prec),
                 "minQuote": min_amt,
+                "tradable": tradable,
             }
-            # 여러 키로 저장해서 키 미스매치 방지
+            # 키 폭넓게 저장
             m[sym_raw] = spec
             base_key = sym_raw[:-5] if sym_raw.endswith("_SPBL") else sym_raw
             m[base_key] = spec
@@ -99,9 +128,15 @@ def get_symbol_spec_spot(symbol: str) -> Dict[str, float]:
     key2 = base
     spec = _PROD_CACHE["data"].get(key1) or _PROD_CACHE["data"].get(key2)
     if not spec:
-        spec = {"qtyStep": 0.000001, "priceStep": 0.000001, "minQuote": 5.0}
+        spec = {"qtyStep": 0.000001, "priceStep": 0.000001, "minQuote": 5.0, "tradable": True}
         _PROD_CACHE["data"][key1] = spec
     return spec
+
+def is_tradable(symbol: str) -> bool:
+    if is_symbol_removed(symbol):
+        return False
+    spec = get_symbol_spec_spot(symbol)
+    return bool(spec.get("tradable", True))
 
 def round_down_step(x: float, step: float) -> float:
     if step <= 0:
@@ -215,10 +250,26 @@ def get_spot_free_qty(symbol: str, fresh: bool = False) -> float:
     return float(m.get(base, 0.0))
 
 # ---------- orders ----------
+def _extract_code_text(resp_text: str) -> Dict[str, str]:
+    # Bitget 에러 본문에서 code/msg 추출 시도
+    try:
+        j = json.loads(resp_text)
+        if isinstance(j, dict):
+            return {"code": str(j.get("code", "")), "msg": str(j.get("msg", ""))}
+    except Exception:
+        pass
+    m = re.search(r'"code"\s*:\s*"?(?P<code>\d+)"?', resp_text or "")
+    n = re.search(r'"msg"\s*:\s*"(?P<msg>[^"]+)"', resp_text or "")
+    return {"code": m.group("code") if m else "", "msg": n.group("msg") if n else ""}
+
 def place_spot_market_buy(symbol: str, usdt_amount: float) -> Dict:
     """
     Market-Buy: Bitget는 size/quantity를 'quote 금액(USDT)'로 해석
     """
+    if not is_tradable(symbol):
+        mark_symbol_removed(symbol)
+        return {"code": "LOCAL_SYMBOL_REMOVED", "msg": "symbol not tradable/removed"}
+
     spec = get_symbol_spec_spot(symbol)
     min_quote = float(spec.get("minQuote", 5.0))
     if usdt_amount < min_quote:
@@ -231,13 +282,16 @@ def place_spot_market_buy(symbol: str, usdt_amount: float) -> Dict:
         "side": "buy",
         "orderType": "market",
         "force": "gtc",
-        "quantity": amt_str   # market-buy expects quote amount
+        "quantity": amt_str
     }
     bj = json.dumps(body)
     try:
         _rl("spot_order", 0.12)
         res = requests.post(BASE_URL + path, headers=_headers("POST", path, bj), data=bj, timeout=15)
         if res.status_code != 200:
+            info = _extract_code_text(res.text or "")
+            if info.get("code") == "40309" or "symbol has been removed" in (info.get("msg","").lower()):
+                mark_symbol_removed(symbol)
             return {"code": f"HTTP_{res.status_code}", "msg": res.text}
         return res.json()
     except Exception as e:
@@ -248,10 +302,13 @@ def place_spot_market_sell_qty(symbol: str, qty: float) -> Dict:
     Market-Sell: base 수량으로 전송.
     40808(Parameter verification ... checkScale=*)가 오면 그 자리수로 잘라 '자동 재시도' 후 결과 반환.
     """
-    import re
     qty = float(qty)
     if qty <= 0:
         return {"code": "LOCAL_BAD_QTY", "msg": "qty<=0"}
+
+    if not is_tradable(symbol):
+        mark_symbol_removed(symbol)
+        return {"code": "LOCAL_SYMBOL_REMOVED", "msg": "symbol not tradable/removed"}
 
     spec = get_symbol_spec_spot(symbol)
     step = float(spec.get("qtyStep", 1e-6))
@@ -285,16 +342,20 @@ def place_spot_market_sell_qty(symbol: str, qty: float) -> Dict:
         if res.status_code == 200:
             return res.json()
 
-        # 2차: HTTP 400 + checkScale(or checkBDScale) 있으면 그 자리수로 재시도
         txt = res.text or ""
+        info = _extract_code_text(txt)
+        if info.get("code") == "40309" or "symbol has been removed" in (info.get("msg","").lower()):
+            mark_symbol_removed(symbol)
+            return {"code": f"HTTP_{res.status_code}", "msg": txt}
+
+        # 2차: 400 + checkScale → 자리수 보정 재시도
         m = re.search(r"(?:checkBDScale|checkScale)[\"']?\s*[:=]\s*([0-9]+)", txt)
         if res.status_code == 400 and m:
-            chk = int(m.group(1))           # 예: 4
-            step2 = 10 ** (-chk)            # 0.0001
+            chk = int(m.group(1))
+            step2 = 10 ** (-chk)
             qty_str2 = _fmt(qty, step2)
             body2 = dict(body, quantity=qty_str2)
             bj2 = json.dumps(body2)
-            # (옵션) 디버깅 로그
             try:
                 from telegram_bot import send_telegram
                 send_telegram(f"[SPOT] retry sell {symbol} scale-> {chk} qty={qty_str2}")
