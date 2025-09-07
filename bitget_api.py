@@ -247,72 +247,7 @@ def get_last_price(symbol: str, retries: int = 6, base: float = 0.20) -> Optiona
     return None
 
 # ──────────────────────────────────────────────────────────────
-# Orders
-# ──────────────────────────────────────────────────────────────
-def place_market_order(symbol: str, usdt_amount: float, side: str, leverage: float = 5, reduce_only: bool = False) -> Dict:
-    last = get_last_price(symbol)
-    if not last: return {"code": "LOCAL_TICKER_FAIL", "msg": "ticker_none"}
-    spec = get_symbol_spec(symbol)
-    qty  = round_down_step(usdt_amount / last, float(spec.get("sizeStep", 0.001)))
-    if qty <= 0: return {"code": "LOCAL_BAD_QTY", "msg": f"qty {qty}"}
-    if qty < float(spec.get("minQty", 0.0)):
-        need = float(spec.get("minQty")) * last
-        return {"code": "LOCAL_MIN_QTY", "msg": f"need≈{need:.6f}USDT", "qty": qty}
-
-    path = "/api/mix/v1/order/placeOrder"
-    body = {
-        "symbol":     _mix_symbol(symbol),
-        "marginCoin": "USDT",
-        "size":       str(qty),
-        "side":       "buy_single" if side == "buy" else "sell_single",
-        "orderType":  "market",
-        "leverage":   str(leverage),
-        "reduceOnly": bool(reduce_only),
-        "clientOid":  f"cli-{int(time.time()*1000)}"
-    }
-    bj = json.dumps(body)
-    try:
-        _rl("order", 0.12)
-        res = requests.post(BASE_URL + path, headers=_headers("POST", path, bj), data=bj, timeout=15)
-        if res.status_code != 200:
-            print("❌ order HTTP", res.status_code, res.text[:200])
-            return {"code": f"HTTP_{res.status_code}", "msg": res.text}
-        return res.json()
-    except Exception as e:
-        print("❌ order EXC", str(e))
-        return {"code": "LOCAL_EXCEPTION", "msg": str(e)}
-
-def place_reduce_by_size(symbol: str, size: float, side: str) -> Dict:
-    size = float(size)
-    if size <= 0: return {"code": "LOCAL_BAD_QTY", "msg": "size<=0"}
-    step = float(get_symbol_spec(symbol).get("sizeStep", 0.001))
-    size = round_down_step(size, step)
-    if size <= 0: return {"code": "LOCAL_STEP_ZERO", "msg": "after_step=0"}
-
-    path = "/api/mix/v1/order/placeOrder"
-    body = {
-        "symbol":     _mix_symbol(symbol),
-        "marginCoin": "USDT",
-        "size":       str(size),
-        "side":       "sell_single" if side.lower() == "long" else "buy_single",
-        "orderType":  "market",
-        "reduceOnly": True,
-        "clientOid":  f"cli-red-{int(time.time()*1000)}"
-    }
-    bj = json.dumps(body)
-    try:
-        _rl("order", 0.12)
-        res = requests.post(BASE_URL + path, headers=_headers("POST", path, bj), data=bj, timeout=15)
-        if res.status_code != 200:
-            print("❌ reduce HTTP", res.status_code, res.text[:200])
-            return {"code": f"HTTP_{res.status_code}", "msg": res.text}
-        return res.json()
-    except Exception as e:
-        print("❌ reduce EXC", str(e))
-        return {"code": "LOCAL_EXCEPTION", "msg": str(e)}
-
-# ──────────────────────────────────────────────────────────────
-# Positions
+# Positions helpers (NEW)
 # ──────────────────────────────────────────────────────────────
 _POS_CACHE = {"data": [], "ts": 0.0, "cooldown_until": 0.0}
 def _ffloat(x):
@@ -364,6 +299,108 @@ def get_open_positions() -> List[Dict]:
         _POS_CACHE["cooldown_until"] = now + 90
         print("⚠️ position 새 조회 실패 → 캐시 반환(90s 쿨다운)")
     return _POS_CACHE["data"]
+
+def get_position_size(symbol: str, side: str) -> float:
+    """현재 보유 수량(long/short) 반환. 없으면 0."""
+    sym = convert_symbol(symbol)
+    side = side.lower()
+    for p in get_open_positions():
+        if p.get("symbol") == sym and p.get("side") == side:
+            try:
+                return float(p.get("size") or 0.0)
+            except:
+                return 0.0
+    return 0.0
+
+# ──────────────────────────────────────────────────────────────
+# Orders
+# ──────────────────────────────────────────────────────────────
+def place_market_order(symbol: str, usdt_amount: float, side: str, leverage: float = 5, reduce_only: bool = False) -> Dict:
+    last = get_last_price(symbol)
+    if not last: return {"code": "LOCAL_TICKER_FAIL", "msg": "ticker_none"}
+    spec = get_symbol_spec(symbol)
+    qty  = round_down_step(usdt_amount / last, float(spec.get("sizeStep", 0.001)))
+    if qty <= 0: return {"code": "LOCAL_BAD_QTY", "msg": f"qty {qty}"}
+    if qty < float(spec.get("minQty", 0.0)):
+        need = float(spec.get("minQty")) * last
+        return {"code": "LOCAL_MIN_QTY", "msg": f"need≈{need:.6f}USDT", "qty": qty}
+
+    path = "/api/mix/v1/order/placeOrder"
+    body = {
+        "symbol":     _mix_symbol(symbol),
+        "marginCoin": "USDT",
+        "size":       str(qty),
+        "side":       "buy_single" if side == "buy" else "sell_single",
+        "orderType":  "market",
+        "leverage":   str(leverage),
+        "reduceOnly": bool(reduce_only),
+        "clientOid":  f"cli-{int(time.time()*1000)}"
+    }
+    bj = json.dumps(body)
+    try:
+        _rl("order", 0.12)
+        res = requests.post(BASE_URL + path, headers=_headers("POST", path, bj), data=bj, timeout=15)
+        if res.status_code != 200:
+            print("❌ order HTTP", res.status_code, res.text[:200])
+            return {"code": f"HTTP_{res.status_code}", "msg": res.text}
+        return res.json()
+    except Exception as e:
+        print("❌ order EXC", str(e))
+        return {"code": "LOCAL_EXCEPTION", "msg": str(e)}
+
+def place_reduce_by_size(symbol: str, size: float, side: str) -> Dict:
+    """
+    reduceOnly 마켓주문. 요청 사이즈를 현재 보유 사이즈와 스텝/최소수량에 맞춰 자동 클램핑.
+    side: "long"을 줄이면 sell_single, "short"를 줄이면 buy_single
+    """
+    # 1) 현재 보유 수량 점검 & 클램핑 (NEW)
+    held = get_position_size(symbol, side)
+    if held <= 0:
+        return {"code": "LOCAL_NO_POSITION", "msg": "held=0"}
+
+    step = float(get_symbol_spec(symbol).get("sizeStep", 0.001))
+    minq = float(get_symbol_spec(symbol).get("minQty", 0.0))
+
+    size_req = max(0.0, float(size))
+    size_req = min(size_req, held)                        # 보유 수량 초과 방지
+    size_req = round_down_step(size_req, step)            # 스텝 반올림
+    if size_req < max(minq, step):
+        return {"code": "LOCAL_STEP_ZERO", "msg": f"after_clamp={size_req}"}
+
+    path = "/api/mix/v1/order/placeOrder"
+    body = {
+        "symbol":     _mix_symbol(symbol),
+        "marginCoin": "USDT",
+        "size":       str(size_req),
+        "side":       "sell_single" if side.lower() == "long" else "buy_single",
+        "orderType":  "market",
+        "reduceOnly": True,
+        "clientOid":  f"cli-red-{int(time.time()*1000)}"
+    }
+    bj = json.dumps(body)
+    try:
+        _rl("order", 0.12)
+        res = requests.post(BASE_URL + path, headers=_headers("POST", path, bj), data=bj, timeout=15)
+        if res.status_code != 200:
+            # 40804 방지 로직을 넣었지만, 혹시 겹치면 여기서도 방어
+            if "40804" in res.text:
+                return {"code": "LOCAL_CLAMPED_40804", "msg": "exceed_held_blocked"}
+            return {"code": f"HTTP_{res.status_code}", "msg": res.text}
+        return res.json()
+    except Exception as e:
+        print("❌ reduce EXC", str(e))
+        return {"code": "LOCAL_EXCEPTION", "msg": str(e)}
+
+def reduce_by_ratio(symbol: str, side: str, ratio: float) -> Dict:
+    """
+    현재 보유 수량의 비율만큼 안전 감축(중복 안전).
+    ratio=0.5 → 50% 감축
+    """
+    held = get_position_size(symbol, side)
+    if held <= 0:
+        return {"code": "LOCAL_NO_POSITION", "msg": "held=0"}
+    size = max(0.0, held * float(ratio))
+    return place_reduce_by_size(symbol, size, side)
 
 # ──────────────────────────────────────────────────────────────
 # 계좌/마진/잔고 조회
