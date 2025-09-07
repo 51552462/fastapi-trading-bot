@@ -24,8 +24,7 @@ TRACE_LOG = os.getenv("TRACE_LOG", "0") == "1"
 TP1_PCT = float(os.getenv("TP1_PCT", "0.30"))
 TP2_PCT = float(os.getenv("TP2_PCT", "0.40"))
 TP3_PCT = float(os.getenv("TP3_PCT", "0.30"))
-SL1_PCT = float(os.getenv("SL1_PCT", "0.50"))
-SL2_PCT = float(os.getenv("SL2_PCT", "1.00"))
+# SL은 main에서 sl1/sl2 모두 전량 종료로 라우팅
 
 MAX_OPEN_COINS = int(os.getenv("MAX_OPEN_COINS", "60"))
 CAP_CHECK_SEC  = float(os.getenv("CAP_CHECK_SEC", "10"))
@@ -116,6 +115,9 @@ def enter_spot(symbol: str, usdt_amount: float):
         free_after = _refresh_free_qty(symbol)
         _cache_qty(symbol, free_after)
         send_telegram(f"[SPOT] BUY {symbol} approx {usdt_amount} USDT (qty~{free_after})")
+    elif code in ("LOCAL_SYMBOL_REMOVED",):
+        send_telegram(f"[SPOT] BUY skip (removed) {symbol}")
+        _clear_cache(symbol)
     else:
         send_telegram(f"[SPOT] BUY fail {symbol} -> {resp}")
 
@@ -138,10 +140,14 @@ def _sell_pct(symbol: str, pct: float, tag: str):
         return
 
     resp = place_spot_market_sell_qty(symbol, qty)
-    if str(resp.get("code", "")) in ("00000", "0"):
+    code = str(resp.get("code", ""))
+    if code in ("00000", "0"):
         remaining = max(0.0, cached - qty) if cached > 0 else max(0.0, free - qty)
         _cache_qty(symbol, remaining)
         send_telegram(f"[SPOT] {tag} {symbol} qty~{qty} ({int(pct*100)}%)")
+    elif code in ("LOCAL_SYMBOL_REMOVED",):
+        send_telegram(f"[SPOT] {tag} skip (removed) {symbol}")
+        _clear_cache(symbol)
     else:
         send_telegram(f"[SPOT] {tag} fail {symbol} -> {resp}")
 
@@ -151,8 +157,6 @@ def take_partial_spot(symbol: str, pct: float):
 
 
 def stop_partial_spot(symbol: str, pct: float):
-    """손절 신호용 부분 청산 (SL1/SL2)"""
-    # SL2_PCT=1.0이면 전량 청산과 동일
     _sell_pct(symbol, pct, tag="STOP")
 
 
@@ -169,8 +173,12 @@ def close_spot(symbol: str, reason: str = "manual"):
         return
 
     resp = place_spot_market_sell_qty(symbol, base_qty)
-    if str(resp.get("code", "")) in ("00000", "0"):
+    code = str(resp.get("code", ""))
+    if code in ("00000", "0"):
         _clear_cache(symbol)
         send_telegram(f"[SPOT] CLOSE {symbol} ({reason})")
+    elif code in ("LOCAL_SYMBOL_REMOVED",):
+        _clear_cache(symbol)
+        send_telegram(f"[SPOT] CLOSE skip (removed) {symbol} ({reason})")
     else:
         send_telegram(f"[SPOT] CLOSE fail {symbol} -> {resp}")
