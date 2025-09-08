@@ -1,4 +1,10 @@
-# trader.py — 체결/감시/부분익절/종료 알림 강화, -10% ROE 컷 + TP 후 본절 종료
+# trader.py — 체결/감시/부분익절/종료 알림 강화
+# - reduce_by_contracts 복구
+# - 레버리지 반영 ROE -10% 즉시 손절 (STOP_ROE, 기본 0.10)
+# - TP1/TP2 이후 본절(BE) 도달 시 즉시 전체 종료
+# - 종료/TP/스킵 등 텔레그램 문구 복구
+# - 용량가드(capacity guard) 유지
+
 import os, time, threading
 from typing import Dict, Any, Optional
 
@@ -7,11 +13,11 @@ from bitget_api import (
     place_market_order, place_reduce_by_size, get_symbol_spec, round_down_step,
 )
 
-# 텔레그램(없으면 프린트로 대체)
 try:
     from telegram_bot import send_telegram
 except Exception:
-    def send_telegram(msg: str): print("[TG]", msg)
+    def send_telegram(msg: str):
+        print("[TG]", msg)
 
 # ========= ENV =========
 DEFAULT_AMOUNT = float(os.getenv("DEFAULT_AMOUNT", "80"))
@@ -84,7 +90,6 @@ def _update_local_state_from_exchange():
     """거래소 포지션을 읽어 로컬상태(entry/size)를 대략 동기화."""
     opens = get_open_positions()
     with _POS_LOCK:
-        # 마크 비워주기
         seen = set()
         for p in opens:
             sym = convert_symbol(p.get("symbol") or "")
@@ -96,36 +101,56 @@ def _update_local_state_from_exchange():
             d = position_data.setdefault(k, {})
             d["size"]  = float(p.get("size") or 0.0)
             d["entry"] = float(p.get("entryPrice") or 0.0)
-            # 소멸 조건
             if d["size"] <= 0:
                 position_data.pop(k, None)
-        # 더 이상 거래소에 없는 포지션은 정리
         for k in list(position_data.keys()):
             if k not in seen and position_data.get(k,{}).get("size",0) <= 0:
                 position_data.pop(k, None)
 
 # ========= CAPACITY GUARD =========
-def _capacity_loop():
+def _count_positions():
+    opens = get_open_positions()
+    long_c = sum(1 for p in opens if _norm_side(p.get("side"))=="long" and float(p.get("size") or 0)>0)
+    short_c= sum(1 for p in opens if _norm_side(p.get("side"))=="short"and float(p.get("size") or 0)>0)
+    return long_c, short_c
+
+def _cap_guard_tick():
+    try:
+        long_c, short_c = _count_positions()
+        with _CAP_LOCK:
+            _CAPACITY["last_count"] = long_c + short_c
+            _CAPACITY["long_count"] = long_c
+            _CAPACITY["short_count"]= short_c
+            _CAPACITY["blocked"] = (_CAPACITY["last_count"] >= MAX_OPEN_POSITIONS)
+            _CAPACITY["long_blocked"]  = (not LONG_BYPASS_CAP)  and _CAPACITY["blocked"]
+            _CAPACITY["short_blocked"] = (not SHORT_BYPASS_CAP) and _CAPACITY["blocked"]
+    except Exception as e:
+        print("capacity err:", e)
+
+def _cap_guard_loop():
     while True:
-        try:
-            opens = get_open_positions()
-            long_c = sum(1 for p in opens if _norm_side(p.get("side"))=="long" and float(p.get("size") or 0)>0)
-            short_c= sum(1 for p in opens if _norm_side(p.get("side"))=="short"and float(p.get("size") or 0)>0)
-            with _CAP_LOCK:
-                _CAPACITY["last_count"] = long_c + short_c
-                _CAPACITY["long_count"] = long_c
-                _CAPACITY["short_count"]= short_c
-                _CAPACITY["blocked"] = (_CAPACITY["last_count"] >= MAX_OPEN_POSITIONS)
-                _CAPACITY["long_blocked"]  = (not LONG_BYPASS_CAP)  and _CAPACITY["blocked"]
-                _CAPACITY["short_blocked"] = (not SHORT_BYPASS_CAP) and _CAPACITY["blocked"]
-        except Exception as e:
-            print("capacity err:", e)
+        _cap_guard_tick()
         time.sleep(CAP_CHECK_SEC)
 
 def start_capacity_guard():
-    threading.Thread(target=_capacity_loop, name="capacity-guard", daemon=True).start()
+    threading.Thread(target=_cap_guard_loop, name="capacity-guard", daemon=True).start()
 
 # ========= TRADING OPS =========
+def _set_local(symbol, side, size, entry):
+    with _POS_LOCK:
+        d = position_data.setdefault(_key(symbol, side), {})
+        d["size"]  = float(size or 0.0)
+        d["entry"] = float(entry or 0.0)
+
+def _rm_local(symbol, side):
+    with _POS_LOCK:
+        position_data.pop(_key(symbol, side), None)
+
+def _upd_local_qty(symbol, side, new_size):
+    with _POS_LOCK:
+        d = position_data.setdefault(_key(symbol, side), {})
+        d["size"] = float(new_size or 0.0)
+
 def enter_position(symbol: str, side: str = "long", usdt_amount: Optional[float] = None,
                    leverage: Optional[float] = None, timeframe: Optional[str] = None):
     symbol = convert_symbol(symbol)
@@ -165,7 +190,7 @@ def reduce_by_contracts(symbol: str, contracts: float, side: str):
     resp = place_reduce_by_size(symbol, qty, side)
     code = str(resp.get("code",""))
     if code != "00000":
-        send_telegram(f"❌ REDUCE {side.upper()} {symbol} {qty} fail: {resp}")
+        send_telegram(f"❌ REDUCE {side.UPPER()} {symbol} {qty} fail: {resp}")
         return {"ok": False, "resp": resp}
     send_telegram(f"✂️ REDUCE {side.upper()} {symbol} {qty}")
     _update_local_state_from_exchange()
@@ -207,7 +232,6 @@ def take_partial_profit(symbol: str, ratio: float, side: str = "long", reason: s
             d["tp1_done"] = True
         elif abs(ratio - TP2_PCT) < 1e-6 or (d.get("tp1_done") and ratio <= (TP1_PCT+TP2_PCT+1e-6)):
             d["tp2_done"] = True
-        # TP1 or TP2가 찍혔다면 본절(BE) 오면 즉시 종료
         if d.get("tp1_done") or d.get("tp2_done"):
             d["be_armed"] = True
     _update_local_state_from_exchange()
@@ -215,7 +239,6 @@ def take_partial_profit(symbol: str, ratio: float, side: str = "long", reason: s
 
 def close_position(symbol: str, side: str = "long", reason: str = "manual"):
     symbol = convert_symbol(symbol); side = _norm_side(side)
-    # 원격 사이즈 확인
     held = 0.0
     for p in get_open_positions():
         if convert_symbol(p.get("symbol"))==symbol and _norm_side(p.get("side"))==side:
@@ -266,17 +289,14 @@ def _watchdog_loop():
                     d = position_data.setdefault(k, {})
                     d.setdefault("entry", entry)
                     d.setdefault("size", size)
-                    # BE: 롱은 mark <= entry, 숏은 mark >= entry
                     if d.get("be_armed"):
                         if (side=="long" and mark <= entry) or (side=="short" and mark >= entry):
                             be_fire = True
 
                 now = time.time()
                 if be_fire or hit_pnl or hit_price:
-                    # 쿨다운 체크(중복 컷 방지)
                     if now < cooldown_ts.get(k, 0):
                         continue
-                    # 연속 확인
                     confirm_cnt[k] = confirm_cnt.get(k, 0) + 1
                     last_hit_ts[k] = now
                     if confirm_cnt[k] >= max(1, STOP_CONFIRM_N):
@@ -285,7 +305,6 @@ def _watchdog_loop():
                         cooldown_ts[k] = now + STOP_COOLDOWN_SEC
                         confirm_cnt[k] = 0
                 else:
-                    # 히트가 아니면 카운트 천천히 리셋
                     if now - last_hit_ts.get(k, 0) > STOP_DEBOUNCE_SEC:
                         confirm_cnt[k] = 0
 
@@ -321,6 +340,11 @@ def runtime_overrides(changed: Dict[str, Any]):
     if "TP2_PCT" in changed: TP2_PCT = float(changed["TP2_PCT"])
     if "TP3_PCT" in changed: TP3_PCT = float(changed["TP3_PCT"])
 
+# admin_runtime.py는 apply_runtime_overrides(...)를 찾음 → 호환 alias
+def apply_runtime_overrides(changed: Dict[str, Any]):
+    return runtime_overrides(changed)
+
+# ===== 기타 도우미 ==================================================
 def get_pending_snapshot():
     with _POS_LOCK:
         return {"positions": dict(position_data)}
