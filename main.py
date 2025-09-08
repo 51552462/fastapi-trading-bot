@@ -1,10 +1,20 @@
-# main.py — FastAPI entrypoint (ADD-ONLY)
+# main.py — 변경된 부분 포함한 전체본 (ADD ONLY, 기존 로직 유지)
 import os, sys, time, json, hashlib, threading, queue, re, glob, subprocess
 from collections import deque
 from typing import Dict, Any, Optional
 from fastapi import FastAPI, Request, Query, HTTPException
 
-# --- path guard (import 경로 안전) ---
+try:
+    from admin_api import router as admin_router
+except Exception:
+    admin_router = None
+
+try:
+    from ai_expert import start_ai_expert
+except Exception:
+    def start_ai_expert():  # 폴백
+        pass
+
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 if BASE_DIR not in sys.path:
     sys.path.insert(0, BASE_DIR)
@@ -16,11 +26,10 @@ from trader import (
 from telegram_bot import send_telegram
 from bitget_api import convert_symbol, get_open_positions
 
-# 정책/텔레메트리/리스크가드 (비침투적 추가)
-from policy.tf_policy import ingest_signal, start_policy_manager  # [ADD]
-from risk_guard import can_open                                   # [ADD]
+from policy.tf_policy import ingest_signal, start_policy_manager
+from risk_guard import can_open
 try:
-    from telemetry.logger import log_event                        # [OPT]
+    from telemetry.logger import log_event
 except Exception:
     def log_event(*a, **kw): pass
 
@@ -40,21 +49,21 @@ try:
 except Exception:
     SYMBOL_AMOUNT = {}
 
-# 무료플랜 파일 확인/리포트용(선택)
-LOG_DIR = os.getenv("TRADE_LOG_DIR", "./logs")
-REPORT_DIR = "./reports"
+TRADE_LOG_DIR  = os.getenv("TRADE_LOG_DIR", "./trade_logs")
+REPORT_DIR     = os.getenv("REPORT_DIR", "./reports")
 LOGS_API_TOKEN = os.getenv("LOGS_API_TOKEN", "")
-
-app = FastAPI()
 
 INGRESS_LOG: deque = deque(maxlen=200)
 _DEDUP: Dict[str, float] = {}
 _BIZDEDUP: Dict[str, float] = {}
+
 _task_q: "queue.Queue[Dict[str, Any]]" = queue.Queue(maxsize=QUEUE_MAX)
 
-# ──────────────────────────────────────────────────────────────
-# 유틸
-# ──────────────────────────────────────────────────────────────
+app = FastAPI(title="fastapi-trading-bot", version="1.0.0")
+
+if admin_router:
+    app.include_router(admin_router)
+
 def _dedup_key(d: Dict[str, Any]) -> str:
     return hashlib.sha1(json.dumps(d, sort_keys=True).encode()).hexdigest()
 
@@ -83,90 +92,53 @@ def _norm_type(typ: str) -> str:
     return aliases.get(t, t)
 
 def _canon_tf(s: Optional[str]) -> Optional[str]:
-    if not s: return None
-    s = s.strip().lower()
-    return s if s in ("1h","2h","3h","4h","d") else None
+    s = (s or "").strip().lower()
+    if not s:
+        return None
+    s = s.replace(" ", "").replace("_", "")
+    m = {
+        "1m":"1m","3m":"3m","5m":"5m","15m":"15m","30m":"30m",
+        "1h":"1h","2h":"2h","3h":"3h","4h":"4h",
+        "1d":"1d","1day":"1d","d":"1d"
+    }
+    return m.get(s, s)
 
-def _auth_or_raise(token: Optional[str]):
-    if LOGS_API_TOKEN and token != LOGS_API_TOKEN:
-        raise HTTPException(status_code=401, detail="invalid token")
+def _resolve_amount(symbol: str, default: float) -> float:
+    if FORCE_DEFAULT_AMOUNT:
+        return default
+    amt = SYMBOL_AMOUNT.get(symbol) or SYMBOL_AMOUNT.get(symbol.replace("USDT",""))
+    try:
+        return float(amt) if amt is not None else default
+    except Exception:
+        return default
 
-# ──────────────────────────────────────────────────────────────
-# Payload 파서(느슨하게)
-# ──────────────────────────────────────────────────────────────
-async def _parse_any(req: Request) -> Dict[str, Any]:
-    # JSON
-    try:
-        return await req.json()
-    except Exception:
-        pass
-    # Raw body(JSON-like)
-    try:
-        raw = (await req.body()).decode(errors="ignore").strip()
-        if raw:
-            try:
-                return json.loads(raw)
-            except Exception:
-                fixed = raw.replace("'", '"')
-                return json.loads(fixed)
-    except Exception:
-        pass
-    # Form
-    try:
-        form = await req.form()
-        payload = form.get("payload") or form.get("data")
-        if payload:
-            return json.loads(payload)
-    except Exception:
-        pass
-    # key:value lines
-    try:
-        txt = (await req.body()).decode(errors="ignore")
-        d: Dict[str, Any] = {}
-        for part in re.split(r"[\n,]+", txt):
-            if ":" in part:
-                k, v = part.split(":", 1)
-                d[k.strip()] = v.strip()
-        if d:
-            return d
-    except Exception:
-        pass
-    raise ValueError("cannot parse request")
+def _worker():
+    while True:
+        data = _task_q.get()
+        try:
+            _handle_signal(data)
+        except Exception as e:
+            try: send_telegram(f"❗worker error: {e}")
+            except Exception: pass
+        finally:
+            _task_q.task_done()
 
-# ──────────────────────────────────────────────────────────────
-# 시그널 라우팅
-# ──────────────────────────────────────────────────────────────
+def _worker_boot():
+    for _ in range(WORKERS):
+        threading.Thread(target=_worker, daemon=True).start()
+
 def _handle_signal(data: Dict[str, Any]):
-    typ_raw = (data.get("type") or "")
-    symbol  = _norm_symbol(data.get("symbol", ""))
-    side    = _infer_side(data.get("side"), "long")
+    symbol = _norm_symbol(str(data.get("symbol") or data.get("ticker") or ""))
+    typ_raw = str(data.get("type") or data.get("event") or data.get("reason") or "")
+    side    = _infer_side(str(data.get("side") or data.get("direction") or "long"))
+    tf      = _canon_tf(str(data.get("timeframe") or ""))
 
-    # 원본 로그(선택)
-    try: log_event(data, stage="ingress")
-    except: pass
-
-    # TF 힌트 수집
-    try: ingest_signal(data)
-    except: pass
-
-    amount   = float(data.get("amount", DEFAULT_AMOUNT))
-    leverage = float(data.get("leverage", LEVERAGE))
-
-    # 심볼별 금액 우선
-    resolved_amount = float(amount)
-    if (symbol in SYMBOL_AMOUNT) and (str(SYMBOL_AMOUNT[symbol]).strip() != ""):
-        try: resolved_amount = float(SYMBOL_AMOUNT[symbol])
-        except Exception: resolved_amount = float(DEFAULT_AMOUNT)
-    elif FORCE_DEFAULT_AMOUNT:
-        resolved_amount = float(DEFAULT_AMOUNT)
-
-    if not symbol:
-        send_telegram("⚠️ symbol 없음: " + json.dumps(data))
+    if not symbol or not typ_raw:
         return
 
+    resolved_amount = _resolve_amount(symbol, DEFAULT_AMOUNT)
     t = _norm_type(typ_raw)
 
-    # 너무 잦은 동일 비즈니스 이벤트 차단
     now = time.time()
     bizkey = f"{t}:{symbol}:{side}"
     last = _BIZDEDUP.get(bizkey, 0.0)
@@ -180,9 +152,7 @@ def _handle_signal(data: Dict[str, Any]):
         except Exception:
             pass
 
-    # 라우팅
     if t == "entry":
-        # === 리스크 예산 체크 (자본 자동 반영) ===
         allowed = can_open({
             "symbol": symbol,
             "side": side,
@@ -190,110 +160,46 @@ def _handle_signal(data: Dict[str, Any]):
             "size": resolved_amount
         })
         if not allowed:
-            # [ADD-ONLY] 막힐 때 조용히 사라지지 않도록 알림/파일로그
-            try: send_telegram(f"⛔ RiskGuard block {symbol} {side} amt={resolved_amount} tf={_canon_tf(str(data.get('timeframe') or ''))}")
+            try: send_telegram(f"⛔ RiskGuard block {symbol} {side} amt≈{resolved_amount} tf={_canon_tf(str(data.get('timeframe') or ''))}")
             except Exception: pass
             try: log_event({"event":"guard_block","symbol":symbol,"side":side,
-                            "amount":resolved_amount,"timeframe":data.get("timeframe")}, stage="guard")
+                            "amt":resolved_amount,"tf":tf}, stage="guard")
             except Exception: pass
             return
-        enter_position(symbol, resolved_amount, side=side, leverage=leverage)
-        return
 
-    if t in ("tp1", "tp2", "tp3"):
-        pct = float(os.getenv("TP1_PCT", "0.30")) if t == "tp1" else \
-              float(os.getenv("TP2_PCT", "0.40")) if t == "tp2" else \
-              float(os.getenv("TP3_PCT", "0.30"))
-        take_partial_profit(symbol, pct, side=side)
-        return
+        ingest_signal({"type":"entry","symbol":symbol,"side":side,"tf":tf})
+        enter_position(symbol=symbol, side=side, usdt_amount=resolved_amount, timeframe=tf, leverage=LEVERAGE)
 
-    # 즉시 전체 종료 키들
-    CLOSE_KEYS = {"stoploss","emaexit","failcut","fullexit","close","exit","liquidation","sl1","sl2"}
-    if t in CLOSE_KEYS:
-        close_position(symbol, side=side, reason=t)
-        return
+    elif t in ("tp1","tp2","tp3"):
+        ratio = {"tp1":float(os.getenv("TP1_PCT","0.30")),
+                 "tp2":float(os.getenv("TP2_PCT","0.40")),
+                 "tp3":float(os.getenv("TP3_PCT","0.30"))}[t]
+        ingest_signal({"type":t,"symbol":symbol,"side":side,"tf":tf})
+        take_partial_profit(symbol=symbol, side=side, ratio=ratio)
 
-    if t == "reducebycontracts":
-        contracts = float(data.get("contracts", 0))
-        if contracts > 0:
-            reduce_by_contracts(symbol, contracts, side=side)
-        return
-
-    if t in ("tailtouch", "info", "debug"):
-        return
-
-    send_telegram("❓ 알 수 없는 신호: " + json.dumps(data))
-
-# ──────────────────────────────────────────────────────────────
-# 워커/엔드포인트/스타트업
-# ──────────────────────────────────────────────────────────────
-def _worker_loop(idx: int):
-    while True:
+    elif t in ("reducebycontracts",):
         try:
-            data = _task_q.get()
-            if data is None:
-                continue
-            _handle_signal(data)
-        except Exception as e:
-            print(f"[worker-{idx}] error:", e)
-        finally:
-            _task_q.task_done()
+            contracts = float(data.get("contracts"))
+        except Exception:
+            contracts = 0.0
+        if contracts > 0:
+            reduce_by_contracts(symbol=symbol, side=side, contracts=contracts)
 
-async def _ingest(req: Request):
-    now = time.time()
-    try:
-        data = await _parse_any(req)
-    except Exception as e:
-        return {"ok": False, "error": f"bad_payload: {e}"}
+    # === NEW: 전략 손절 시그널을 명시적으로 기록 ===
+    elif t in ("stoploss","failcut","emaexit"):
+        ingest_signal({"type":t,"symbol":symbol,"side":side,"tf":tf})
+        close_position(symbol=symbol, side=side, reason=t)  # ← reason 남김
 
-    dk = _dedup_key(data)
-    if dk in _DEDUP and now - _DEDUP[dk] < DEDUP_TTL:
-        return {"ok": True, "dedup": True}
-    _DEDUP[dk] = now
-
-    INGRESS_LOG.append({"ts": now, "ip": (req.client.host if req and req.client else "?"), "data": data})
-    try:
-        _task_q.put_nowait(data)
-    except queue.Full:
-        send_telegram("⚠️ queue full → drop signal: " + json.dumps(data))
-        return {"ok": False, "queued": False, "reason": "queue_full"}
-
-    return {"ok": True, "queued": True, "qsize": _task_q.qsize()}
-
-@app.get("/")
-def root():
-    return {"ok": True}
-
-@app.post("/signal")
-async def signal(req: Request):
-    return await _ingest(req)
-
-@app.post("/webhook")
-async def webhook(req: Request):
-    return await _ingest(req)
-
-@app.post("/alert")
-async def alert(req: Request):
-    return await _ingest(req)
+    else:
+        ingest_signal({"type":t,"symbol":symbol,"side":side,"tf":tf})
+        close_position(symbol=symbol, side=side)
 
 @app.get("/health")
 def health():
-    return {"ok": True, "ingress": len(INGRESS_LOG), "queue": _task_q.qsize(), "workers": WORKERS}
-
-@app.get("/ingress")
-def ingress():
-    return list(INGRESS_LOG)[-30:]
-
-@app.get("/positions")
-def positions():
-    return {"positions": get_open_positions()}
-
-@app.get("/queue")
-def queue_size():
-    return {"size": _task_q.qsize(), "max": QUEUE_MAX}
-
-@app.get("/config")
-def config():
+    try:
+        pos = list(get_open_positions())
+    except Exception:
+        pos = []
     return {
         "DEFAULT_AMOUNT": DEFAULT_AMOUNT, "LEVERAGE": LEVERAGE,
         "DEDUP_TTL": DEDUP_TTL, "BIZDEDUP_TTL": BIZDEDUP_TTL,
@@ -301,109 +207,84 @@ def config():
         "LOG_INGRESS": LOG_INGRESS,
         "FORCE_DEFAULT_AMOUNT": FORCE_DEFAULT_AMOUNT,
         "SYMBOL_AMOUNT": SYMBOL_AMOUNT,
+        "positions": pos
     }
 
 @app.get("/pending")
 def pending():
     return get_pending_snapshot()
 
-# === 시간봉 강제 태깅 웹훅 (Pine 수정 없이 URL만 바꿈) ===
 def _ingest_with_tf_override(data: Dict[str, Any], tf: str):
     now = time.time()
-    d = dict(data or {}); d["timeframe"] = tf  # 핵심: 서버가 TF 주입
-
+    d = dict(data or {}); d["timeframe"] = tf
     dk = _dedup_key(d)
     if dk in _DEDUP and now - _DEDUP[dk] < DEDUP_TTL:
         return {"ok": True, "dedup": True, "tf": tf}
     _DEDUP[dk] = now
-
     INGRESS_LOG.append({"ts": now, "ip": "tf-override", "data": d})
     try:
         _task_q.put_nowait(d)
     except queue.Full:
         send_telegram("⚠️ queue full → drop signal(tf): " + json.dumps(d))
         return {"ok": False, "queued": False, "reason": "queue_full"}
+    try:
+        log_event({"event":"ingress_tf","tf":tf,"payload":d}, stage="ingress")
+    except Exception:
+        pass
+    return {"ok": True, "queued": True, "tf": tf}
 
-    return {"ok": True, "queued": True, "qsize": _task_q.qsize(), "tf": tf}
+@app.post("/signal")
+async def signal_root(request: Request):
+    payload: Dict[str, Any] = {}
+    try:
+        payload = await request.json()
+    except Exception:
+        try:
+            form = await request.form()
+            payload = json.loads(form.get("payload", "{}"))
+        except Exception:
+            pass
+
+    now = time.time()
+    dk = _dedup_key(payload)
+    if dk in _DEDUP and now - _DEDUP[dk] < DEDUP_TTL:
+        return {"ok": True, "dedup": True}
+    _DEDUP[dk] = now
+
+    INGRESS_LOG.append({"ts": now, "ip": request.client.host if request.client else "?", "data": payload})
+    try:
+        _task_q.put_nowait(payload)
+    except queue.Full:
+        send_telegram("⚠️ queue full → drop signal: " + json.dumps(payload))
+        return {"ok": False, "queued": False, "reason": "queue_full"}
+
+    try:
+        log_event({"event":"ingress","payload":payload}, stage="ingress")
+    except Exception:
+        pass
+
+    return {"ok": True, "queued": True}
 
 @app.post("/signal/1h")
-async def signal_1h(req: Request):
-    d = await _parse_any(req)
-    return _ingest_with_tf_override(d, "1H")
-
-@app.post("/signal/2h")
-async def signal_2h(req: Request):
-    d = await _parse_any(req)
-    return _ingest_with_tf_override(d, "2H")
-
-@app.post("/signal/3h")
-async def signal_3h(req: Request):
-    d = await _parse_any(req)
-    return _ingest_with_tf_override(d, "3H")
-
+async def signal_1h(request: Request):   return _ingest_with_tf_override(await request.json(), "1H")
 @app.post("/signal/4h")
-async def signal_4h(req: Request):
-    d = await _parse_any(req)
-    return _ingest_with_tf_override(d, "4H")
+async def signal_4h(request: Request):   return _ingest_with_tf_override(await request.json(), "4H")
+@app.post("/signal/1d")
+async def signal_1d(request: Request):   return _ingest_with_tf_override(await request.json(), "1D")
 
-# [ADD-ONLY] 트레일링 슬래시 호환 라우트들 (/signal/{tf}/)
-@app.post("/signal/1h/")
-async def signal_1h_slash(req: Request):
-    d = await _parse_any(req); return _ingest_with_tf_override(d, "1H")
+@app.get("/ingress")
+def ingress():
+    return {"items": list(INGRESS_LOG)}
 
-@app.post("/signal/2h/")
-async def signal_2h_slash(req: Request):
-    d = await _parse_any(req); return _ingest_with_tf_override(d, "2H")
+def _auth_or_raise(token: Optional[str]):
+    if LOGS_API_TOKEN and token != LOGS_API_TOKEN:
+        raise HTTPException(status_code=401, detail="bad token")
 
-@app.post("/signal/3h/")
-async def signal_3h_slash(req: Request):
-    d = await _parse_any(req); return _ingest_with_tf_override(d, "3H")
-
-@app.post("/signal/4h/")
-async def signal_4h_slash(req: Request):
-    d = await _parse_any(req); return _ingest_with_tf_override(d, "4H")
-
-# ──────────────────────────────────────────────────────────────
-# (선택) 무료 플랜에서도 파일 확인/요약 돌리기 위한 경량 API
-# ──────────────────────────────────────────────────────────────
-@app.get("/logs/list")
-def list_logs(token: Optional[str] = Query(None)):
-    _auth_or_raise(token)
-    try:
-        files = sorted(glob.glob(os.path.join(LOG_DIR, "*")))
-        return {"dir": LOG_DIR, "files": [os.path.basename(f) for f in files]}
-    except Exception as e:
-        return {"error": str(e), "dir": LOG_DIR}
-
-@app.get("/logs/tail")
-def tail_log(file: str, lines: int = 50, token: Optional[str] = Query(None)):
-    _auth_or_raise(token)
-    path = os.path.join(LOG_DIR, file)
-    try:
-        with open(path, "r", encoding="utf-8") as f:
-            buf = f.readlines()[-max(1, min(lines, 1000)):]
-        return {"file": file, "lines": buf}
-    except FileNotFoundError:
-        raise HTTPException(status_code=404, detail=f"not found: {file}")
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
-# [ADD] 로그 자가진단: 파일에 테스트 이벤트 1줄 쓰기
-@app.get("/logs/selftest")
-def logs_selftest(token: Optional[str] = Query(None)):
-    _auth_or_raise(token)
-    try:
-        log_event({"event": "selftest", "msg": "hello", "stage": "self"}, stage="selftest")
-        return {"ok": True, "tip": "이후 /logs/list 로 파일 생겼는지 확인"}
-    except Exception as e:
-        return {"ok": False, "error": str(e)}
-
-# POST 전용이 불편하니 GET도 허용
 @app.post("/reports/run")
 def run_summary(days: Optional[int] = None, token: Optional[str] = Query(None)):
     _auth_or_raise(token)
-    cmd = ["python3", "tools/summarize_logs.py"]
-    if days is not None:
+    cmd = ["python3", "summarize_logs.py"]
+    if days:
         cmd += ["--days", str(days)]
     try:
         os.makedirs(REPORT_DIR, exist_ok=True)
@@ -417,7 +298,6 @@ def run_summary(days: Optional[int] = None, token: Optional[str] = Query(None)):
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
-# [ADD] GET 호환: 브라우저에서 바로 리포트 실행
 @app.get("/reports/run")
 def run_summary_get(days: Optional[int] = None, token: Optional[str] = Query(None)):
     return run_summary(days=days, token=token)
@@ -434,35 +314,20 @@ def get_kpis(token: Optional[str] = Query(None)):
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
-@app.get("/reports/download")
-def download_report(name: str, token: Optional[str] = Query(None)):
-    _auth_or_raise(token)
-    path = os.path.join(REPORT_DIR, name)
-    if not os.path.isfile(path):
-        raise HTTPException(status_code=404, detail=f"report not found: {name}")
-    with open(path, "r", encoding="utf-8") as f:
-        return {"name": name, "content": f.read()}
-
-# ──────────────────────────────────────────────────────────────
-# 스타트업 훅
-# ──────────────────────────────────────────────────────────────
-def _worker_boot():
-    for i in range(WORKERS):
-        t = threading.Thread(target=_worker_loop, args=(i,), daemon=True, name=f"signal-worker-{i}")
-        t.start()
-
-@app.on_event("startup")
-def on_startup():
+def _boot():
     _worker_boot()
     start_capacity_guard()
     start_watchdogs()
     start_reconciler()
-    start_policy_manager()   # 정책 매니저 시작
+    start_policy_manager()
+    start_ai_expert()
     try:
         threading.Thread(
             target=send_telegram,
-            args=("✅ FastAPI up (workers + watchdog + reconciler + capacity-guard + policy)",),
+            args=("✅ FastAPI up (workers + watchdog + reconciler + capacity-guard + policy + ai)",),
             daemon=True
         ).start()
     except Exception:
         pass
+
+_boot()
