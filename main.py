@@ -1,11 +1,6 @@
+# main.py — FastAPI entrypoint (policy OFF by default, orchestrator LIVE-ready, KPI 입력 엔드포인트 포함)
 
-# main.py — FastAPI entrypoint
-# - TradingView webhook ingestion (generic + 1H/2H/3H/4H/D)
-# - Admin runtime overrides
-# - Boots watchdogs/reconciler/capacity guard + policy manager + optional AI expert
-# - Telegram status pings
-
-import os, sys, json, time
+import os, sys, json, time, threading
 from typing import Any, Dict, Optional
 from fastapi import FastAPI, Request, HTTPException
 
@@ -29,18 +24,29 @@ except Exception:
     def send_telegram(msg: str):
         print("[TG]", msg)
 
-# Policy / AI (optional)
+# ===== AI modules (optional) =====
+# Policy Manager (직접 종료 기능) — 기본 OFF
+POLICY_ENABLE = os.getenv("POLICY_ENABLE", "0") == "1"
 try:
     from tf_policy import ingest_signal, start_policy_manager
 except Exception:
     def ingest_signal(*args, **kwargs): pass
     def start_policy_manager(): pass
 
-# Optional AI expert (user custom)
+# AI Expert (손절폭/파라미터 자동튜닝)
 try:
     from ai_expert import start_ai_expert
 except Exception:
     def start_ai_expert(): pass
+
+# Orchestrator (KPI 기반 자동 패치 적용)
+try:
+    from ai_orchestrator import loop as _orch_loop
+    def start_ai_orchestrator():
+        threading.Thread(target=_orch_loop, name="ai-orchestrator", daemon=True).start()
+except Exception:
+    def start_ai_orchestrator():
+        pass
 
 # =========================
 # helpers
@@ -53,6 +59,7 @@ def _infer_side(s: Optional[str]) -> Optional[str]:
     return s
 
 async def _parse_any(req: Request) -> Dict[str, Any]:
+    # JSON or raw body
     try:
         data = await req.json()
     except Exception:
@@ -62,11 +69,10 @@ async def _parse_any(req: Request) -> Dict[str, Any]:
         except Exception:
             raise HTTPException(400, "invalid payload")
 
-    # Normalize common fields
     symbol = (data.get("symbol") or data.get("ticker") or "").upper()
     side   = _infer_side(data.get("side"))
     type_  = (data.get("type") or data.get("action") or "").lower()
-    amount = data.get("amount")  # usdt notional
+    amount = data.get("amount")
     leverage = data.get("leverage")
     ratio  = data.get("ratio")
     contracts = data.get("contracts")
@@ -80,8 +86,10 @@ async def _parse_any(req: Request) -> Dict[str, Any]:
     }
 
 def _ingest_with_tf_override(d: Dict[str, Any], tf_hint: Optional[str] = None) -> Dict[str, Any]:
+    # Policy가 켜져 있을 때만 시그널 인입 기록
     try:
-        ingest_signal(d.get("symbol"), d.get("side"), tf_hint, d.get("meta"))
+        if POLICY_ENABLE:
+            ingest_signal(d.get("symbol"), d.get("side"), tf_hint, d.get("meta"))
     except Exception:
         pass
     return _route_signal(d, tf_hint=tf_hint)
@@ -145,6 +153,28 @@ def pending():
         snap = {}
     return {"ok": True, "snapshot": snap}
 
+# ---- KPI 입출력 (오케스트레이터 LIVE용) ----
+@app.post("/reports/kpis")
+async def reports_kpis(req: Request):
+    data = await req.json()
+    report_dir = os.getenv("REPORT_DIR", "./reports")
+    os.makedirs(report_dir, exist_ok=True)
+    path = os.path.join(report_dir, "kpis.json")
+    tmp  = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, indent=2)
+    os.replace(tmp, path)
+    return {"ok": True, "path": path}
+
+@app.get("/reports/kpis")
+def get_kpis():
+    report_dir = os.getenv("REPORT_DIR", "./reports")
+    path = os.path.join(report_dir, "kpis.json")
+    if not os.path.exists(path):
+        return {"ok": False, "error": "no kpis.json"}
+    return {"ok": True, "kpis": json.load(open(path, "r", encoding="utf-8"))}
+
+# ---- TradingView signals ----
 @app.post("/signal")
 async def signal_generic(req: Request):
     d = await _parse_any(req)
@@ -175,6 +205,7 @@ async def signal_d(req: Request):
     d = await _parse_any(req)
     return _ingest_with_tf_override(d, "D")
 
+# ---- admin runtime ----
 @app.post("/admin/runtime")
 async def admin_runtime(req: Request):
     tok = req.headers.get("x-admin-token") or req.headers.get("X-Admin-Token")
@@ -195,17 +226,27 @@ def _boot():
     start_watchdogs()
     start_reconciler()
     start_capacity_guard()
-    # AI policy manager & expert (if available)
-    try:
-        start_policy_manager()
-        send_telegram("🧠 Policy manager started")
-    except Exception:
-        pass
+
+    # Policy (직접 종결 로직) — 원하면만 ON
+    if POLICY_ENABLE:
+        try:
+            start_policy_manager()
+            send_telegram("🧠 Policy manager started")
+        except Exception:
+            pass
+
+    # Expert & Orchestrator
     try:
         start_ai_expert()
         send_telegram("🤖 AI expert started")
     except Exception:
         pass
+    try:
+        start_ai_orchestrator()
+        send_telegram("🧠 Orchestrator started")
+    except Exception:
+        pass
+
     send_telegram("✅ FastAPI up (workers + watchdog + reconciler + guards + AI)")
 
 _boot()
