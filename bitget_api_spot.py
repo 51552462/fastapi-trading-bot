@@ -1,4 +1,4 @@
-# bitget_api_spot.py
+# bitget_api_spot.py  (Spot symbols from v2, rest kept the same)
 import os, time, json, hmac, hashlib, base64, requests, math, re
 from typing import Dict, Optional
 
@@ -8,10 +8,10 @@ API_KEY        = os.getenv("BITGET_API_KEY", "")
 API_SECRET     = os.getenv("BITGET_API_SECRET", "")
 API_PASSPHRASE = os.getenv("BITGET_API_PASSWORD", "")
 
-# 심볼 제거(폐지/일시중단) 블록 유지 시간(초) - 기본 12시간
+# how long to block a symbol after 40309 (removed) – default 12h
 REMOVED_BLOCK_TTL = int(os.getenv("REMOVED_BLOCK_TTL", "43200"))
 
-# ---------- rate limit ----------
+# ---------- small rate-limit helper ----------
 _last_call: Dict[str, float] = {}
 def _rl(key: str, min_interval: float = 0.08):
     now = time.time()
@@ -57,11 +57,15 @@ def convert_symbol(sym: str) -> str:
     return ALIASES.get(s, s)
 
 def _spot_symbol(sym: str) -> str:
+    """
+    Orders/tickers on v1 endpoints still commonly expect *_SPBL.
+    We normalize to that form for order/ticker calls.
+    """
     base = convert_symbol(sym)
-    return base if base.endswith("_SPBL") else f"{base}_SPBL"  # e.g., BTCUSDT_SPBL
+    return base if base.endswith("_SPBL") else f"{base}_SPBL"
 
 # ---------- removed symbol cache ----------
-_REMOVED: Dict[str, float] = {}  # key: base(symbol without _SPBL), value: until_ts
+_REMOVED: Dict[str, float] = {}  # base -> until_ts
 
 def mark_symbol_removed(symbol: str):
     base = convert_symbol(symbol)
@@ -77,58 +81,88 @@ def is_symbol_removed(symbol: str) -> bool:
         return False
     return True
 
-# ---------- spec cache ----------
+# ---------- symbol/spec cache (from v2 endpoint) ----------
 _PROD_CACHE = {"ts": 0.0, "data": {}}
 
-def _refresh_products_cache():
-    path = "/api/spot/v1/public/products"
+def _to_float(x, default: float = 0.0) -> float:
     try:
-        _rl("products", 0.15)
+        if x is None:
+            return default
+        if isinstance(x, (int, float)):
+            return float(x)
+        s = str(x).strip()
+        if s == "" or s.lower() == "null":
+            return default
+        return float(s)
+    except Exception:
+        return default
+
+def _refresh_products_cache_v2():
+    """
+    Use v2 symbols endpoint:
+      GET /api/v2/spot/public/symbols
+    Returns entries like:
+      {
+        "symbol":"PRIMEUSDT",
+        "status":"online",
+        "pricePrecision":"5",
+        "quantityPrecision":"2",
+        "quotePrecision":"5",
+        "minTradeUSDT":"1",
+        "minTradeAmount":"0",
+        ...
+      }
+    """
+    path = "/api/v2/spot/public/symbols"
+    try:
+        _rl("products_v2", 0.15)
         r = requests.get(BASE_URL + path, timeout=12)
         j = r.json()
         arr = j.get("data") or []
-        m = {}
+        m: Dict[str, Dict] = {}
         for it in arr:
-            sym_raw = (it.get("symbol") or "").upper()  # DOGEUSDT or DOGEUSDT_SPBL
-            if not sym_raw:
+            sym_base = (it.get("symbol") or "").upper()  # e.g. PRIMEUSDT  (no _SPBL in v2)
+            if not sym_base:
                 continue
-            qty_prec   = int(it.get("quantityPrecision") or 6)
-            price_prec = int(it.get("pricePrecision") or 6)
-            min_amt    = float(it.get("minTradeAmount") or 0.0)  # quote 최소 USDT
-            # 일부 리전은 status, symbolStatus, online 등으로 표기 다름
-            status = (it.get("status") or it.get("symbolStatus") or it.get("online") or "").lower()
-            tradable = True
-            if isinstance(status, str) and status:
-                tradable = status in ("online", "enable", "enabled", "true", "tradable")
-            elif isinstance(status, bool):
-                tradable = bool(status)
+            qty_prec   = int(_to_float(it.get("quantityPrecision"), 6))
+            price_prec = int(_to_float(it.get("pricePrecision"), 6))
+            # prefer minTradeUSDT, fallback to minTradeAmount
+            min_quote  = _to_float(it.get("minTradeUSDT"), _to_float(it.get("minTradeAmount"), 1.0))
+            status_raw = it.get("status")
+            tradable   = True
+            if isinstance(status_raw, str):
+                tradable = status_raw.lower() in ("online", "enable", "enabled", "true", "tradable")
+            elif isinstance(status_raw, bool):
+                tradable = bool(status_raw)
 
             spec = {
-                "qtyStep": 10 ** (-qty_prec),
+                "qtyStep":   10 ** (-qty_prec),
                 "priceStep": 10 ** (-price_prec),
-                "minQuote": min_amt,
-                "tradable": tradable,
+                "minQuote":  min_quote if min_quote > 0 else 1.0,
+                "tradable":  tradable,
             }
-            # 키 폭넓게 저장
-            m[sym_raw] = spec
-            base_key = sym_raw[:-5] if sym_raw.endswith("_SPBL") else sym_raw
-            m[base_key] = spec
-            m[base_key.replace("/", "").replace("-", "")] = spec
+            # store under multiple keys to avoid mismatches
+            m[sym_base] = spec
+            m[f"{sym_base}_SPBL"] = spec
+            # legacy keys without slash/dash also map to same spec
+            m[sym_base.replace("/", "").replace("-", "")] = spec
+
         _PROD_CACHE["data"] = m
         _PROD_CACHE["ts"] = time.time()
     except Exception as e:
-        print("spot products refresh fail:", e)
+        print("spot products v2 refresh fail:", e)
 
 def get_symbol_spec_spot(symbol: str) -> Dict[str, float]:
     now = time.time()
     if now - _PROD_CACHE["ts"] > 600 or not _PROD_CACHE["data"]:
-        _refresh_products_cache()
+        _refresh_products_cache_v2()
     base = convert_symbol(symbol)
-    key1 = _spot_symbol(symbol)
-    key2 = base
+    key1 = _spot_symbol(symbol)  # e.g. PRIMEUSDT_SPBL
+    key2 = base                  # e.g. PRIMEUSDT
     spec = _PROD_CACHE["data"].get(key1) or _PROD_CACHE["data"].get(key2)
     if not spec:
-        spec = {"qtyStep": 0.000001, "priceStep": 0.000001, "minQuote": 5.0, "tradable": True}
+        # safe default
+        spec = {"qtyStep": 0.000001, "priceStep": 0.000001, "minQuote": 1.0, "tradable": True}
         _PROD_CACHE["data"][key1] = spec
     return spec
 
@@ -150,7 +184,7 @@ def _step_to_scale(step: float) -> int:
     p = round(-math.log10(step))
     return max(0, int(p))
 
-# ---------- ticker ----------
+# ---------- ticker (keep v1; it accepts *_SPBL) ----------
 _SPOT_TICKER_CACHE: Dict[str, tuple] = {}
 SPOT_TICKER_TTL = float(os.getenv("SPOT_TICKER_TTL", "2.5"))
 
@@ -202,7 +236,7 @@ def _fetch_assets_v2(coin: Optional[str] = None) -> Dict[str, float]:
         c = (it.get("coin") or "").upper()
         if not c:
             continue
-        avail = float(it.get("available") or 0.0)
+        avail = _to_float(it.get("available"), 0.0)
         m[c] = avail
     return m
 
@@ -217,7 +251,7 @@ def _fetch_assets_v1() -> Dict[str, float]:
         c = (it.get("coin") or "").upper()
         if not c:
             continue
-        avail = float(it.get("available") or 0.0)
+        avail = _to_float(it.get("available"), 0.0)
         m[c] = avail
     return m
 
@@ -249,9 +283,8 @@ def get_spot_free_qty(symbol: str, fresh: bool = False) -> float:
     m = get_spot_balances()
     return float(m.get(base, 0.0))
 
-# ---------- orders ----------
+# ---------- order helpers ----------
 def _extract_code_text(resp_text: str) -> Dict[str, str]:
-    # Bitget 에러 본문에서 code/msg 추출 시도
     try:
         j = json.loads(resp_text)
         if isinstance(j, dict):
@@ -262,16 +295,14 @@ def _extract_code_text(resp_text: str) -> Dict[str, str]:
     n = re.search(r'"msg"\s*:\s*"(?P<msg>[^"]+)"', resp_text or "")
     return {"code": m.group("code") if m else "", "msg": n.group("msg") if n else ""}
 
+# ---------- orders (keep v1 place-order; symbol = *_SPBL) ----------
 def place_spot_market_buy(symbol: str, usdt_amount: float) -> Dict:
-    """
-    Market-Buy: Bitget는 size/quantity를 'quote 금액(USDT)'로 해석
-    """
     if not is_tradable(symbol):
         mark_symbol_removed(symbol)
         return {"code": "LOCAL_SYMBOL_REMOVED", "msg": "symbol not tradable/removed"}
 
     spec = get_symbol_spec_spot(symbol)
-    min_quote = float(spec.get("minQuote", 5.0))
+    min_quote = float(spec.get("minQuote", 1.0))
     if usdt_amount < min_quote:
         return {"code": "LOCAL_MIN_QUOTE", "msg": f"need>={min_quote}USDT"}
 
@@ -282,7 +313,7 @@ def place_spot_market_buy(symbol: str, usdt_amount: float) -> Dict:
         "side": "buy",
         "orderType": "market",
         "force": "gtc",
-        "quantity": amt_str
+        "quantity": amt_str  # market-buy expects quote amount
     }
     bj = json.dumps(body)
     try:
@@ -298,10 +329,6 @@ def place_spot_market_buy(symbol: str, usdt_amount: float) -> Dict:
         return {"code": "LOCAL_EXCEPTION", "msg": str(e)}
 
 def place_spot_market_sell_qty(symbol: str, qty: float) -> Dict:
-    """
-    Market-Sell: base 수량으로 전송.
-    40808(Parameter verification ... checkScale=*)가 오면 그 자리수로 잘라 '자동 재시도' 후 결과 반환.
-    """
     qty = float(qty)
     if qty <= 0:
         return {"code": "LOCAL_BAD_QTY", "msg": "qty<=0"}
@@ -324,7 +351,6 @@ def place_spot_market_sell_qty(symbol: str, qty: float) -> Dict:
         scale = _scale_from_step(s)
         return (f"{q:.{scale}f}").rstrip("0").rstrip(".") if scale > 0 else str(int(q))
 
-    # 1차: products step 기준
     qty_str = _fmt(qty, step)
     path = "/api/spot/v1/trade/orders"
     body = {
@@ -342,13 +368,13 @@ def place_spot_market_sell_qty(symbol: str, qty: float) -> Dict:
         if res.status_code == 200:
             return res.json()
 
-        txt = res.text or ""
+        txt  = res.text or ""
         info = _extract_code_text(txt)
         if info.get("code") == "40309" or "symbol has been removed" in (info.get("msg","").lower()):
             mark_symbol_removed(symbol)
             return {"code": f"HTTP_{res.status_code}", "msg": txt}
 
-        # 2차: 400 + checkScale → 자리수 보정 재시도
+        # 40808 → precision resubmit
         m = re.search(r"(?:checkBDScale|checkScale)[\"']?\s*[:=]\s*([0-9]+)", txt)
         if res.status_code == 400 and m:
             chk = int(m.group(1))
