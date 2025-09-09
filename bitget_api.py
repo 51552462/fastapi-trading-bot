@@ -1,76 +1,62 @@
 # -*- coding: utf-8 -*-
 """
-bitget_api.py — Bitget REST 어댑터 (USDT Perp / ONEWAY)
+bitget_api.py — Bitget REST adapter (USDT-M perpetual, one-way)
 
-업데이트 요약
-- 심볼 자동 해석(동적 조회 + 캐시): /api/v2/mix/market/contracts(productType=USDT-FUTURES)
-- 주문/레버리지/청산에 productType, marginMode 항상 포함 (v2 엄격검증 대응)
-- 가격 조회(get_last_price) 강화: v2 ticker(+productType) → v2 tickers 목록 → v2 candles → v1 ticker → v1 depth 순서 폴백
-- 스텝 내림 반올림/명목가·증거금 해석/oneway reduceOnly 등 기존 기능 유지
+What changed (fix pack):
+- V2 market endpoints (ticker/candles) **must** receive the base symbol without `_UMCBL`.
+  This was returning `last: null`, which then cascaded into `LOCAL_TICKER_FAIL`.
+  We now convert to base (e.g., "DOGEUSDT") for V2 market endpoints only.
+- Symbol resolution keeps using the exchange contract id with suffix (e.g., "DOGEUSDT_UMCBL")
+  for trading/account endpoints.
+- Added stronger fallbacks for price retrieval and robust symbol cache.
 """
 
-import os
-import time
-import hmac
-import hashlib
-import base64
-import json
-from typing import Any, Dict, List, Optional, Tuple
+from __future__ import annotations
+
+import os, time, json, hmac, hashlib, base64
+from typing import Any, Dict, Optional, Tuple, List
 
 import requests
 
-# =========================
-# 환경변수
-# =========================
-BITGET_HOST = os.getenv("BITGET_HOST", "https://api.bitget.com")
+# ---------- Env ----------
+BITGET_HOST   = os.getenv("BITGET_HOST", "https://api.bitget.com")
+API_KEY       = os.getenv("BITGET_API_KEY", "")
+API_SECRET    = os.getenv("BITGET_API_SECRET", "")
+API_PASSPHRASE= os.getenv("BITGET_API_PASSPHRASE", "")
+HTTP_TIMEOUT  = int(float(os.getenv("HTTP_TIMEOUT", "8")))
+BITGET_DEBUG  = os.getenv("BITGET_DEBUG", "0") == "1"
 
-API_KEY    = os.getenv("BITGET_API_KEY", "")
-API_SECRET = os.getenv("BITGET_API_SECRET", "")
-API_PASS   = os.getenv("BITGET_API_PASS", "")
-
-# 수량/가격 기본 스텝 (심볼 스펙 조회 실패 시 사용)
-DEFAULT_SIZE_STEP  = float(os.getenv("DEFAULT_SIZE_STEP", "0.001"))
-DEFAULT_PRICE_STEP = float(os.getenv("DEFAULT_PRICE_STEP", "0.0001"))
-
-# amount 해석 모드: notional(명목가) / margin(증거금)
-AMOUNT_MODE = os.getenv("AMOUNT_MODE", "notional").lower().strip()
-
-# 포지션 모드 기본: oneway (hedge 미지원)
+# One-way only (the rest of the code assumes one-way)
 POSITION_MODE = os.getenv("BITGET_POSITION_MODE", "oneway").lower().strip()
 
-# 마진 모드: cross / isolated (Bitget v2 표기: crossed / isolated)
+# margin mode: cross / isolated  → Bitget v2 expects crossed/isolated
 MARGIN_MODE_ENV = os.getenv("BITGET_MARGIN_MODE", "cross").lower().strip()
 
-# HTTP 타임아웃(초)
-HTTP_TIMEOUT = 8
+# V2 requires productType for USDT-M perpetuals
+PRODUCT_TYPE  = "USDT-FUTURES"
 
-# v2에서 주문/레버리지/포지션 조회 시 요구됨
-PRODUCT_TYPE = "USDT-FUTURES"
+# Amount mode: "notional" (default) or "margin" (rare)
+AMOUNT_MODE   = os.getenv("AMOUNT_MODE", "notional").lower().strip()
 
-# 디버그 로그 (서버 콘솔에만)
-BITGET_DEBUG = os.getenv("BITGET_DEBUG", "0") == "1"
+DEFAULT_SIZE_STEP  = float(os.getenv("DEFAULT_SIZE_STEP", "0.001"))
+DEFAULT_PRICE_STEP = float(os.getenv("DEFAULT_PRICE_STEP", "0.01"))
 
-# 계약심볼 캐시(실심볼 ↔ 코어심볼)
-_SYMBOL_CACHE: Dict[str, Tuple[str, float]] = {}  # core -> (exchange_symbol, ts)
-_SYMBOL_CACHE_TTL = float(os.getenv("SYMBOL_CACHE_TTL", "300"))  # 5분
+# Contract symbol cache
+_SYMBOL_CACHE: Dict[str, Tuple[str, float]] = {}  # core->(exchange_symbol, ts)
+_SYMBOL_CACHE_TTL = float(os.getenv("SYMBOL_CACHE_TTL", "300"))  # 5 min
 
-# =========================
-# 내부 유틸
-# =========================
 def _dbg(*a):
-    if BITGET_DEBUG:
-        print("[bitget]", *a)
+    if BITGET_DEBUG: print("[bitget]", *a)
 
+# -------- Normalizers --------
 def convert_symbol(s: str) -> str:
     """
-    다양한 표기(BINANCE:BTCUSDT, BTC-USDT, BTCUSDT_UMCBL, BTCUSDT.PERP)를
-    내부 표준 'BTCUSDT'로 정규화.
+    Normalize any variant to base 'BTCUSDT' style.
+    E.g. BINANCE:BTCUSDT, BTC-USDT, BTCUSDT_UMCBL, BTCUSDT.PERP → BTCUSDT
     """
-    if not s:
-        return ""
+    if not s: return ""
     t = str(s).upper().strip()
-    if ":" in t:
-        t = t.split(":")[-1]
+    if ":" in t: t = t.split(":")[-1]
     for sep in ["_", "-", ".", "/"]:
         t = t.replace(sep, "")
     for suf in ["UMCBL", "DMCBL", "CMCBL", "PERP"]:
@@ -80,40 +66,38 @@ def convert_symbol(s: str) -> str:
         t = t + "USDT"
     return t
 
+def _v2_market_symbol(sym_or_core: str) -> str:
+    """
+    V2 market endpoints (ticker/candles) expect base symbol WITHOUT suffix.
+    """
+    return convert_symbol(sym_or_core)
 
 def round_down_step(x: float, step: float) -> float:
-    """거래소가 요구하는 최소 호가/수량 스텝에 맞춰 내림 반올림."""
     try:
-        x = float(x)
-        step = float(step)
+        x = float(x); step = float(step)
     except Exception:
-        return float(x)
-    if step <= 0:
-        return float(x)
-    k = int(x / step)
-    return float(f"{k * step:.12f}")
+        return float(x or 0.0)
+    if step <= 0: return float(x)
+    return (int(x / step)) * step
 
-
+# -------- Signing / HTTP --------
 def _ts_ms() -> str:
     return str(int(time.time() * 1000))
 
-
-def _sign(ts: str, method: str, path: str, body: str) -> str:
-    raw = f"{ts}{method.upper()}{path}{body}"
-    mac = hmac.new(API_SECRET.encode(), raw.encode(), hashlib.sha256).digest()
-    return base64.b64encode(mac).decode()
-
-
 def _headers(ts: str, sign: str) -> Dict[str, str]:
     return {
-        "ACCESS-KEY": API_KEY,
-        "ACCESS-SIGN": sign,
-        "ACCESS-TIMESTAMP": ts,
-        "ACCESS-PASSPHRASE": API_PASS,
-        "Content-Type": "application/json",
-        "locale": "en-US",
+        "ACCESS-KEY":        API_KEY,
+        "ACCESS-SIGN":       sign,
+        "ACCESS-TIMESTAMP":  ts,
+        "ACCESS-PASSPHRASE": API_PASSPHRASE,
+        "Content-Type":      "application/json",
     }
 
+def _sign(ts: str, method: str, path: str, body: str = "") -> str:
+    # Bitget v2: prehash = timestamp + method + requestPath + body
+    prehash = f"{ts}{method.upper()}{path}{body}"
+    mac = hmac.new(API_SECRET.encode(), prehash.encode(), hashlib.sha256).digest()
+    return base64.b64encode(mac).decode()
 
 def _req_public(method: str, path: str, params: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     url = BITGET_HOST + path
@@ -126,13 +110,11 @@ def _req_public(method: str, path: str, params: Optional[Dict[str, Any]] = None)
     except Exception as e:
         return {"code": "HTTP_ERR", "msg": f"{type(e).__name__}: {e}"}
 
-
 def _req_private(method: str, path: str, body: Optional[Dict[str, Any]] = None, query: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
-    url_path = path
-    url = BITGET_HOST + url_path
+    url = BITGET_HOST + path
     ts = _ts_ms()
     body_str = json.dumps(body or {}, separators=(",", ":"))
-    sign = _sign(ts, method, url_path, body_str if method.upper() != "GET" else "")
+    sign = _sign(ts, method, path, body_str if method.upper() != "GET" else "")
     try:
         if method.upper() == "GET":
             r = requests.get(url, params=query or {}, headers=_headers(ts, sign), timeout=HTTP_TIMEOUT)
@@ -144,23 +126,14 @@ def _req_private(method: str, path: str, body: Optional[Dict[str, Any]] = None, 
     except Exception as e:
         return {"code": "HTTP_ERR", "msg": f"{type(e).__name__}: {e}"}
 
-
 def _margin_mode_v2() -> str:
-    """환경변수 → Bitget v2 표기로 매핑"""
     m = (MARGIN_MODE_ENV or "cross").lower()
-    if m in ("cross", "crossed", "cross_margin"):
-        return "crossed"
-    if m in ("isolated", "fixed", "isolate"):
-        return "isolated"
-    return "crossed"
+    return "crossed" if m.startswith("cross") else "isolated"
 
-# =========================
-# 심볼 해석기 (동적 조회 + 캐시)
-# =========================
+# -------- Contract discovery --------
 def _load_symbol_map() -> Dict[str, str]:
     """
-    /api/v2/mix/market/contracts 에서 productType=USDT-FUTURES 목록을 받아
-    '코어심볼(BTCUSDT)' → '거래소심볼(BTCUSDT_UMCBL 또는 환경에 맞는 문자열)' 매핑 생성
+    Build map: core (BTCUSDT) -> exchange contract symbol (BTCUSDT_UMCBL)
     """
     out: Dict[str, str] = {}
     j = _req_public("GET", "/api/v2/mix/market/contracts", {"productType": PRODUCT_TYPE})
@@ -175,74 +148,65 @@ def _load_symbol_map() -> Dict[str, str]:
     _dbg("symbol_map size:", len(out))
     return out
 
-
 def _resolve_exchange_symbol(core: str) -> str:
-    """core(예: DOGEUSDT) → 거래소가 요구하는 심볼 문자열로 변환(캐시 사용)."""
     core = convert_symbol(core)
     now = time.time()
     cached = _SYMBOL_CACHE.get(core)
     if cached and now - cached[1] < _SYMBOL_CACHE_TTL:
         return cached[0]
-    # 캐시 미스 → 계약목록 조회
     m = _load_symbol_map()
-    ex = m.get(core)
-    if not ex:
-        # 마지막 폴백: 알려진 접미사로 시도
-        ex = core + "_UMCBL"
+    ex = m.get(core) or (core + "_UMCBL")  # last resort
     _SYMBOL_CACHE[core] = (ex, now)
     return ex
 
-# =========================
-# 마켓/스펙
-# =========================
+# -------- Market / Specs --------
 def get_last_price(core: str) -> Optional[float]:
     """
-    가격 조회(튼튼한 폴백 체인)
-    1) v2 ticker (symbol, productType)
-    2) v2 tickers 목록(productType)에서 심볼 매칭
-    3) v2 candles(1m) 마지막 종가
-    4) v1 ticker
-    5) v1 depth 최상단 호가(mid)
+    Solid price retrieval:
+    1) v2 market ticker (base symbol, +productType)
+    2) v2 market tickers (list) then match either base or exchange id
+    3) v2 candles (1m, base symbol)
+    4) v1 ticker (exchange id)
+    5) v1 depth → mid price
     """
+    ex_sym = _resolve_exchange_symbol(core)         # e.g., DOGEUSDT_UMCBL
+    base   = _v2_market_symbol(ex_sym)              # e.g., DOGEUSDT
+
     # 1) v2 ticker
-    sym = _resolve_exchange_symbol(core)
-    j = _req_public("GET", "/api/v2/mix/market/ticker", {"symbol": sym, "productType": PRODUCT_TYPE})
+    j1 = _req_public("GET", "/api/v2/mix/market/ticker", {"symbol": base, "productType": PRODUCT_TYPE})
     try:
-        data = j.get("data") or {}
-        last = data.get("last")
-        if last is not None:
-            px = float(last)
-            if px > 0:
-                return px
+        data = j1.get("data") or {}
+        last = data.get("last") or data.get("close")
+        if last is not None and float(last) > 0:
+            return float(last)
     except Exception:
         pass
 
-    # 2) v2 tickers 목록
+    # 2) v2 tickers (list)
     j2 = _req_public("GET", "/api/v2/mix/market/tickers", {"productType": PRODUCT_TYPE})
     try:
-        arr = j2.get("data") or []
-        for it in arr:
-            if (it.get("symbol") or "").upper() == sym:
-                last = it.get("last")
+        for it in j2.get("data") or []:
+            sym_field = (it.get("symbol") or "").upper()
+            if sym_field in (base, ex_sym):
+                last = it.get("last") or it.get("close")
                 if last is not None and float(last) > 0:
                     return float(last)
     except Exception:
         pass
 
-    # 3) v2 candles 1m
-    j3 = _req_public("GET", "/api/v2/mix/market/candles", {"symbol": sym, "granularity": "60"})
+    # 3) v2 candles (1m)
+    j3 = _req_public("GET", "/api/v2/mix/market/candles", {"symbol": base, "granularity": "60"})
     try:
         arr = j3.get("data") or []
         if arr:
-            # [ts, open, high, low, close, volume, ...] 형태
             close_px = float(arr[0][4])
             if close_px > 0:
                 return close_px
     except Exception:
         pass
 
-    # 4) v1 ticker
-    j4 = _req_public("GET", "/api/mix/v1/market/ticker", {"symbol": sym})
+    # 4) v1 ticker (needs exchange id)
+    j4 = _req_public("GET", "/api/mix/v1/market/ticker", {"symbol": ex_sym})
     try:
         data = j4.get("data") or {}
         last = data.get("last")
@@ -252,7 +216,7 @@ def get_last_price(core: str) -> Optional[float]:
         pass
 
     # 5) v1 depth → mid
-    j5 = _req_public("GET", "/api/mix/v1/market/depth", {"symbol": sym, "limit": 1})
+    j5 = _req_public("GET", "/api/mix/v1/market/depth", {"symbol": ex_sym, "limit": 1})
     try:
         data = j5.get("data") or {}
         bids = data.get("bids") or []
@@ -264,20 +228,17 @@ def get_last_price(core: str) -> Optional[float]:
                 return mid
     except Exception:
         pass
-
-    _dbg("get_last_price FAIL for", core, "->", sym, "responses:", j)
     return None
 
-
 def get_symbol_spec(core: str) -> Dict[str, Any]:
-    sym = _resolve_exchange_symbol(core)
+    ex_sym = _resolve_exchange_symbol(core)
     size_step, price_step = DEFAULT_SIZE_STEP, DEFAULT_PRICE_STEP
 
     # v2 instruments
     j = _req_public("GET", "/api/v2/mix/market/contracts", {"productType": PRODUCT_TYPE})
     try:
         for it in j.get("data") or []:
-            if (it.get("symbol") or "").upper() == sym:
+            if (it.get("symbol") or "").upper() == ex_sym:
                 ps = it.get("priceTick"); ss = it.get("sizeTick")
                 if ps: price_step = float(ps)
                 if ss: size_step  = float(ss)
@@ -289,7 +250,7 @@ def get_symbol_spec(core: str) -> Dict[str, Any]:
     j1 = _req_public("GET", "/api/mix/v1/market/contracts", {})
     try:
         for it in j1.get("data") or []:
-            if (it.get("symbol") or "").upper() == sym:
+            if (it.get("symbol") or "").upper() == ex_sym:
                 ps = it.get("priceEndStep") or it.get("priceTick")
                 ss = it.get("sizeTick") or it.get("volumePlace")
                 if ps: price_step = float(ps)
@@ -302,34 +263,33 @@ def get_symbol_spec(core: str) -> Dict[str, Any]:
 
     return {"sizeStep": size_step, "priceStep": price_step}
 
-
 def symbol_exists(core: str) -> bool:
-    sym = _resolve_exchange_symbol(core)
-    j = _req_public("GET", "/api/v2/mix/market/ticker", {"symbol": sym, "productType": PRODUCT_TYPE})
+    # Use base symbol for v2 market ping
+    base = _v2_market_symbol(core)
+    j = _req_public("GET", "/api/v2/mix/market/ticker", {"symbol": base, "productType": PRODUCT_TYPE})
     return bool(j.get("data"))
 
-# =========================
-# 계정/포지션
-# =========================
+# -------- Account / Positions --------
 def set_position_mode(mode: str = "oneway") -> Dict[str, Any]:
     m = (mode or "oneway").lower()
     if m not in ("oneway", "hedge"): m = "oneway"
     body = {"productType": PRODUCT_TYPE, "posMode": "one_way" if m=="oneway" else "hedge"}
     return _req_private("POST", "/api/v2/mix/account/set-position-mode", body)
 
+def _margin_mode() -> str:
+    return _margin_mode_v2()
 
 def set_leverage(core: str, leverage: float) -> Dict[str, Any]:
-    sym = _resolve_exchange_symbol(core)
+    ex_sym = _resolve_exchange_symbol(core)
     body = {
-        "symbol": sym,
+        "symbol": ex_sym,
         "productType": PRODUCT_TYPE,
         "marginCoin": "USDT",
         "leverage": str(int(leverage or 1)),
         "holdSide": "long",
-        "marginMode": _margin_mode_v2(),
+        "marginMode": _margin_mode(),
     }
     return _req_private("POST", "/api/v2/mix/account/set-leverage", body)
-
 
 def get_open_positions(symbol: Optional[str] = None) -> List[Dict[str, Any]]:
     q = {"productType": PRODUCT_TYPE}
@@ -339,7 +299,6 @@ def get_open_positions(symbol: Optional[str] = None) -> List[Dict[str, Any]]:
         data = j.get("data") or []
         for it in data:
             if symbol:
-                # 비교 대상도 해석 필요
                 target = _resolve_exchange_symbol(symbol).upper()
                 if (it.get("symbol") or "").upper() != target:
                     continue
@@ -356,15 +315,12 @@ def get_open_positions(symbol: Optional[str] = None) -> List[Dict[str, Any]]:
         pass
     return arr
 
-# =========================
-# 주문
-# =========================
+# -------- Orders --------
 def _normalize_side_for_oneway(side: str) -> str:
     s = (side or "").lower()
     if s == "long": return "buy"
     if s == "short": return "sell"
     return "buy"
-
 
 def _compute_size(core: str, amount_usdt: float, leverage: float) -> float:
     price = float(get_last_price(core) or 0.0)
@@ -379,14 +335,13 @@ def _compute_size(core: str, amount_usdt: float, leverage: float) -> float:
     size = round_down_step(size, float(spec.get("sizeStep", DEFAULT_SIZE_STEP)))
     return size
 
-
 def place_market_order(core: str, amount_usdt: float, side: str, leverage: float) -> Dict[str, Any]:
-    sym = _resolve_exchange_symbol(core)
+    ex_sym = _resolve_exchange_symbol(core)
     size = _compute_size(core, amount_usdt, leverage)
     if size <= 0:
         return {"code": "LOCAL_TICKER_FAIL", "msg": "ticker_none or size<=0"}
 
-    # (선택) 레버리지 선반영 (실패해도 주문은 진행)
+    # best-effort set leverage (ignore failures)
     try:
         if leverage and leverage > 0:
             _ = set_leverage(core, leverage)
@@ -395,48 +350,38 @@ def place_market_order(core: str, amount_usdt: float, side: str, leverage: float
 
     req_side = _normalize_side_for_oneway(side)
     body = {
-        "symbol": sym,
+        "symbol": ex_sym,
         "productType": PRODUCT_TYPE,
         "marginCoin": "USDT",
         "size": f"{size}",
         "side": req_side,             # buy/sell
         "orderType": "market",
-        "force": "gtc",
+        "timeInForceValue": "normal",
         "reduceOnly": False,
-        "marginMode": _margin_mode_v2(),  # crossed / isolated
+        "marginMode": _margin_mode(),
     }
     j = _req_private("POST", "/api/v2/mix/order/place-order", body)
-    ok = str(j.get("code", "")) in ("00000", "0", "200")
-    return j if ok else {"code": j.get("code", "HTTP_ERR"), "msg": j.get("msg") or j}
+    return j
 
-
-def place_reduce_by_size(core: str, size: float, side: str) -> Dict[str, Any]:
-    sym = _resolve_exchange_symbol(core)
-    spec = get_symbol_spec(core)
-    size = round_down_step(float(size), float(spec.get("sizeStep", DEFAULT_SIZE_STEP)))
-    if size <= 0:
-        return {"code": "LOCAL_SIZE_ZERO", "msg": "size<=0"}
-
-    req_side = _normalize_side_for_oneway(side)
+def place_reduce_by_size(core: str, contracts: float, side: str) -> Dict[str, Any]:
+    ex_sym = _resolve_exchange_symbol(core)
+    req_side = "sell" if (side or "").lower() == "long" else "buy"  # reduce opposite
     body = {
-        "symbol": sym,
+        "symbol": ex_sym,
         "productType": PRODUCT_TYPE,
         "marginCoin": "USDT",
-        "size": f"{size}",
-        "side": req_side,            # buy/sell
+        "size": f"{contracts}",
+        "side": req_side,
         "orderType": "market",
-        "force": "gtc",
+        "timeInForceValue": "normal",
         "reduceOnly": True,
-        "marginMode": _margin_mode_v2(),
+        "marginMode": _margin_mode(),
     }
     j = _req_private("POST", "/api/v2/mix/order/place-order", body)
-    ok = str(j.get("code", "")) in ("00000", "0", "200")
-    return j if ok else {"code": j.get("code", "HTTP_ERR"), "msg": j.get("msg") or j}
-
+    return j
 
 def close_all_for_symbol(core: str) -> Dict[str, Any]:
-    sym = _resolve_exchange_symbol(core)
-    body = {"symbol": sym, "marginCoin": "USDT", "productType": PRODUCT_TYPE}
+    ex_sym = _resolve_exchange_symbol(core)
+    body = {"symbol": ex_sym, "marginCoin": "USDT", "productType": PRODUCT_TYPE}
     j = _req_private("POST", "/api/v2/mix/order/close-positions", body)
-    ok = str(j.get("code", "")) in ("00000", "0", "200")
-    return j if ok else {"code": j.get("code", "HTTP_ERR"), "msg": j.get("msg") or j}
+    return j
