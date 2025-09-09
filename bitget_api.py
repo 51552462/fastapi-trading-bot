@@ -3,8 +3,9 @@
 bitget_api.py — Bitget REST 어댑터 (USDT Perp / ONEWAY)
 
 업데이트 요약
-- 심볼 자동 해석: /api/v2/mix/market/contracts 로 실심볼 조회해 매핑(캐시)
+- 심볼 자동 해석(동적 조회 + 캐시): /api/v2/mix/market/contracts(productType=USDT-FUTURES)
 - 주문/레버리지/청산에 productType, marginMode 항상 포함 (v2 엄격검증 대응)
+- 가격 조회(get_last_price) 강화: v2 ticker(+productType) → v2 tickers 목록 → v2 candles → v1 ticker → v1 depth 순서 폴백
 - 스텝 내림 반올림/명목가·증거금 해석/oneway reduceOnly 등 기존 기능 유지
 """
 
@@ -46,6 +47,9 @@ HTTP_TIMEOUT = 8
 # v2에서 주문/레버리지/포지션 조회 시 요구됨
 PRODUCT_TYPE = "USDT-FUTURES"
 
+# 디버그 로그 (서버 콘솔에만)
+BITGET_DEBUG = os.getenv("BITGET_DEBUG", "0") == "1"
+
 # 계약심볼 캐시(실심볼 ↔ 코어심볼)
 _SYMBOL_CACHE: Dict[str, Tuple[str, float]] = {}  # core -> (exchange_symbol, ts)
 _SYMBOL_CACHE_TTL = float(os.getenv("SYMBOL_CACHE_TTL", "300"))  # 5분
@@ -53,6 +57,10 @@ _SYMBOL_CACHE_TTL = float(os.getenv("SYMBOL_CACHE_TTL", "300"))  # 5분
 # =========================
 # 내부 유틸
 # =========================
+def _dbg(*a):
+    if BITGET_DEBUG:
+        print("[bitget]", *a)
+
 def convert_symbol(s: str) -> str:
     """
     다양한 표기(BINANCE:BTCUSDT, BTC-USDT, BTCUSDT_UMCBL, BTCUSDT.PERP)를
@@ -164,6 +172,7 @@ def _load_symbol_map() -> Dict[str, str]:
                 out[core] = ex_sym
     except Exception:
         pass
+    _dbg("symbol_map size:", len(out))
     return out
 
 
@@ -178,7 +187,7 @@ def _resolve_exchange_symbol(core: str) -> str:
     m = _load_symbol_map()
     ex = m.get(core)
     if not ex:
-        # 마지막 폴백: 알려진 접미사로 시도 (환경에 따라 필요할 수 있음)
+        # 마지막 폴백: 알려진 접미사로 시도
         ex = core + "_UMCBL"
     _SYMBOL_CACHE[core] = (ex, now)
     return ex
@@ -187,24 +196,76 @@ def _resolve_exchange_symbol(core: str) -> str:
 # 마켓/스펙
 # =========================
 def get_last_price(core: str) -> Optional[float]:
+    """
+    가격 조회(튼튼한 폴백 체인)
+    1) v2 ticker (symbol, productType)
+    2) v2 tickers 목록(productType)에서 심볼 매칭
+    3) v2 candles(1m) 마지막 종가
+    4) v1 ticker
+    5) v1 depth 최상단 호가(mid)
+    """
+    # 1) v2 ticker
     sym = _resolve_exchange_symbol(core)
-    j = _req_public("GET", "/api/v2/mix/market/ticker", {"symbol": sym})
+    j = _req_public("GET", "/api/v2/mix/market/ticker", {"symbol": sym, "productType": PRODUCT_TYPE})
     try:
         data = j.get("data") or {}
         last = data.get("last")
         if last is not None:
-            return float(last)
+            px = float(last)
+            if px > 0:
+                return px
     except Exception:
         pass
-    # v1 fallback
-    j1 = _req_public("GET", "/api/mix/v1/market/ticker", {"symbol": sym})
+
+    # 2) v2 tickers 목록
+    j2 = _req_public("GET", "/api/v2/mix/market/tickers", {"productType": PRODUCT_TYPE})
     try:
-        data = j1.get("data") or {}
+        arr = j2.get("data") or []
+        for it in arr:
+            if (it.get("symbol") or "").upper() == sym:
+                last = it.get("last")
+                if last is not None and float(last) > 0:
+                    return float(last)
+    except Exception:
+        pass
+
+    # 3) v2 candles 1m
+    j3 = _req_public("GET", "/api/v2/mix/market/candles", {"symbol": sym, "granularity": "60"})
+    try:
+        arr = j3.get("data") or []
+        if arr:
+            # [ts, open, high, low, close, volume, ...] 형태
+            close_px = float(arr[0][4])
+            if close_px > 0:
+                return close_px
+    except Exception:
+        pass
+
+    # 4) v1 ticker
+    j4 = _req_public("GET", "/api/mix/v1/market/ticker", {"symbol": sym})
+    try:
+        data = j4.get("data") or {}
         last = data.get("last")
-        if last is not None:
+        if last is not None and float(last) > 0:
             return float(last)
     except Exception:
         pass
+
+    # 5) v1 depth → mid
+    j5 = _req_public("GET", "/api/mix/v1/market/depth", {"symbol": sym, "limit": 1})
+    try:
+        data = j5.get("data") or {}
+        bids = data.get("bids") or []
+        asks = data.get("asks") or []
+        if bids and asks:
+            bid = float(bids[0][0]); ask = float(asks[0][0])
+            mid = (bid + ask) / 2.0
+            if mid > 0:
+                return mid
+    except Exception:
+        pass
+
+    _dbg("get_last_price FAIL for", core, "->", sym, "responses:", j)
     return None
 
 
@@ -244,7 +305,7 @@ def get_symbol_spec(core: str) -> Dict[str, Any]:
 
 def symbol_exists(core: str) -> bool:
     sym = _resolve_exchange_symbol(core)
-    j = _req_public("GET", "/api/v2/mix/market/ticker", {"symbol": sym})
+    j = _req_public("GET", "/api/v2/mix/market/ticker", {"symbol": sym, "productType": PRODUCT_TYPE})
     return bool(j.get("data"))
 
 # =========================
@@ -278,7 +339,9 @@ def get_open_positions(symbol: Optional[str] = None) -> List[Dict[str, Any]]:
         data = j.get("data") or []
         for it in data:
             if symbol:
-                if (it.get("symbol") or "").upper() != _resolve_exchange_symbol(symbol).upper():
+                # 비교 대상도 해석 필요
+                target = _resolve_exchange_symbol(symbol).upper()
+                if (it.get("symbol") or "").upper() != target:
                     continue
             sz = float(it.get("total") or it.get("holdVolume") or 0.0)
             sd = (it.get("holdSide") or it.get("side") or "").lower()
@@ -305,7 +368,8 @@ def _normalize_side_for_oneway(side: str) -> str:
 
 def _compute_size(core: str, amount_usdt: float, leverage: float) -> float:
     price = float(get_last_price(core) or 0.0)
-    if price <= 0: return 0.0
+    if price <= 0: 
+        return 0.0
     spec = get_symbol_spec(core)
     if AMOUNT_MODE == "margin":
         notional = float(amount_usdt) * float(leverage or 1.0)
@@ -326,8 +390,8 @@ def place_market_order(core: str, amount_usdt: float, side: str, leverage: float
     try:
         if leverage and leverage > 0:
             _ = set_leverage(core, leverage)
-    except Exception:
-        pass
+    except Exception as e:
+        _dbg("set_leverage err:", e)
 
     req_side = _normalize_side_for_oneway(side)
     body = {
