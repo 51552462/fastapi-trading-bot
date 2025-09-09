@@ -1,9 +1,10 @@
 # -*- coding: utf-8 -*-
-# Bitget USDT-M 퍼프 V2 어댑터 — 신규진입 reduceOnly 제거 / 청산 reduceOnly True / 심볼 정규화 / 시세 폴백
+# Bitget USDT-M 퍼프 V2 어댑터 — 신규진입 reduceOnly 제거 / 청산 reduceOnly True / 심볼 정규화 / 시세 폴백 / GET 서명 fix
 from __future__ import annotations
 import os, time, json, hmac, hashlib, base64
 from typing import Any, Dict, Optional, Tuple, List
 import requests
+from urllib.parse import urlencode
 
 BITGET_HOST    = os.getenv("BITGET_HOST", "https://api.bitget.com")
 API_KEY        = os.getenv("BITGET_API_KEY", "")
@@ -46,27 +47,43 @@ def _ts_ms() -> str: return str(int(time.time()*1000))
 def _headers(ts: str, sign: str) -> Dict[str,str]:
     return {"ACCESS-KEY":API_KEY,"ACCESS-SIGN":sign,"ACCESS-TIMESTAMP":ts,
             "ACCESS-PASSPHRASE":API_PASSPHRASE,"Content-Type":"application/json"}
-def _sign(ts: str, method: str, path: str, body: str = "") -> str:
-    pre = f"{ts}{method.upper()}{path}{body}"
+
+def _sign(ts: str, method: str, path_with_query: str, body: str = "") -> str:
+    # Bitget prehash: timestamp + method + requestPath(+query) + body
+    pre = f"{ts}{method.upper()}{path_with_query}{body}"
     mac = hmac.new(API_SECRET.encode(), pre.encode(), hashlib.sha256).digest()
     return base64.b64encode(mac).decode()
-def _req_public(m: str, p: str, params=None): 
+
+def _req_public(m: str, p: str, params=None):
     url=BITGET_HOST+p
     try:
-        r = requests.get(url, params=params or {}, timeout=HTTP_TIMEOUT) if m=="GET" else requests.post(url,json=params or {},timeout=HTTP_TIMEOUT)
+        r = requests.get(url, params=params or {}, timeout=HTTP_TIMEOUT) if m=="GET" \
+            else requests.post(url, json=params or {}, timeout=HTTP_TIMEOUT)
         return r.json()
     except Exception as e: return {"code":"HTTP_ERR","msg":f"{type(e).__name__}:{e}"}
+
 def _req_private(m: str, p: str, body=None, query=None):
-    url=BITGET_HOST+p; ts=_ts_ms()
-    body_str=json.dumps(body or {},separators=(",",":"))
-    sign=_sign(ts,m,p, body_str if m!="GET" else "")
+    """
+    FIX: GET 서명 시 query-string 포함
+    """
+    url  = BITGET_HOST + p
+    ts   = _ts_ms()
+    qstr = ""
+    if query:
+        # Bitget는 원래 들어간 순서대로 사인해도 통과하지만, 안정적으로 정렬
+        qstr = "?" + urlencode(sorted([(str(k), str(v)) for k, v in query.items()]))
+    path_for_sign = p + qstr
+    body_str = json.dumps(body or {}, separators=(",", ":")) if m != "GET" else ""
+    sign = _sign(ts, m, path_for_sign, body_str)
+
     try:
-        if m=="GET":
-            r=requests.get(url, params=query or {}, headers=_headers(ts,sign), timeout=HTTP_TIMEOUT)
+        if m == "GET":
+            r = requests.get(url, params=query or {}, headers=_headers(ts, sign), timeout=HTTP_TIMEOUT)
         else:
-            r=requests.post(url, params=query or {}, data=body_str, headers=_headers(ts,sign), timeout=HTTP_TIMEOUT)
+            r = requests.post(url, params=query or {}, data=body_str, headers=_headers(ts, sign), timeout=HTTP_TIMEOUT)
         return r.json()
-    except Exception as e: return {"code":"HTTP_ERR","msg":f"{type(e).__name__}:{e}"}
+    except Exception as e:
+        return {"code":"HTTP_ERR","msg":f"{type(e).__name__}:{e}"}
 
 def _margin_mode_v2() -> str:
     return "crossed" if (MARGIN_MODE_ENV or "cross").startswith("cross") else "isolated"
@@ -171,7 +188,8 @@ def symbol_exists(core:str)->bool:
 def set_position_mode(mode:str="oneway")->Dict[str,Any]:
     m=(mode or "oneway").lower()
     if m not in ("oneway","hedge"): m="oneway"
-    return _req_private("POST","/api/v2/mix/account/set-position-mode",{"productType":PRODUCT_TYPE,"posMode":"one_way" if m=="oneway" else "hedge"})
+    return _req_private("POST","/api/v2/mix/account/set-position-mode",
+                        {"productType":PRODUCT_TYPE,"posMode":"one_way" if m=="oneway" else "hedge"})
 
 def _margin_mode()->str: return "crossed" if (MARGIN_MODE_ENV or "cross").startswith("cross") else "isolated"
 
@@ -181,17 +199,47 @@ def set_leverage(core:str, lev:float)->Dict[str,Any]:
          "leverage":str(int(lev or 1)),"holdSide":"long","marginMode":_margin_mode()})
 
 def get_open_positions(symbol: Optional[str]=None)->List[Dict[str,Any]]:
+    """
+    포지션 조회 (GET 사인 fix 버전)
+    1) v2 all-position
+    2) v1 singlePosition (심볼 맵 기반 폴백) — 일부 계정/지역 편차 대비
+    """
+    out: List[Dict[str, Any]] = []
+
+    # 1) v2
     q={"productType":PRODUCT_TYPE}
-    j=_req_private("GET","/api/v2/mix/position/all-position",query=q)
-    out=[]
+    j=_req_private("GET","/api/v2/mix/position/all-position", query=q)
     try:
         for it in j.get("data") or []:
-            if symbol and _base_symbol(it.get("symbol") or "") != _base_symbol(symbol): continue
+            if symbol and _base_symbol(it.get("symbol") or "") != _base_symbol(symbol): 
+                continue
             sz=float(it.get("total") or it.get("holdVolume") or it.get("available") or 0.0)
             sd=(it.get("holdSide") or it.get("side") or "").lower()
             out.append({"symbol":it.get("symbol"),"size":sz,"side":sd,
                         "entryPrice":float(it.get("avgOpenPrice") or it.get("openPrice") or 0.0)})
-    except: pass
+    except Exception as e:
+        _dbg("v2 all-position parse err", e)
+
+    # 2) v1 폴백 (v2가 빈 배열이거나 None 일 때)
+    if not out:
+        try:
+            m = _load_symbol_map()
+            cores = [symbol] if symbol else list(m.keys())
+            for core in cores:
+                ex = m.get(_base_symbol(core)) or _resolve_exchange_symbol_for_v1(core)
+                j1=_req_private("GET","/api/mix/v1/position/singlePosition", query={"symbol": ex})
+                d = j1.get("data") or {}
+                sz=float(d.get("total") or d.get("holdVolume") or 0.0)
+                if sz>0:
+                    out.append({
+                        "symbol": _base_symbol(core),
+                        "size": sz,
+                        "side": (d.get("holdSide") or d.get("side") or "").lower(),
+                        "entryPrice": float(d.get("avgOpenPrice") or d.get("openPrice") or 0.0)
+                    })
+        except Exception as e:
+            _dbg("v1 singlePosition fallback err", e)
+
     return out
 
 def _normalize_side_for_oneway(s:str)->str:
