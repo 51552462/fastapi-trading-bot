@@ -7,7 +7,7 @@ bitget_api.py — Bitget REST adapter (USDT-M perpetual, one-way)
 - V1 폴백 엔드포인트만 거래소 심볼(ex: BTCUSDT_UMCBL) 사용
 - get_last_price(): v2 단건(+/-productType) → v2 목록(+/-productType) → v2 캔들 → v1 티커 → v1 호가(mid)
 - 주문:
-  * 신규 진입(place_market_order): reduceOnly 필드 '아예 미포함'
+  * 신규 진입(place_market_order): reduceOnly 필드 '아예 미포함' (40017 방지)
   * 부분청산(place_reduce_by_size): reduceOnly=True
   * 전량종료(close_all_for_symbol): v2 close-positions
 """
@@ -362,7 +362,7 @@ def place_market_order(core: str, amount_usdt: float, side: str, leverage: float
         "side": _normalize_side_for_oneway(side),  # buy/sell
         "orderType": "market",
         "timeInForceValue": "normal",
-        # 신규 진입에서 reduceOnly는 '아예 미포함' (40017 방지)
+        # 신규 진입에서 reduceOnly는 '아예 미포함'
         "marginMode": _margin_mode(),
     }
     return _req_private("POST", "/api/v2/mix/order/place-order", body)
