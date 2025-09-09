@@ -1,3 +1,4 @@
+# -*- coding: utf-8 -*-
 # trader.py — 추세보호 + 체결로그 + 기존 기능 유지 + open_positions 안전호출
 import os, time, threading, inspect
 from typing import Dict, Any, Optional, List
@@ -23,7 +24,7 @@ DEFAULT_AMOUNT = float(os.getenv("DEFAULT_AMOUNT", "80"))
 LEVERAGE       = float(os.getenv("LEVERAGE", "5"))
 
 TP1_PCT = float(os.getenv("TP1_PCT", "0.30"))
-TP2_PCT = float(os.getenv("TP2_PCT", "0.5714286"))  # 남은 물량 기준 40%에 해당하도록 기본값 4/7
+TP2_PCT = float(os.getenv("TP2_PCT", "0.5714286"))  # 남은 물량 기준 40%로 떨어지게 4/7
 TP3_PCT = float(os.getenv("TP3_PCT", "1.0"))        # 나머지 전부
 
 STOP_PCT          = float(os.getenv("STOP_PRICE_MOVE", "0.02"))  # ±2%
@@ -51,6 +52,10 @@ POLICY_CLOSE_ALLOW_NEG_ROE   = float(os.getenv("POLICY_CLOSE_ALLOW_NEG_ROE", "0.
 
 # 재진입 쿨다운
 REOPEN_COOLDOWN_SEC = float(os.getenv("REOPEN_COOLDOWN_SEC", "60"))
+
+# --- NEW: 포지션 조회 리트라이/폴백 설정 ---
+TP_RETRY_N     = int(float(os.getenv("TP_RETRY_N", "4")))     # TP/SL 시 원격 조회 재시도 회수
+TP_RETRY_SLEEP = float(os.getenv("TP_RETRY_SLEEP", "0.6"))    # 시도 간 대기 (초)
 
 # -------- 내부 상태 --------
 position_data: Dict[str, Dict[str, Any]] = {}
@@ -121,6 +126,21 @@ def _update_local_state_from_exchange():
         for k in list(position_data.keys()):
             if k not in seen and position_data.get(k,{}).get("size",0) <= 0:
                 position_data.pop(k, None)
+
+def _find_remote_held(symbol: str, side: str, retries: int = None) -> float:
+    """원격 포지션 수량을 리트라이하며 조회."""
+    retries = TP_RETRY_N if retries is None else max(0, int(retries))
+    for i in range(retries + 1):
+        opens = _safe_get_positions()
+        for p in opens:
+            if convert_symbol(p.get("symbol")) == symbol and _norm_side(p.get("side")) == side:
+                return float(p.get("size") or 0.0)
+        time.sleep(TP_RETRY_SLEEP)
+    return 0.0
+
+def _local_cached_held(symbol: str, side: str) -> float:
+    with _POS_LOCK:
+        return float(position_data.get(_key(symbol, side), {}).get("size", 0.0))
 
 # -------- Capacity Guard --------
 def _capacity_loop():
@@ -209,6 +229,7 @@ def take_partial_profit(symbol: str, ratio: float, side: str = "long", reason: s
     """
     ratio > 0 → 잔량 비율만큼 감축
     reason="tp_qty:<수량>" 형태 → 정확 수량만큼 감축
+    - 원격 포지션 조회가 지연될 수 있어 리트라이 & 로컬 캐시 폴백 추가
     """
     symbol = convert_symbol(symbol); side = _norm_side(side)
 
@@ -221,10 +242,11 @@ def take_partial_profit(symbol: str, ratio: float, side: str = "long", reason: s
     if tp_qty is None and (ratio is None or ratio <= 0 or ratio > 1):
         return {"ok": False, "reason": "bad_ratio_or_qty"}
 
-    held = 0.0
-    for p in _safe_get_positions():
-        if convert_symbol(p.get("symbol"))==symbol and _norm_side(p.get("side"))==side:
-            held = float(p.get("size") or 0.0); break
+    # --- 강화: 리트라이해서 원격 포지션 확보 ---
+    held = _find_remote_held(symbol, side)
+    if held <= 0:
+        # 로컬 캐시로도 한 번 더 확인
+        held = _local_cached_held(symbol, side)
     if held <= 0:
         send_telegram(f"⚠️ TP SKIP: 원격 포지션 없음 {symbol}_{side}")
         return {"ok": False, "reason": "no_position"}
@@ -284,17 +306,24 @@ def _policy_close_blocked(symbol: str, side: str, reason: str, entry: float) -> 
 def close_position(symbol: str, side: str = "long", reason: str = "manual"):
     symbol = convert_symbol(symbol); side = _norm_side(side)
 
-    held = entry = 0.0
-    for p in _safe_get_positions():
-        if convert_symbol(p.get("symbol"))==symbol and _norm_side(p.get("side"))==side:
-            held  = float(p.get("size") or 0.0)
-            entry = float(p.get("entryPrice") or 0.0)
-            break
+    # --- 강화: 리트라이해서 원격 포지션 확보 ---
+    held = _find_remote_held(symbol, side)
+    if held <= 0:
+        held = _local_cached_held(symbol, side)
     if held <= 0:
         send_telegram(f"⚠️ CLOSE 스킵: 원격 포지션 없음 {symbol}_{side}")
         return {"ok": False, "reason": "no_position"}
 
-    if reason.startswith("policy") and _policy_close_blocked(symbol, side, reason, entry):
+    # entry px (로컬/원격 혼합)
+    entry = 0.0
+    for p in _safe_get_positions():
+        if convert_symbol(p.get("symbol"))==symbol and _norm_side(p.get("side"))==side:
+            entry = float(p.get("entryPrice") or 0.0)
+            break
+    if entry <= 0:
+        entry = float(position_data.get(_key(symbol, side), {}).get("entry", 0.0))
+
+    if reason.startswith("policy") and _policy_close_blocked(symbol, side, reason, entry or 0.0):
         send_telegram(f"🛡️ POLICY CLOSE BLOCKED by trend-protect: {side.upper()} {symbol} ({reason})")
         return {"ok": False, "reason": "policy_blocked"}
 
@@ -316,8 +345,7 @@ def close_position(symbol: str, side: str = "long", reason: str = "manual"):
         ts_open = float(d.get("ts_open", time.time()))
     log_close_trade(
         ts_open=ts_open, ts_close=time.time(), symbol=symbol, side=side,
-        entry=entry, exit=exit_px, size=qty, pnl_usdt=realized,
-        leverage=LEVERAGE
+        entry=entry, exit=exit_px, size=qty, pnl_usdt=realized, leverage=LEVERAGE
     )
 
     sign = " +" if realized >= 0 else " "
