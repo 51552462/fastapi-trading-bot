@@ -1,8 +1,4 @@
-# trader.py — 기존 기능 유지 + 강화:
-# - 레버리지 5x 기준 ROE -10% 컷(롱-2%/숏+2%) + 가격 ±2% 컷
-# - TP1/TP2 후 본절(BE) 무장
-# - 중복 진입 방지 + 재진입 쿨다운
-# - 텔레그램 알림(진입/TP/리듀스/종료) 유지
+# trader.py — 추세보호 + 체결로그 + 기존 기능 유지
 import os, time, threading
 from typing import Dict, Any, Optional
 
@@ -10,6 +6,12 @@ from bitget_api import (
     convert_symbol, get_last_price, get_open_positions,
     place_market_order, place_reduce_by_size, get_symbol_spec, round_down_step,
 )
+
+# 체결 로그(KPI 파이프라인) — 없으면 no-op
+try:
+    from kpi_pipeline import log_close_trade
+except Exception:
+    def log_close_trade(*args, **kwargs): pass
 
 try:
     from telegram_bot import send_telegram
@@ -22,7 +24,7 @@ LEVERAGE       = float(os.getenv("LEVERAGE", "5"))
 
 TP1_PCT = float(os.getenv("TP1_PCT", "0.30"))
 TP2_PCT = float(os.getenv("TP2_PCT", "0.70"))
-TP3_PCT = float(os.getenv("TP3_PCT", "0.30"))  # 남겨 쓰는 경우 대비
+TP3_PCT = float(os.getenv("TP3_PCT", "0.30"))
 
 STOP_PCT          = float(os.getenv("STOP_PRICE_MOVE", "0.02"))  # ±2%
 STOP_ROE          = float(os.getenv("STOP_ROE", "0.10"))         # -10% ROE
@@ -40,9 +42,14 @@ CAP_CHECK_SEC      = float(os.getenv("CAP_CHECK_SEC", "5"))
 LONG_BYPASS_CAP    = (os.getenv("LONG_BYPASS_CAP", "0") == "1")
 SHORT_BYPASS_CAP   = (os.getenv("SHORT_BYPASS_CAP", "0") == "1")
 
-BE_AFTER_TP1 = os.getenv("BE_AFTER_TP1", "0") == "1"
-BE_AFTER_TP2 = os.getenv("BE_AFTER_TP2", "1") == "1"
+# 추세 보호(Policy close가 섣불리 끊는 것 방지)
+TREND_PROTECT                = os.getenv("TREND_PROTECT", "1") == "1"
+PROTECT_AFTER_TP1            = os.getenv("PROTECT_AFTER_TP1", "1") == "1"
+PROTECT_AFTER_TP2            = os.getenv("PROTECT_AFTER_TP2", "1") == "1"
+POLICY_CLOSE_MIN_HOLD_SEC    = float(os.getenv("POLICY_CLOSE_MIN_HOLD_SEC", "900"))  # 15분
+POLICY_CLOSE_ALLOW_NEG_ROE   = float(os.getenv("POLICY_CLOSE_ALLOW_NEG_ROE", "0.0")) # ROE<=0는 허용
 
+# 재진입 쿨다운(닫고 나서 바로 재진입 방지)
 REOPEN_COOLDOWN_SEC = float(os.getenv("REOPEN_COOLDOWN_SEC", "60"))
 
 # -------- STATE --------
@@ -94,6 +101,7 @@ def _update_local_state_from_exchange():
             d = position_data.setdefault(k, {})
             d["size"]  = float(p.get("size") or 0.0)
             d["entry"] = float(p.get("entryPrice") or 0.0)
+            d.setdefault("ts_open", d.get("ts_open", time.time()))
             if d["size"] <= 0:
                 position_data.pop(k, None)
         for k in list(position_data.keys()):
@@ -158,6 +166,13 @@ def enter_position(symbol: str, side: str = "long", usdt_amount: Optional[float]
         send_telegram(f"❌ OPEN {side.upper()} {symbol} {amount:.1f}USDT fail: {resp}")
         return {"ok": False, "resp": resp}
 
+    with _POS_LOCK:
+        d = position_data.setdefault(k, {})
+        d["ts_open"] = time.time()  # 체결시간 기록(보호/로그용)
+        d["tp1_done"] = d.get("tp1_done", False)
+        d["tp2_done"] = d.get("tp2_done", False)
+        d["be_armed"] = d.get("be_armed", False)
+
     send_telegram(f"✅ OPEN {side.upper()} {symbol} {amount:.2f}USDT @ {leverage or LEVERAGE}x")
     _update_local_state_from_exchange()
     return {"ok": True}
@@ -207,10 +222,36 @@ def take_partial_profit(symbol: str, ratio: float, side: str = "long", reason: s
             d["tp1_done"] = True
         if (abs(ratio - TP2_PCT) < 1e-6 or (d.get("tp1_done") and ratio >= TP2_PCT-1e-6)):
             d["tp2_done"] = True
-        if (BE_AFTER_TP1 and d.get("tp1_done")) or (BE_AFTER_TP2 and d.get("tp2_done")):
+        if (d.get("tp1_done") and os.getenv("BE_AFTER_TP1","0")=="1") or \
+           (d.get("tp2_done") and os.getenv("BE_AFTER_TP2","1")=="1"):
             d["be_armed"] = True
     _update_local_state_from_exchange()
     return {"ok": True}
+
+def _policy_close_blocked(symbol: str, side: str, reason: str, entry: float) -> bool:
+    """AI(policy_*) 강제 종료가 '추세보호' 규칙에 걸리면 True를 반환(=차단)."""
+    if not TREND_PROTECT: 
+        return False
+    try:
+        k = _key(symbol, side)
+        with _POS_LOCK:
+            d = position_data.get(k, {})
+        mark = float(get_last_price(symbol) or 0.0)
+        roe  = _signed_change_pct(side, mark, entry) * LEVERAGE
+        age  = time.time() - float(d.get("ts_open", time.time()))
+        tp_ok = (PROTECT_AFTER_TP1 and d.get("tp1_done")) or (PROTECT_AFTER_TP2 and d.get("tp2_done"))
+        be_armed = d.get("be_armed")
+        # 보호 규칙:
+        # 1) TP1/TP2 이후 양호한 수익(ROE>0) & 최소 홀드시간 미만 → 차단
+        # 2) 본절 무장 중이고 아직 본절(가격 역전) 아님 → 차단
+        if tp_ok and roe > POLICY_CLOSE_ALLOW_NEG_ROE and age < POLICY_CLOSE_MIN_HOLD_SEC:
+            return True
+        if be_armed:
+            if (side=="long" and mark > entry) or (side=="short" and mark < entry):
+                return True
+        return False
+    except Exception:
+        return False
 
 def close_position(symbol: str, side: str = "long", reason: str = "manual"):
     symbol = convert_symbol(symbol); side = _norm_side(side)
@@ -225,6 +266,11 @@ def close_position(symbol: str, side: str = "long", reason: str = "manual"):
         send_telegram(f"⚠️ CLOSE 스킵: 원격 포지션 없음 {symbol}_{side}")
         return {"ok": False, "reason": "no_position"}
 
+    # 🔒 추세 보호: policy_* 이유로 닫으려 할 때 보호 규칙 검사
+    if reason.startswith("policy") and _policy_close_blocked(symbol, side, reason, entry):
+        send_telegram(f"🛡️ POLICY CLOSE BLOCKED by trend-protect: {side.upper()} {symbol} ({reason})")
+        return {"ok": False, "reason": "policy_blocked"}
+
     exit_px = float(get_last_price(symbol) or 0.0)
     realized = 0.0
     if entry > 0 and exit_px > 0:
@@ -237,6 +283,16 @@ def close_position(symbol: str, side: str = "long", reason: str = "manual"):
     if str(resp.get("code","")) != "00000":
         send_telegram(f"❌ CLOSE fail {symbol}_{side}: {resp}")
         return {"ok": False, "resp": resp}
+
+    # 체결 로그 기록(KPI 자동 생성용)
+    with _POS_LOCK:
+        d = position_data.get(_key(symbol, side), {})
+        ts_open = float(d.get("ts_open", time.time()))
+    log_close_trade(
+        ts_open=ts_open, ts_close=time.time(), symbol=symbol, side=side,
+        entry=entry, exit=exit_px, size=qty, pnl_usdt=realized,
+        leverage=LEVERAGE
+    )
 
     sign = " +" if realized >= 0 else " "
     send_telegram(
@@ -280,6 +336,7 @@ def _watchdog_loop():
                     d = position_data.setdefault(k, {})
                     d.setdefault("entry", entry)
                     d.setdefault("size", size)
+                    d.setdefault("ts_open", time.time())
                     if d.get("be_armed"):
                         if (side=="long" and mark <= entry) or (side=="short" and mark >= entry):
                             be_fire = True
@@ -322,15 +379,13 @@ def start_reconciler():
 # -------- RUNTIME OVERRIDES --------
 def runtime_overrides(changed: Dict[str, Any]):
     global STOP_PCT, RECON_INTERVAL_SEC, TP1_PCT, TP2_PCT, TP3_PCT
-    global STOP_ROE, BE_AFTER_TP1, BE_AFTER_TP2, REOPEN_COOLDOWN_SEC
+    global STOP_ROE, REOPEN_COOLDOWN_SEC
     if "STOP_PRICE_MOVE" in changed: STOP_PCT = float(changed["STOP_PRICE_MOVE"])
     if "STOP_ROE" in changed:        STOP_ROE = float(changed["STOP_ROE"])
     if "RECON_INTERVAL_SEC" in changed: RECON_INTERVAL_SEC = float(changed["RECON_INTERVAL_SEC"])
     if "TP1_PCT" in changed: TP1_PCT = float(changed["TP1_PCT"])
     if "TP2_PCT" in changed: TP2_PCT = float(changed["TP2_PCT"])
     if "TP3_PCT" in changed: TP3_PCT = float(changed["TP3_PCT"])
-    if "BE_AFTER_TP1" in changed: BE_AFTER_TP1 = bool(int(changed["BE_AFTER_TP1"]))
-    if "BE_AFTER_TP2" in changed: BE_AFTER_TP2 = bool(int(changed["BE_AFTER_TP2"]))
     if "REOPEN_COOLDOWN_SEC" in changed: REOPEN_COOLDOWN_SEC = float(changed["REOPEN_COOLDOWN_SEC"])
 
 def apply_runtime_overrides(changed: Dict[str, Any]):
