@@ -1,4 +1,4 @@
-# bitget_api_spot.py  (Spot symbols from v2, rest kept the same)
+# bitget_api_spot.py  (v2 symbols, smart _SPBL handling)
 import os, time, json, hmac, hashlib, base64, requests, math, re
 from typing import Dict, Optional
 
@@ -11,7 +11,7 @@ API_PASSPHRASE = os.getenv("BITGET_API_PASSWORD", "")
 # how long to block a symbol after 40309 (removed) – default 12h
 REMOVED_BLOCK_TTL = int(os.getenv("REMOVED_BLOCK_TTL", "43200"))
 
-# ---------- small rate-limit helper ----------
+# ---------- rate-limit helper ----------
 _last_call: Dict[str, float] = {}
 def _rl(key: str, min_interval: float = 0.08):
     now = time.time()
@@ -41,7 +41,7 @@ def _headers(method: str, path_with_query: str, body: str = "") -> Dict[str, str
         "locale": "en-US",
     }
 
-# ---------- symbol helpers ----------
+# ---------- aliases ----------
 ALIASES: Dict[str, str] = {}
 _alias_env = os.getenv("SYMBOL_ALIASES_JSON", "")
 if _alias_env:
@@ -55,14 +55,6 @@ def convert_symbol(sym: str) -> str:
     if s.endswith("PERP"):
         s = s[:-4]
     return ALIASES.get(s, s)
-
-def _spot_symbol(sym: str) -> str:
-    """
-    Orders/tickers on v1 endpoints still commonly expect *_SPBL.
-    We normalize to that form for order/ticker calls.
-    """
-    base = convert_symbol(sym)
-    return base if base.endswith("_SPBL") else f"{base}_SPBL"
 
 # ---------- removed symbol cache ----------
 _REMOVED: Dict[str, float] = {}  # base -> until_ts
@@ -81,8 +73,8 @@ def is_symbol_removed(symbol: str) -> bool:
         return False
     return True
 
-# ---------- symbol/spec cache (from v2 endpoint) ----------
-_PROD_CACHE = {"ts": 0.0, "data": {}}
+# ---------- symbol/spec cache (v2 endpoint) ----------
+_PROD_CACHE = {"ts": 0.0, "data": {}}  # key -> spec
 
 def _to_float(x, default: float = 0.0) -> float:
     try:
@@ -99,19 +91,17 @@ def _to_float(x, default: float = 0.0) -> float:
 
 def _refresh_products_cache_v2():
     """
-    Use v2 symbols endpoint:
-      GET /api/v2/spot/public/symbols
-    Returns entries like:
-      {
-        "symbol":"PRIMEUSDT",
-        "status":"online",
-        "pricePrecision":"5",
-        "quantityPrecision":"2",
-        "quotePrecision":"5",
-        "minTradeUSDT":"1",
-        "minTradeAmount":"0",
-        ...
-      }
+    GET /api/v2/spot/public/symbols
+    data[i]: {
+      "symbol":"PRIMEUSDT",
+      "status":"online",
+      "pricePrecision":"5",
+      "quantityPrecision":"2",
+      "quotePrecision":"5",
+      "minTradeUSDT":"1",
+      "minTradeAmount":"0",
+      ...
+    }
     """
     path = "/api/v2/spot/public/symbols"
     try:
@@ -126,7 +116,6 @@ def _refresh_products_cache_v2():
                 continue
             qty_prec   = int(_to_float(it.get("quantityPrecision"), 6))
             price_prec = int(_to_float(it.get("pricePrecision"), 6))
-            # prefer minTradeUSDT, fallback to minTradeAmount
             min_quote  = _to_float(it.get("minTradeUSDT"), _to_float(it.get("minTradeAmount"), 1.0))
             status_raw = it.get("status")
             tradable   = True
@@ -141,29 +130,27 @@ def _refresh_products_cache_v2():
                 "minQuote":  min_quote if min_quote > 0 else 1.0,
                 "tradable":  tradable,
             }
-            # store under multiple keys to avoid mismatches
+            # store under multiple keys for compatibility
             m[sym_base] = spec
             m[f"{sym_base}_SPBL"] = spec
-            # legacy keys without slash/dash also map to same spec
             m[sym_base.replace("/", "").replace("-", "")] = spec
-
         _PROD_CACHE["data"] = m
         _PROD_CACHE["ts"] = time.time()
     except Exception as e:
         print("spot products v2 refresh fail:", e)
 
-def get_symbol_spec_spot(symbol: str) -> Dict[str, float]:
-    now = time.time()
-    if now - _PROD_CACHE["ts"] > 600 or not _PROD_CACHE["data"]:
+def _ensure_products_cache():
+    if not _PROD_CACHE["data"] or time.time() - _PROD_CACHE["ts"] > 600:
         _refresh_products_cache_v2()
+
+def get_symbol_spec_spot(symbol: str) -> Dict[str, float]:
+    _ensure_products_cache()
     base = convert_symbol(symbol)
-    key1 = _spot_symbol(symbol)  # e.g. PRIMEUSDT_SPBL
-    key2 = base                  # e.g. PRIMEUSDT
-    spec = _PROD_CACHE["data"].get(key1) or _PROD_CACHE["data"].get(key2)
+    key1 = f"{base}_SPBL"
+    spec = _PROD_CACHE["data"].get(base) or _PROD_CACHE["data"].get(key1)
     if not spec:
-        # safe default
         spec = {"qtyStep": 0.000001, "priceStep": 0.000001, "minQuote": 1.0, "tradable": True}
-        _PROD_CACHE["data"][key1] = spec
+        _PROD_CACHE["data"][base] = spec
     return spec
 
 def is_tradable(symbol: str) -> bool:
@@ -178,24 +165,37 @@ def round_down_step(x: float, step: float) -> float:
     k = math.floor(float(x) / step)
     return round(k * step, 12)
 
-def _step_to_scale(step: float) -> int:
+def _scale_from_step(step: float) -> int:
     if step <= 0:
         return 6
     p = round(-math.log10(step))
     return max(0, int(p))
 
-# ---------- ticker (keep v1; it accepts *_SPBL) ----------
+# ---------- symbol used for order/ticker ----------
+def _spot_symbol(sym: str) -> str:
+    """
+    Use base symbol if v2 cache has it (e.g. PRIMEUSDT).
+    Otherwise, fall back to *_SPBL (e.g. BTCUSDT_SPBL).
+    """
+    base = convert_symbol(sym)
+    _ensure_products_cache()
+    if base in _PROD_CACHE["data"]:
+        return base            # PRIMEUSDT -> PRIMEUSDT
+    # fallback
+    return base if base.endswith("_SPBL") else f"{base}_SPBL"
+
+# ---------- ticker (keep v1 endpoint; accepts base or *_SPBL depending on symbol) ----------
 _SPOT_TICKER_CACHE: Dict[str, tuple] = {}
 SPOT_TICKER_TTL = float(os.getenv("SPOT_TICKER_TTL", "2.5"))
 
 def get_last_price_spot(symbol: str, retries: int = 5, sleep_base: float = 0.18) -> Optional[float]:
-    sym_spbl = _spot_symbol(symbol)
-    c = _SPOT_TICKER_CACHE.get(sym_spbl)
+    sym = _spot_symbol(symbol)
+    c = _SPOT_TICKER_CACHE.get(sym)
     now = time.time()
     if c and now - c[0] <= SPOT_TICKER_TTL:
         return float(c[1])
 
-    path = f"/api/spot/v1/market/ticker?symbol={sym_spbl}"
+    path = f"/api/spot/v1/market/ticker?symbol={sym}"
     for i in range(retries):
         try:
             _rl("spot_ticker", 0.06)
@@ -213,7 +213,7 @@ def get_last_price_spot(symbol: str, retries: int = 5, sleep_base: float = 0.18)
             if px:
                 v = float(px)
                 if v > 0:
-                    _SPOT_TICKER_CACHE[sym_spbl] = (time.time(), v)
+                    _SPOT_TICKER_CACHE[sym] = (time.time(), v)
                     return v
         except Exception:
             pass
@@ -283,7 +283,7 @@ def get_spot_free_qty(symbol: str, fresh: bool = False) -> float:
     m = get_spot_balances()
     return float(m.get(base, 0.0))
 
-# ---------- order helpers ----------
+# ---------- error text helper ----------
 def _extract_code_text(resp_text: str) -> Dict[str, str]:
     try:
         j = json.loads(resp_text)
@@ -295,7 +295,7 @@ def _extract_code_text(resp_text: str) -> Dict[str, str]:
     n = re.search(r'"msg"\s*:\s*"(?P<msg>[^"]+)"', resp_text or "")
     return {"code": m.group("code") if m else "", "msg": n.group("msg") if n else ""}
 
-# ---------- orders (keep v1 place-order; symbol = *_SPBL) ----------
+# ---------- orders (keep v1 place-order; symbol may be base or *_SPBL) ----------
 def place_spot_market_buy(symbol: str, usdt_amount: float) -> Dict:
     if not is_tradable(symbol):
         mark_symbol_removed(symbol)
@@ -307,9 +307,10 @@ def place_spot_market_buy(symbol: str, usdt_amount: float) -> Dict:
         return {"code": "LOCAL_MIN_QUOTE", "msg": f"need>={min_quote}USDT"}
 
     amt_str = f"{float(usdt_amount):.6f}".rstrip("0").rstrip(".")
+    sym = _spot_symbol(symbol)
     path = "/api/spot/v1/trade/orders"
     body = {
-        "symbol": _spot_symbol(symbol),
+        "symbol": sym,
         "side": "buy",
         "orderType": "market",
         "force": "gtc",
@@ -340,21 +341,16 @@ def place_spot_market_sell_qty(symbol: str, qty: float) -> Dict:
     spec = get_symbol_spec_spot(symbol)
     step = float(spec.get("qtyStep", 1e-6))
 
-    def _scale_from_step(s: float) -> int:
-        if s <= 0:
-            return 6
-        p = round(-math.log10(s))
-        return max(0, int(p))
-
     def _fmt(q: float, s: float) -> str:
         q = round_down_step(q, s)
         scale = _scale_from_step(s)
         return (f"{q:.{scale}f}").rstrip("0").rstrip(".") if scale > 0 else str(int(q))
 
     qty_str = _fmt(qty, step)
+    sym = _spot_symbol(symbol)
     path = "/api/spot/v1/trade/orders"
     body = {
-        "symbol": _spot_symbol(symbol),
+        "symbol": sym,
         "side": "sell",
         "orderType": "market",
         "force": "gtc",
@@ -374,7 +370,7 @@ def place_spot_market_sell_qty(symbol: str, qty: float) -> Dict:
             mark_symbol_removed(symbol)
             return {"code": f"HTTP_{res.status_code}", "msg": txt}
 
-        # 40808 → precision resubmit
+        # 40808 → precision resubmit with server-suggested scale
         m = re.search(r"(?:checkBDScale|checkScale)[\"']?\s*[:=]\s*([0-9]+)", txt)
         if res.status_code == 400 and m:
             chk = int(m.group(1))
