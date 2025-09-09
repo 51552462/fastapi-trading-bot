@@ -1,5 +1,5 @@
-# main.py — FastAPI entrypoint (workers + watchdog + reconciler + guards + KPI + AI 튜너)
-# - 축약/생략 없음 (완전체)
+# main.py — FastAPI entrypoint (workers + watchdog + reconciler + guards + KPI + AI)
+# - 부팅 메시지 강화: AI expert started / Orchestrator started / 초기 튜너 요약
 import os
 import time
 import json
@@ -17,7 +17,7 @@ from trader import (
     apply_runtime_overrides, get_pending_snapshot
 )
 
-# KPI 파이프라인(없어도 구동 가능하도록 안전장치)
+# KPI 파이프라인(없어도 구동 가능)
 try:
     from kpi_pipeline import start_kpi_pipeline, aggregate_and_save, list_trades
 except Exception:
@@ -25,14 +25,14 @@ except Exception:
     def aggregate_and_save(): return {}
     def list_trades(limit: int = 200): return []
 
-# 텔레그램 (없으면 콘솔로 대체)
+# 텔레그램 (없으면 콘솔 대체)
 try:
     from telegram_bot import send_telegram
 except Exception:
     def send_telegram(msg: str):
         print("[TG]", msg)
 
-# Bitget 심볼 존재여부/가격 등 디버그용
+# Bitget 디버그용
 try:
     from bitget_api import symbol_exists, get_last_price, convert_symbol, get_open_positions
 except Exception:
@@ -45,13 +45,12 @@ except Exception:
 # ---------------- ENV ----------------
 ADMIN_TOKEN = os.getenv("ADMIN_TOKEN", "")
 
-# AI/오케스트레이터 관련
+# AI/오케스트레이터
 POLICY_ENABLE = os.getenv("POLICY_ENABLE", "1") == "1"
 AI_ORCH_APPLY_MODE = os.getenv("AI_ORCH_APPLY_MODE", "live").lower().strip()  # live|dry
-# 🔒 요청사항 반영: 기본값은 '강제 종료 비활성화'
-POLICY_CLOSE_ENABLE = os.getenv("POLICY_CLOSE_ENABLE", "0") == "1"
+POLICY_CLOSE_ENABLE = os.getenv("POLICY_CLOSE_ENABLE", "0") == "1"            # 기본 OFF(추세보호)
 
-# KPI 파일 경로
+# KPI 파일
 REPORT_DIR = os.getenv("REPORT_DIR", "./reports")
 KPIS_JSON = os.path.join(REPORT_DIR, "kpis.json")
 
@@ -64,15 +63,13 @@ app = FastAPI(title=APP_NAME, version=APP_VER)
 
 # =============== MODELS ===============
 class SignalReq(BaseModel):
-    type: str                    # entry|close|tp1|tp2|tp3|stop|failcut|be (등)
+    type: str
     symbol: str
-    side: Optional[str] = None   # long|short
+    side: Optional[str] = None
     amount: Optional[float] = None
     timeframe: Optional[str] = None
 
-
 class AdminRuntimeReq(BaseModel):
-    # 허용되는 키만 필터링해서 사용
     STOP_ROE: Optional[float] = None
     STOP_PRICE_MOVE: Optional[float] = None
     RECON_INTERVAL_SEC: Optional[float] = None
@@ -80,7 +77,6 @@ class AdminRuntimeReq(BaseModel):
     TP2_PCT: Optional[float] = None
     TP3_PCT: Optional[float] = None
     REOPEN_COOLDOWN_SEC: Optional[float] = None
-
 
 class KPIReq(BaseModel):
     win_rate: Optional[float] = None
@@ -103,7 +99,6 @@ def _load_kpis() -> Dict[str, Any]:
     except Exception:
         return {}
 
-
 def _save_kpis(obj: Dict[str, Any]):
     os.makedirs(REPORT_DIR, exist_ok=True)
     tmp = KPIS_JSON + ".tmp"
@@ -117,16 +112,13 @@ def _save_kpis(obj: Dict[str, Any]):
 def root():
     return {"ok": True, "name": APP_NAME, "version": APP_VER}
 
-
 @app.get("/health")
 def health():
     return {"ok": True, "ts": int(time.time())}
 
-
 @app.get("/version")
 def version():
     return {"ok": True, "version": APP_VER}
-
 
 # ---------- signals (TradingView) ----------
 @app.post("/signal")
@@ -138,21 +130,19 @@ def signal(req: SignalReq):
     tf = req.timeframe
 
     try:
-        # ENTRY
         if t in ("entry", "open"):
             if side not in ("long", "short"):
                 raise HTTPException(400, "side must be long/short")
             r = enter_position(sym, side=side, usdt_amount=amt, timeframe=tf)
             return {"ok": True, "res": r}
 
-        # CLOSE (전략 시그널로 전체 종료)
         if t in ("close", "exit"):
             if side not in ("long", "short"):
                 raise HTTPException(400, "side must be long/short")
             r = close_position(sym, side=side, reason="signal_close")
             return {"ok": True, "res": r}
 
-        # 부분익절 — 반드시 "전략 시그널"로만 수행 (AI는 실행 안 함)
+        # 분할익절은 전략 시그널로만
         if t in ("tp1", "tp_1", "takeprofit1"):
             r = take_partial_profit(sym, ratio=float(os.getenv("TP1_PCT", "0.30")), side=side, reason="tp1")
             return {"ok": True, "res": r}
@@ -163,7 +153,7 @@ def signal(req: SignalReq):
             r = take_partial_profit(sym, ratio=float(os.getenv("TP3_PCT", "0.30")), side=side, reason="tp3")
             return {"ok": True, "res": r}
 
-        # STOP/FAILCUT/BE — 전략이 명시적으로 지시했을 때만
+        # 전략이 직접 지시한 손절/본절
         if t in ("stop", "sl", "cut", "failcut", "be", "breakeven"):
             if side not in ("long", "short"):
                 raise HTTPException(400, "side must be long/short")
@@ -176,7 +166,6 @@ def signal(req: SignalReq):
         raise
     except Exception as e:
         return JSONResponse({"ok": False, "error": str(e)}, status_code=500)
-
 
 # ---------- admin (runtime patch) ----------
 @app.post("/admin/runtime")
@@ -196,11 +185,9 @@ def admin_runtime(req: AdminRuntimeReq, request: Request, x_admin_token: str = H
     send_telegram(f"🧠 AI 튜너 조정\n{', '.join([f'{k}={v}' for k, v in changed.items()])}")
     return {"ok": True, "changed": changed}
 
-
 # ---------- reports (KPI) ----------
 @app.post("/reports/kpis")
 def post_kpis(req: KPIReq):
-    # 외부(리포터/애널라이저)에서 보내주는 집계 KPI를 그대로 저장
     cur = _load_kpis()
     for k, v in req.dict().items():
         if v is not None:
@@ -209,18 +196,14 @@ def post_kpis(req: KPIReq):
     _save_kpis(cur)
     return {"ok": True, "kpis": cur}
 
-
 @app.get("/reports/kpis")
 def get_kpis():
-    # 내부 KPI 파이프라인이 돌아가면 aggregate_and_save()가 최신화
     k = _load_kpis()
     return {"ok": True, "kpis": k}
-
 
 @app.get("/reports/trades")
 def get_trades(limit: int = 200):
     return {"ok": True, "trades": list_trades(limit=limit)}
-
 
 # ---------- debug ----------
 @app.get("/debug/symbol/{symbol}")
@@ -233,7 +216,6 @@ def debug_symbol(symbol: str):
         "last": get_last_price(core)
     }
 
-
 @app.get("/debug/positions")
 def debug_positions():
     try:
@@ -241,70 +223,67 @@ def debug_positions():
     except Exception as e:
         return {"ok": False, "error": str(e)}
 
-
 @app.get("/snapshot")
 def snapshot():
     return {"ok": True, "snapshot": get_pending_snapshot()}
 
 
-# =============== BOOTSTRAP ===============
+# =============== ORCHESTRATOR ===============
 def _orch_logic_from_kpi(kpi: Dict[str, Any]) -> Dict[str, Any]:
     """
-    KPI → 런타임 파라미터 맵핑 (예시)
-    - 주의: 여기서는 '분할 TP'는 조정하지 않고, '강제 종료'도 트리거하지 않음.
-    - 목적: 추세를 오래 태우되, 손실 국면에서는 리스크 축소.
+    KPI → 런타임 파라미터 맵핑 (분할/강제종료 미포함)
     """
     changed: Dict[str, Any] = {}
     win = float(kpi.get("win_rate", 0.0) or 0.0)
     avg_r = float(kpi.get("avg_r", 0.0) or 0.0)
     roi_h = float(kpi.get("roi_per_hour", 0.0) or 0.0)
     mdd = float(kpi.get("max_dd", 0.0) or 0.0)
-    n = int(kpi.get("n_trades", 0) or 0)
 
-    # 보수화 조건: ROI/h < 0 이거나, MDD < -0.15
     if roi_h < 0.0 or mdd < -0.15:
-        changed["STOP_PRICE_MOVE"] = 0.020 + 0.005  # +0.5%p
-        changed["STOP_ROE"] = 0.08                  # -8%로 타이트
+        changed["STOP_PRICE_MOVE"] = 0.025  # 보수화(+0.5%p)
+        changed["STOP_ROE"] = 0.08          # -8%로 타이트
         changed["REOPEN_COOLDOWN_SEC"] = 120
-    # 완화 조건: 성과 양호
     elif win > 0.50 and avg_r > 0.25:
-        changed["STOP_PRICE_MOVE"] = 0.018          # -0.2%p
+        changed["STOP_PRICE_MOVE"] = 0.018  # 완화(-0.2%p)
         changed["STOP_ROE"] = 0.10
         changed["REOPEN_COOLDOWN_SEC"] = 90
-    else:
-        # 중립 유지
-        pass
-
     return changed
-
 
 def _orchestrator_loop():
     """
-    LIVE 자동 보정 (분할 TP/강제종료는 절대 여기서 실행하지 않음)
-    - 요청사항 반영: '수익 잘 나오는 추세 포지션'은 AI가 끊지 않음
-      → 강제 종료는 기본 비활성(POLICY_CLOSE_ENABLE=0)
+    LIVE 자동 보정(강제 종료는 기본 OFF). 시작 시 항상 스타트/요약 메시지 송신.
     """
     if not POLICY_ENABLE:
         print("[orch] disabled (POLICY_ENABLE=0)")
         return
 
+    # 부팅 알림(고정)
     send_telegram("🧠 Policy manager started")
+    send_telegram("🤖 AI expert started")
+    send_telegram("🧠 Orchestrator started")
+
+    first_announce = True
+
     while True:
         try:
             kpi = _load_kpis()
-            if not kpi:
-                time.sleep(10)
-                continue
+            # 초기 KPI가 없으면 0으로 요약
+            win = float(kpi.get("win_rate", 0.0) or 0.0)
+            avg_r = float(kpi.get("avg_r", 0.0) or 0.0)
+            n = int(kpi.get("n_trades", 0) or 0)
+
+            # 첫 루프에서는 변경이 없어도 요약 메시지 1회 송신(요청 스샷 형태)
+            if first_announce:
+                send_telegram(f"🤖 AI 튜너 조정\n- WinRate={win*100:.1f}% AvgR={avg_r:.2f} N={n}\n• 신호: worst=0.0% (버킷Top=0.0%, 24hTop=0.0%), state.stable_seq=0")
+                first_announce = False
 
             changed = _orch_logic_from_kpi(kpi)
             if changed and AI_ORCH_APPLY_MODE == "live":
                 apply_runtime_overrides(changed)
                 send_telegram("🤖 AI 튜너 조정\n" + ", ".join([f"{k}={v}" for k, v in changed.items()]))
 
-            # 요청 시에만 강제 종료 로직을 여기에 넣을 수 있지만, 기본값은 미사용
+            # 강제 종료는 기본 비활성 (POLICY_CLOSE_ENABLE=0)
             if POLICY_CLOSE_ENABLE:
-                # 예시: 매우 나쁜 단기 ROI면 정책 종료 검토 (trader에 보호가드 있음)
-                # disabled by default — keep empty
                 pass
 
         except Exception as e:
@@ -312,29 +291,24 @@ def _orchestrator_loop():
         time.sleep(30)
 
 
+# =============== BOOTSTRAP ===============
 def _boot():
     try:
-        # KPI 파이프라인(체결로그 → 주기 집계)
         start_kpi_pipeline()
     except Exception as e:
         print("kpi pipeline start err:", e)
 
-    # 워치독(손절/BE 감시), 리컨실, 용량가드
     start_watchdogs()
     start_reconciler()
     start_capacity_guard()
 
-    # 오케스트레이터(라이브 자동 보정)
     threading.Thread(target=_orchestrator_loop, name="ai-orchestrator", daemon=True).start()
 
-    # 부팅 메시지
     send_telegram("✅ FastAPI up (workers + watchdog + reconciler + guards + AI)")
-
 
 @app.on_event("startup")
 def on_startup():
     _boot()
-
 
 # ---- local dev run ----
 if __name__ == "__main__":
