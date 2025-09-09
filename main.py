@@ -1,65 +1,55 @@
-# main.py — FastAPI entrypoint (policy OFF by default, orchestrator LIVE-ready, KPI 입력 엔드포인트 포함)
+# main.py — FastAPI entrypoint
+# - 기존 기능 유지 + 추가: TV 전략 alert(type) 완전 매핑, 심볼 워밍업, KPI/AI/디버그
 
 import os, sys, json, time, threading
 from typing import Any, Dict, Optional
 from fastapi import FastAPI, Request, HTTPException
 
-# ===== import path guard =====
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 if BASE_DIR not in sys.path:
     sys.path.insert(0, BASE_DIR)
 
-# ===== internal modules =====
 from trader import (
     enter_position, take_partial_profit, reduce_by_contracts, close_position,
     start_watchdogs, start_reconciler, start_capacity_guard,
     runtime_overrides as trader_runtime_overrides,
-    get_pending_snapshot
+    get_pending_snapshot,
 )
 
-# Telegram (optional)
+# Telegram (모듈 없으면 print로 대체)
 try:
     from telegram_bot import send_telegram
 except Exception:
     def send_telegram(msg: str):
         print("[TG]", msg)
 
-# ===== AI modules (optional) =====
-# Policy Manager (직접 종료 기능) — 기본 OFF
+# Policy/AI (없으면 무시)
 POLICY_ENABLE = os.getenv("POLICY_ENABLE", "0") == "1"
 try:
     from tf_policy import ingest_signal, start_policy_manager
 except Exception:
     def ingest_signal(*args, **kwargs): pass
     def start_policy_manager(): pass
-
-# AI Expert (손절폭/파라미터 자동튜닝)
 try:
     from ai_expert import start_ai_expert
 except Exception:
     def start_ai_expert(): pass
-
-# Orchestrator (KPI 기반 자동 패치 적용)
 try:
     from ai_orchestrator import loop as _orch_loop
     def start_ai_orchestrator():
         threading.Thread(target=_orch_loop, name="ai-orchestrator", daemon=True).start()
 except Exception:
-    def start_ai_orchestrator():
-        pass
+    def start_ai_orchestrator(): pass
 
-# =========================
-# helpers
-# =========================
+# ---------------- helpers ----------------
 def _infer_side(s: Optional[str]) -> Optional[str]:
     if not s: return None
     s = s.lower()
-    if s in ("buy","long","l"): return "long"
+    if s in ("buy","long","l"):  return "long"
     if s in ("sell","short","s"): return "short"
     return s
 
 async def _parse_any(req: Request) -> Dict[str, Any]:
-    # JSON or raw body
     try:
         data = await req.json()
     except Exception:
@@ -69,30 +59,39 @@ async def _parse_any(req: Request) -> Dict[str, Any]:
         except Exception:
             raise HTTPException(400, "invalid payload")
 
-    symbol = (data.get("symbol") or data.get("ticker") or "").upper()
-    side   = _infer_side(data.get("side"))
-    type_  = (data.get("type") or data.get("action") or "").lower()
-    amount = data.get("amount")
-    leverage = data.get("leverage")
-    ratio  = data.get("ratio")
-    contracts = data.get("contracts")
-    meta   = data
-
     return {
-        "symbol": symbol, "side": side, "type": type_,
-        "amount": amount, "leverage": leverage,
-        "ratio": ratio, "contracts": contracts,
-        "meta": meta,
+        "symbol": (data.get("symbol") or data.get("ticker") or "").upper(),
+        "side": _infer_side(data.get("side")),
+        "type": (data.get("type") or data.get("action") or "").lower(),
+        "amount": data.get("amount"),
+        "leverage": data.get("leverage"),
+        "ratio": data.get("ratio"),
+        "contracts": data.get("contracts"),
+        "meta": data,
     }
 
 def _ingest_with_tf_override(d: Dict[str, Any], tf_hint: Optional[str] = None) -> Dict[str, Any]:
-    # Policy가 켜져 있을 때만 시그널 인입 기록
     try:
         if POLICY_ENABLE:
             ingest_signal(d.get("symbol"), d.get("side"), tf_hint, d.get("meta"))
     except Exception:
         pass
     return _route_signal(d, tf_hint=tf_hint)
+
+# ---------- TradingView 전략 타입 매핑(롱/숏 2세트 포함) ----------
+TV_CLOSE_TYPES = {
+    # 즉시 전체 종료(손절/실패/EMA/청산)
+    "sl": "stop", "sl1": "stop1", "sl2": "stop2",
+    "failcut": "failcut", "fail": "failcut",
+    "emaexit": "emaexit", "ema160_exit": "emaexit", "exit_ema160": "emaexit",
+    "stoploss": "stoploss", "liquidation": "liquidation",
+    "exit": "signal",
+}
+TV_TP_RATIOS = {  # 현재 보유수량 기준
+    "tp1": 0.30,
+    "tp2": 0.70,
+    # tp3는 전체 종료로 처리(아래)
+}
 
 def _route_signal(d: Dict[str, Any], tf_hint: Optional[str] = None) -> Dict[str, Any]:
     symbol = d["symbol"]; side = d["side"]; type_ = d["type"]
@@ -102,30 +101,19 @@ def _route_signal(d: Dict[str, Any], tf_hint: Optional[str] = None) -> Dict[str,
     if not symbol:
         raise HTTPException(400, "symbol required")
 
-    # OPEN
+    # --- 공용 기본 타입 ---
     if type_ in ("open","entry","enter"):
         if side not in ("long","short"):
-            raise HTTPException(400, "side required for open")
+            raise HTTPException(400, "side required for open/entry")
         ok = enter_position(symbol, side, usdt_amount=amount, leverage=leverage)
         return {"ok": bool(ok), "r": ok}
 
-    # CLOSE
     if type_ in ("close","exit","flatten"):
         if side not in ("long","short"):
             raise HTTPException(400, "side required for close")
         ok = close_position(symbol, side, reason="signal")
         return {"ok": bool(ok), "r": ok}
 
-    # TP (ratio 0~1)
-    if type_ in ("tp","takeprofit","partial"):
-        if ratio is None:
-            raise HTTPException(400, "ratio required for tp")
-        if side not in ("long","short"):
-            raise HTTPException(400, "side required for tp")
-        ok = take_partial_profit(symbol, float(ratio), side, reason="tp")
-        return {"ok": bool(ok), "r": ok}
-
-    # REDUCE by contracts (size)
     if type_ in ("reduce","reduceonly","reduce_by_contracts","reduce_by_size"):
         if contracts is None:
             raise HTTPException(400, "contracts required for reduce")
@@ -134,16 +122,47 @@ def _route_signal(d: Dict[str, Any], tf_hint: Optional[str] = None) -> Dict[str,
         ok = reduce_by_contracts(symbol, float(contracts), side)
         return {"ok": bool(ok), "r": ok}
 
+    if type_ in ("tp","takeprofit","partial"):
+        if ratio is None or side not in ("long","short"):
+            raise HTTPException(400, "ratio/side required for tp")
+        ok = take_partial_profit(symbol, float(ratio), side, reason="tp")
+        return {"ok": bool(ok), "r": ok}
+
+    # --- TV 전략 전용 타입(롱/숏 2세트) ---
+    # 분할 익절
+    if type_ in ("tp1","tp2"):
+        if side not in ("long","short"):
+            raise HTTPException(400, "side required for tpX")
+        r = TV_TP_RATIOS[type_]
+        ok = take_partial_profit(symbol, r, side, reason=type_)
+        return {"ok": bool(ok), "r": ok}
+
+    # tp3 → 전체 종료(텔레그램 'CLOSE' 포맷으로)
+    if type_ in ("tp3","final","fullclose"):
+        if side not in ("long","short"):
+            raise HTTPException(400, "side required for tp3")
+        ok = close_position(symbol, side, reason="tp3")
+        return {"ok": bool(ok), "r": ok}
+
+    # 손절/실패/EMA/강제청산 → 전체 종료
+    if type_ in TV_CLOSE_TYPES:
+        if side not in ("long","short"):
+            raise HTTPException(400, "side required for stop/fail/ema/liq")
+        ok = close_position(symbol, side, reason=TV_CLOSE_TYPES[type_])
+        return {"ok": bool(ok), "r": ok}
+
+    # 경고성 알림(숏2 'tailTouch' 등) → 서버 동작 없이 통과
+    if type_ in ("tailtouch","notice","warn"):
+        send_telegram(f"⚠️ {type_} {side or ''} {symbol}")
+        return {"ok": True, "r": "noted"}
+
     raise HTTPException(400, f"unsupported type: {type_}")
 
-# =========================
-# FastAPI app & routes
-# =========================
+# --------------- FastAPI ---------------
 app = FastAPI(title="fastapi-trading-bot")
 
 @app.get("/health")
-def health():
-    return {"ok": True, "ts": int(time.time())}
+def health(): return {"ok": True, "ts": int(time.time())}
 
 @app.get("/pending")
 def pending():
@@ -153,7 +172,7 @@ def pending():
         snap = {}
     return {"ok": True, "snapshot": snap}
 
-# ---- KPI 입출력 (오케스트레이터 LIVE용) ----
+# KPI in/out
 @app.post("/reports/kpis")
 async def reports_kpis(req: Request):
     data = await req.json()
@@ -174,7 +193,7 @@ def get_kpis():
         return {"ok": False, "error": "no kpis.json"}
     return {"ok": True, "kpis": json.load(open(path, "r", encoding="utf-8"))}
 
-# ---- TradingView signals ----
+# 트뷰 신호(타임프레임 힌트 버전 유지)
 @app.post("/signal")
 async def signal_generic(req: Request):
     d = await _parse_any(req)
@@ -205,7 +224,7 @@ async def signal_d(req: Request):
     d = await _parse_any(req)
     return _ingest_with_tf_override(d, "D")
 
-# ---- admin runtime ----
+# 관리자 런타임 패치
 @app.post("/admin/runtime")
 async def admin_runtime(req: Request):
     tok = req.headers.get("x-admin-token") or req.headers.get("X-Admin-Token")
@@ -219,15 +238,29 @@ async def admin_runtime(req: Request):
         raise HTTPException(400, f"apply failed: {e}")
     return {"ok": True}
 
-# =========================
-# bootstrap
-# =========================
+# 디버그
+@app.get("/debug/symbol/{sym}")
+def dbg_symbol(sym: str):
+    try:
+        from bitget_api import get_symbol_spec, convert_symbol, symbol_exists
+        s = convert_symbol(sym)
+        return {"sym": s, "exists": symbol_exists(s), "spec": get_symbol_spec(s)}
+    except Exception as e:
+        return {"ok": False, "err": str(e)}
+
+# --------------- bootstrap ---------------
 def _boot():
+    # 심볼 캐시 워밍업(v2/v1 자동 동기화)
+    try:
+        from bitget_api import _refresh_symbols
+        _refresh_symbols(force=True)
+    except Exception:
+        pass
+
     start_watchdogs()
     start_reconciler()
     start_capacity_guard()
 
-    # Policy (직접 종결 로직) — 원하면만 ON
     if POLICY_ENABLE:
         try:
             start_policy_manager()
@@ -235,7 +268,6 @@ def _boot():
         except Exception:
             pass
 
-    # Expert & Orchestrator
     try:
         start_ai_expert()
         send_telegram("🤖 AI expert started")
