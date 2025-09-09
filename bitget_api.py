@@ -1,8 +1,7 @@
 # bitget_api.py — Bitget wrapper
-# - v2 ticker 우선, v1 폴백
-# - 심볼 자동 동기화(+_UMCBL/코어심볼 양쪽 키 매핑)
-# - 캐시 미스 시 안전 기본값 반환 → 주문이 멈추지 않음
-# - 디버그/유틸 포함
+# - v2 ticker 우선 + v1 폴백
+# - 심볼 자동 동기화(+_UMCBL/코어심볼 매핑)
+# - POSITION_MODE(hedge|oneway) 지원 → 40774 해결
 import os, time, math, hmac, hashlib, base64, json
 from typing import Dict, Any
 import requests
@@ -10,6 +9,8 @@ import requests
 BITGET_BASE = os.getenv("BITGET_BASE_URL", "https://api.bitget.com")
 PRODUCT_TYPE = os.getenv("BITGET_PRODUCT_TYPE", "UMCBL")  # USDT-M
 USE_V2 = os.getenv("BITGET_USE_V2", "1") == "1"
+POSITION_MODE = os.getenv("BITGET_POSITION_MODE", "hedge").lower().strip()  # hedge | oneway
+MARGIN_COIN = os.getenv("MARGIN_COIN", "USDT")
 
 # ===== symbol cache =====
 _SYMBOL_CACHE: Dict[str, Dict[str, Any]] = {}
@@ -43,11 +44,10 @@ def _refresh_symbols(force: bool = False):
         try:
             data = _public_get("/api/mix/v1/market/contracts", {"productType": PRODUCT_TYPE})
         except Exception as e:
-            print("symbol refresh failed:", e)
-            data = []
+            print("symbol refresh failed:", e); data = []
     for it in data:
-        sym_full = str(it.get("symbol") or it.get("contract") or "").upper()   # ex) BTCUSDT_UMCBL
-        core = convert_symbol(sym_full)                                         # ex) BTCUSDT
+        sym_full = str(it.get("symbol") or it.get("contract") or "").upper()
+        core = convert_symbol(sym_full)
         size_step = float(it.get("sizeTick") or it.get("sizeStep") or 0.001)
         price_prec = int(it.get("pricePlace") or it.get("pricePrecision") or 4)
         spec = {"sizeStep": size_step, "pricePrecision": price_prec}
@@ -109,8 +109,7 @@ def get_last_price(symbol: str) -> float:
         last = d.get("last") or d.get("lastPrice")
         return float(last or 0.0)
     except Exception as e:
-        print("v1 ticker err:", e)
-        return 0.0
+        print("v1 ticker err:", e); return 0.0
 
 # ===== private: positions/orders =====
 def get_open_positions():
@@ -118,8 +117,7 @@ def get_open_positions():
     try:
         r = requests.get(BITGET_BASE + path, headers=_signed_headers("GET", path), timeout=10)
         j = r.json()
-        if str(j.get("code")) != "00000":
-            return []
+        if str(j.get("code")) != "00000": return []
         return j.get("data") or []
     except Exception:
         return []
@@ -127,10 +125,16 @@ def get_open_positions():
 def _place_order(symbol: str, side: str, size: float, leverage: float) -> Dict[str, Any]:
     core = convert_symbol(symbol)
     path = "/api/mix/v1/order/placeOrder"
+    if POSITION_MODE == "oneway":
+        # one-way: buy/sell
+        side_field = "buy" if side=="long" else "sell"
+    else:
+        # hedge: open_long/open_short
+        side_field = "open_long" if side=="long" else "open_short"
     body = {
         "symbol": f"{core}_{PRODUCT_TYPE}",
-        "marginCoin": "USDT",
-        "side": "open_long" if side=="long" else "open_short",
+        "marginCoin": MARGIN_COIN,
+        "side": side_field,
         "orderType": "market",
         "size": str(size),
         "leverage": str(leverage),
@@ -144,10 +148,16 @@ def _place_order(symbol: str, side: str, size: float, leverage: float) -> Dict[s
 def place_reduce_by_size(symbol: str, size: float, side: str) -> Dict[str, Any]:
     core = convert_symbol(symbol)
     path = "/api/mix/v1/order/placeOrder"
+    if POSITION_MODE == "oneway":
+        # one-way: reduceOnly=true + opposite direction
+        side_field = "sell" if side=="long" else "buy"
+    else:
+        # hedge: close_long/close_short
+        side_field = "close_long" if side=="long" else "close_short"
     body = {
         "symbol": f"{core}_{PRODUCT_TYPE}",
-        "marginCoin": "USTS" if os.getenv("MARGIN_COIN","USDT")!="USDT" else "USDT",
-        "side": "close_long" if side=="long" else "close_short",
+        "marginCoin": MARGIN_COIN,
+        "side": side_field,
         "orderType": "market",
         "size": str(size),
         "reduceOnly": "true",
