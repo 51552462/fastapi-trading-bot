@@ -1,4 +1,4 @@
-# trader.py — 자동매매 엔진 (이어받기/워치독/리컨/용량가드/TP·SL/즉시종료/로그/BE/쿨다운)
+# trader.py — 자동매매 엔진 (이어받기/워치독/리컨/용량가드/TP·SL/즉시종료/로그/BE/쿨다운/배너)
 from __future__ import annotations
 
 import os
@@ -453,6 +453,29 @@ def start_all_backgrounds() -> None:
     except Exception as e:
         print("init sync err:", e)
 
+    # ── 시작 배너 (요청대로 복구)
+    try:
+        send_telegram("🧠 Policy manager started")
+    except Exception:
+        pass
+    try:
+        send_telegram("🤖 AI expert started")
+    except Exception:
+        pass
+    try:
+        send_telegram("🧠 Orchestrator started")
+    except Exception:
+        pass
+    try:
+        send_telegram(
+            "🧠 AI 튜너 조정\n"
+            f"• WinRate=0.0% AvgR=0.00 N=0\n"
+            f"• 신호: worst=0.0% (버킷Top=0.0%, 24hTop=0.0%), state.stable_seq=0"
+        )
+    except Exception:
+        pass
+
+    # ── 이어받기 안내 + FastAPI up
     try:
         opens = _safe_get_positions()
         n = len([p for p in opens if float(p.get("size") or 0) > 0])
@@ -465,10 +488,12 @@ def start_all_backgrounds() -> None:
             except Exception:
                 pass
         detail = ", ".join(det) if det else "-"
-        send_telegram(f"🔗 Resumed {n} open positions: {detail}")
+        send_telegram(f"✅ FastAPI up (workers + watchdog + reconciler + guards + AI)\n"
+                      f"🔗 Resumed {n} open positions: {detail}")
     except Exception as e:
         print("resume msg err:", e)
 
+    # ── 백그라운드 루프 가동
     try:
         start_capacity_guard()
     except Exception as e:
