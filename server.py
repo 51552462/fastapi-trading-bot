@@ -14,14 +14,16 @@ app = FastAPI(title="Trading Signal Bridge")
 # ---- idempotency (중복 방지) ----
 _DEDUPE_LOCK = threading.Lock()
 _RECENT_SIGS = {}  # hash -> ts
+
 def _dedupe_check(raw: bytes, window_sec: float = 3.0) -> bool:
     h = hashlib.sha256(raw).hexdigest()
     now = time.time()
-    with _DEDUP
-E_LOCK:
+    with _DEDUPE_LOCK:
+        # 오래된 키 정리
         for k, ts in list(_RECENT_SIGS.items()):
             if now - ts > window_sec:
                 _RECENT_SIGS.pop(k, None)
+        # 중복 여부
         if h in _RECENT_SIGS and now - _RECENT_SIGS[h] <= window_sec:
             return True
         _RECENT_SIGS[h] = now
@@ -37,26 +39,28 @@ async def _on_startup():
     start_all_backgrounds()
 
 def _handle_signal(j: dict) -> dict:
-    t   = (j.get("type") or "").strip()
-    sym = convert_symbol(j.get("symbol") or j.get("ticker") or "")
-    side= (j.get("side") or "long").lower()
-    amt = float(j.get("amount") or 0)
-    lev = float(j.get("leverage") or 0)
+    t    = (j.get("type") or "").strip()
+    sym  = convert_symbol(j.get("symbol") or j.get("ticker") or "")
+    side = (j.get("side") or "long").lower()
+    amt  = float(j.get("amount") or 0)
+    lev  = float(j.get("leverage") or 0)
     if not sym:
         return {"ok": False, "msg": "symbol missing"}
 
     # --- ENTRY ---
     if t == "entry":
-        return {"ok": True, "res": enter_position(sym, side=side,
-                    usdt_amount=amt if amt>0 else None,
-                    leverage=lev if lev>0 else None)}
+        return {"ok": True, "res": enter_position(
+            sym, side=side,
+            usdt_amount=amt if amt > 0 else None,
+            leverage=lev if lev > 0 else None
+        )}
 
     # --- PARTIAL TAKE PROFITS ---
     if t == "tp1":
-        r=float(os.getenv("TP1_PCT","0.30"))
+        r = float(os.getenv("TP1_PCT", "0.30"))
         return {"ok": True, "res": take_partial_profit(sym, ratio=r, side=side, reason="tp1")}
     if t == "tp2":
-        r=float(os.getenv("TP2_PCT","0.5714286"))
+        r = float(os.getenv("TP2_PCT", "0.5714286"))
         return {"ok": True, "res": take_partial_profit(sym, ratio=r, side=side, reason="tp2")}
     if t == "tp3":
         return {"ok": True, "res": close_position(sym, side=side, reason="tp3")}
@@ -64,18 +68,18 @@ def _handle_signal(j: dict) -> dict:
     # --- REDUCE by percent/qty ---
     if t == "reduce":
         if "reduce_pct" in j:
-            pct = float(j.get("reduce_pct") or 0)/100.0
+            pct = float(j.get("reduce_pct") or 0) / 100.0
             return {"ok": True, "res": take_partial_profit(sym, ratio=pct, side=side, reason="tp_pct_api")}
         if "contracts" in j:
             qty = float(j.get("contracts") or 0)
             return {"ok": True, "res": reduce_by_contracts(sym, qty, side)}
         return {"ok": False, "msg": "reduce needs reduce_pct or contracts"}
 
-    # --- IMMEDIATE CLOSE TYPES (전략에서 실제 쓰는 모든 키) ---
-    if t in ("sl1","sl2","stoploss","failCut","emaExit","liquidation","stop","breakeven"):
+    # --- IMMEDIATE CLOSE TYPES (전략에서 쓰는 키워드 모두) ---
+    if t in ("sl1", "sl2", "stoploss", "failCut", "emaExit", "liquidation", "stop", "breakeven"):
         return {"ok": True, "res": close_position(sym, side=side, reason=t)}
 
-    # --- 기타 무해 신호(알림만) ---
+    # --- 기타 알림성 ---
     if t in ("tailTouch",):
         return {"ok": True, "msg": "not_an_action"}
 
@@ -83,7 +87,8 @@ def _handle_signal(j: dict) -> dict:
 
 async def _read_json_safely(req: Request) -> tuple[dict, bytes]:
     raw = await req.body()
-    if not raw: raw = b"{}"
+    if not raw:
+        raw = b"{}"
     try:
         j = json.loads(raw.decode() or "{}")
     except Exception:
