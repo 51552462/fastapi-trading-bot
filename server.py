@@ -14,12 +14,11 @@ app = FastAPI(title="Trading Signal Bridge")
 # ---- idempotency (중복 방지) ----
 _DEDUPE_LOCK = threading.Lock()
 _RECENT_SIGS = {}  # hash -> ts
-
 def _dedupe_check(raw: bytes, window_sec: float = 3.0) -> bool:
     h = hashlib.sha256(raw).hexdigest()
     now = time.time()
-    with _DEDUPE_LOCK:
-        # cleanup
+    with _DEDUP
+E_LOCK:
         for k, ts in list(_RECENT_SIGS.items()):
             if now - ts > window_sec:
                 _RECENT_SIGS.pop(k, None)
@@ -46,10 +45,13 @@ def _handle_signal(j: dict) -> dict:
     if not sym:
         return {"ok": False, "msg": "symbol missing"}
 
+    # --- ENTRY ---
     if t == "entry":
         return {"ok": True, "res": enter_position(sym, side=side,
                     usdt_amount=amt if amt>0 else None,
                     leverage=lev if lev>0 else None)}
+
+    # --- PARTIAL TAKE PROFITS ---
     if t == "tp1":
         r=float(os.getenv("TP1_PCT","0.30"))
         return {"ok": True, "res": take_partial_profit(sym, ratio=r, side=side, reason="tp1")}
@@ -58,14 +60,25 @@ def _handle_signal(j: dict) -> dict:
         return {"ok": True, "res": take_partial_profit(sym, ratio=r, side=side, reason="tp2")}
     if t == "tp3":
         return {"ok": True, "res": close_position(sym, side=side, reason="tp3")}
-    if t in ("sl1","sl2","failCut","emaExit","stoploss"):
-        return {"ok": True, "res": close_position(sym, side=side, reason=t)}
+
+    # --- REDUCE by percent/qty ---
     if t == "reduce":
         if "reduce_pct" in j:
             pct = float(j.get("reduce_pct") or 0)/100.0
             return {"ok": True, "res": take_partial_profit(sym, ratio=pct, side=side, reason="tp_pct_api")}
-        qty = float(j.get("contracts") or 0)
-        return {"ok": True, "res": reduce_by_contracts(sym, qty, side)}
+        if "contracts" in j:
+            qty = float(j.get("contracts") or 0)
+            return {"ok": True, "res": reduce_by_contracts(sym, qty, side)}
+        return {"ok": False, "msg": "reduce needs reduce_pct or contracts"}
+
+    # --- IMMEDIATE CLOSE TYPES (전략에서 실제 쓰는 모든 키) ---
+    if t in ("sl1","sl2","stoploss","failCut","emaExit","liquidation","stop","breakeven"):
+        return {"ok": True, "res": close_position(sym, side=side, reason=t)}
+
+    # --- 기타 무해 신호(알림만) ---
+    if t in ("tailTouch",):
+        return {"ok": True, "msg": "not_an_action"}
+
     return {"ok": False, "msg": f"unknown type {t}"}
 
 async def _read_json_safely(req: Request) -> tuple[dict, bytes]:
@@ -87,6 +100,7 @@ async def signal(req: Request):
         return JSONResponse({"ok": True, "deduped": True})
     return JSONResponse(_handle_signal(j))
 
+# 트뷰에서 /signal/3h 같은 꼬리 경로도 허용
 @app.post("/signal/{tail:path}")
 async def signal_any(tail: str, req: Request):
     j, raw = await _read_json_safely(req)
