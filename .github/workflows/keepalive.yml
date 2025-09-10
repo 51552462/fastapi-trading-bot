@@ -25,7 +25,7 @@ jobs:
 
       - name: Ping /health
         env:
-          HEALTH_URL: ${{ secrets.HEALTH_URL }}   # 예: https://<your-app>.onrender.com/health
+          HEALTH_URL: ${{ https://fastapi-trading-bot-9rme.onrender.com/health }}   # 예: https://<your-app>.onrender.com/health
         run: |
           set -e
           for i in 1 2 3; do
