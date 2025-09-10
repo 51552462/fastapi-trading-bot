@@ -8,7 +8,7 @@ from trader_spot import (
     enter_spot, take_partial_spot, close_spot,
     start_capacity_guard
 )
-from telegram_bot import send_telegram
+from telegram_spot_bot import send_telegram
 from bitget_api_spot import convert_symbol, get_spot_balances
 
 DEFAULT_AMOUNT = float(os.getenv("DEFAULT_AMOUNT", "15"))
