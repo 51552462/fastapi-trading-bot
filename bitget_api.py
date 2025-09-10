@@ -49,7 +49,6 @@ def _headers(ts: str, sign: str) -> Dict[str,str]:
             "ACCESS-PASSPHRASE":API_PASSPHRASE,"Content-Type":"application/json"}
 
 def _sign(ts: str, method: str, path_with_query: str, body: str = "") -> str:
-    # Bitget prehash: timestamp + method + requestPath(+query) + body
     pre = f"{ts}{method.upper()}{path_with_query}{body}"
     mac = hmac.new(API_SECRET.encode(), pre.encode(), hashlib.sha256).digest()
     return base64.b64encode(mac).decode()
@@ -63,24 +62,19 @@ def _req_public(m: str, p: str, params=None):
     except Exception as e: return {"code":"HTTP_ERR","msg":f"{type(e).__name__}:{e}"}
 
 def _req_private(m: str, p: str, body=None, query=None):
-    """
-    FIX: GET 서명 시 query-string 포함
-    """
     url  = BITGET_HOST + p
     ts   = _ts_ms()
     qstr = ""
     if query:
-        # Bitget는 원래 들어간 순서대로 사인해도 통과하지만, 안정적으로 정렬
         qstr = "?" + urlencode(sorted([(str(k), str(v)) for k, v in query.items()]))
     path_for_sign = p + qstr
-    body_str = json.dumps(body or {}, separators=(",", ":")) if m != "GET" else ""
+    body_str = json.dumps(body or {},separators=(",",":")) if m!="GET" else ""
     sign = _sign(ts, m, path_for_sign, body_str)
-
     try:
-        if m == "GET":
-            r = requests.get(url, params=query or {}, headers=_headers(ts, sign), timeout=HTTP_TIMEOUT)
+        if m=="GET":
+            r=requests.get(url, params=query or {}, headers=_headers(ts,sign), timeout=HTTP_TIMEOUT)
         else:
-            r = requests.post(url, params=query or {}, data=body_str, headers=_headers(ts, sign), timeout=HTTP_TIMEOUT)
+            r=requests.post(url, params=query or {}, data=body_str, headers=_headers(ts,sign), timeout=HTTP_TIMEOUT)
         return r.json()
     except Exception as e:
         return {"code":"HTTP_ERR","msg":f"{type(e).__name__}:{e}"}
@@ -199,14 +193,7 @@ def set_leverage(core:str, lev:float)->Dict[str,Any]:
          "leverage":str(int(lev or 1)),"holdSide":"long","marginMode":_margin_mode()})
 
 def get_open_positions(symbol: Optional[str]=None)->List[Dict[str,Any]]:
-    """
-    포지션 조회 (GET 사인 fix 버전)
-    1) v2 all-position
-    2) v1 singlePosition (심볼 맵 기반 폴백) — 일부 계정/지역 편차 대비
-    """
     out: List[Dict[str, Any]] = []
-
-    # 1) v2
     q={"productType":PRODUCT_TYPE}
     j=_req_private("GET","/api/v2/mix/position/all-position", query=q)
     try:
@@ -220,7 +207,6 @@ def get_open_positions(symbol: Optional[str]=None)->List[Dict[str,Any]]:
     except Exception as e:
         _dbg("v2 all-position parse err", e)
 
-    # 2) v1 폴백 (v2가 빈 배열이거나 None 일 때)
     if not out:
         try:
             m = _load_symbol_map()
@@ -239,7 +225,6 @@ def get_open_positions(symbol: Optional[str]=None)->List[Dict[str,Any]]:
                     })
         except Exception as e:
             _dbg("v1 singlePosition fallback err", e)
-
     return out
 
 def _normalize_side_for_oneway(s:str)->str:
