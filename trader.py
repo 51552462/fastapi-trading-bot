@@ -1,5 +1,11 @@
-# trader.py — 추세보호 + 체결로그 + 기존 기능 유지 + open_positions 안전호출
-import os, time, threading, inspect
+# trader.py — 자동매매 엔진 (이어받기/워치독/리컨/용량가드/TP·SL/즉시종료/로그/BE/쿨다운)
+# -*- coding: utf-8 -*-
+from __future__ import annotations
+
+import os
+import time
+import threading
+import inspect
 from typing import Dict, Any, Optional, List
 
 from bitget_api import (
@@ -7,75 +13,95 @@ from bitget_api import (
     place_market_order, place_reduce_by_size, get_symbol_spec, round_down_step,
 )
 
-# 체결 로그(KPI 파이프라인) — 없으면 no-op
+# 체결 로그 파이프라인(없으면 no-op)
 try:
     from kpi_pipeline import log_close_trade
 except Exception:
-    def log_close_trade(*args, **kwargs): pass
+    def log_close_trade(*args, **kwargs):  # type: ignore
+        pass
 
+# 텔레그램(없으면 print 대체)
 try:
     from telegram_bot import send_telegram
 except Exception:
-    def send_telegram(msg: str): print("[TG]", msg)
+    def send_telegram(msg: str):  # type: ignore
+        print("[TG]", msg)
 
-# -------- ENV --------
-DEFAULT_AMOUNT = float(os.getenv("DEFAULT_AMOUNT", "80"))
+# =========================
+# 환경변수
+# =========================
+DEFAULT_AMOUNT = float(os.getenv("DEFAULT_AMOUNT", "80"))  # 기본 진입 USDT
 LEVERAGE       = float(os.getenv("LEVERAGE", "5"))
 
+# 분할익절 기본 비율 (잔량 기준)
 TP1_PCT = float(os.getenv("TP1_PCT", "0.30"))
-TP2_PCT = float(os.getenv("TP2_PCT", "0.5714286"))  # 남은 물량 기준 40%에 해당하도록 기본값 4/7
+TP2_PCT = float(os.getenv("TP2_PCT", "0.5714286"))  # 이후 남은 물량 40%에 해당하도록 4/7 기본값
 TP3_PCT = float(os.getenv("TP3_PCT", "1.0"))        # 나머지 전부
 
+# 손절: 가격 이동/ROE 기준
 STOP_PCT          = float(os.getenv("STOP_PRICE_MOVE", "0.02"))  # ±2%
-STOP_ROE          = float(os.getenv("STOP_ROE", "0.10"))         # -10% ROE
+STOP_ROE          = float(os.getenv("STOP_ROE", "0.10"))         # -10% ROE(레버 반영)
 
 STOP_CHECK_SEC    = float(os.getenv("STOP_CHECK_SEC", "2"))
 STOP_CONFIRM_N    = int(float(os.getenv("STOP_CONFIRM_N", "1")))
 STOP_DEBOUNCE_SEC = float(os.getenv("STOP_DEBOUNCE_SEC", "2"))
 STOP_COOLDOWN_SEC = float(os.getenv("STOP_COOLDOWN_SEC", "3"))
 
+# 리컨실러(원격↔로컬 동기화)
 RECON_INTERVAL_SEC = float(os.getenv("RECON_INTERVAL_SEC", "2"))
 RECON_DEBUG        = os.getenv("RECON_DEBUG", "0") == "1"
 
+# 포지션 용량 가드
 MAX_OPEN_POSITIONS = int(float(os.getenv("MAX_OPEN_POSITIONS", "120")))
 CAP_CHECK_SEC      = float(os.getenv("CAP_CHECK_SEC", "5"))
 LONG_BYPASS_CAP    = (os.getenv("LONG_BYPASS_CAP", "0") == "1")
 SHORT_BYPASS_CAP   = (os.getenv("SHORT_BYPASS_CAP", "0") == "1")
 
-# 추세 보호(Policy close가 섣불리 끊는 것 방지)
-TREND_PROTECT                = os.getenv("TREND_PROTECT", "1") == "1"
-PROTECT_AFTER_TP1            = os.getenv("PROTECT_AFTER_TP1", "1") == "1"
-PROTECT_AFTER_TP2            = os.getenv("PROTECT_AFTER_TP2", "1") == "1"
-POLICY_CLOSE_MIN_HOLD_SEC    = float(os.getenv("POLICY_CLOSE_MIN_HOLD_SEC", "900"))  # 15분
-POLICY_CLOSE_ALLOW_NEG_ROE   = float(os.getenv("POLICY_CLOSE_ALLOW_NEG_ROE", "0.0")) # ROE<=0 허용치
+# 추세 보호(정책 종료 차단)
+TREND_PROTECT              = os.getenv("TREND_PROTECT", "1") == "1"
+PROTECT_AFTER_TP1          = os.getenv("PROTECT_AFTER_TP1", "1") == "1"
+PROTECT_AFTER_TP2          = os.getenv("PROTECT_AFTER_TP2", "1") == "1"
+POLICY_CLOSE_MIN_HOLD_SEC  = float(os.getenv("POLICY_CLOSE_MIN_HOLD_SEC", "900"))  # 15분
+POLICY_CLOSE_ALLOW_NEG_ROE = float(os.getenv("POLICY_CLOSE_ALLOW_NEG_ROE", "0.0"))
 
-# 재진입 쿨다운
+# 재오픈 쿨다운
 REOPEN_COOLDOWN_SEC = float(os.getenv("REOPEN_COOLDOWN_SEC", "60"))
 
-# -------- 내부 상태 --------
-position_data: Dict[str, Dict[str, Any]] = {}
+# =========================
+# 내부 상태
+# =========================
+position_data: Dict[str, Dict[str, Any]] = {}  # key=symbol_side → {size, entry, ts_open, flags...}
 _POS_LOCK = threading.RLock()
+
 _CAP_LOCK = threading.RLock()
-_CAPACITY = {"blocked": False, "last_count": 0,
-             "short_blocked": False, "long_blocked": False,
-             "short_count": 0, "long_count": 0, "ts": 0.0}
+_CAPACITY = {
+    "blocked": False, "last_count": 0,
+    "short_blocked": False, "long_blocked": False,
+    "short_count": 0, "long_count": 0, "ts": 0.0
+}
+
+# 재오픈 쿨다운 기록
 LAST_EXIT_TS: Dict[str, float] = {}
 
-# -------- 안전 래퍼: 전체 포지션 조회 --------
+# =========================
+# 유틸
+# =========================
 def _safe_get_positions() -> List[Dict[str, Any]]:
+    """Bitget 포지션 리스트 안전 조회 (v2/v1 어댑터 래핑)."""
     try:
+        # 함수 시그니처 호환성(과거 버전 대비)
         if len(inspect.signature(_raw_get_positions).parameters) >= 1:
-            return _raw_get_positions(None)
+            return _raw_get_positions(None)  # type: ignore[arg-type]
         return _raw_get_positions()
     except TypeError:
         try:
-            return _raw_get_positions(None)
+            return _raw_get_positions(None)  # type: ignore[arg-type]
         except Exception:
             return []
     except Exception:
         return []
 
-def _key(symbol, side):
+def _key(symbol: str, side: str) -> str:
     s = (side or "").lower()
     if s.startswith("l"): s = "long"
     if s.startswith("s"): s = "short"
@@ -83,30 +109,34 @@ def _key(symbol, side):
 
 def _norm_side(s: str) -> str:
     s = (s or "").lower().strip()
-    if s in ("buy","long","l"):  return "long"
-    if s in ("sell","short","s"): return "short"
+    if s in ("buy", "long", "l"):  return "long"
+    if s in ("sell", "short", "s"): return "short"
     return s
 
 def _signed_change_pct(side: str, mark: float, entry: float) -> float:
+    """해당 포지션 기준 수익률(+ long, - short 반전)."""
     raw = (mark - entry) / entry if entry > 0 else 0.0
     return raw if side == "long" else -raw
 
 def _price_drawdown_pct(side: str, mark: float, entry: float) -> float:
-    chg = _signed_change_pct("short" if side=="long" else "long", mark, entry)
+    """가격 이동폭(롱: 하락폭, 숏: 상승폭)을 양수 비율로 계산."""
+    chg = _signed_change_pct("short" if side == "long" else "long", mark, entry)
     return abs(chg)
 
-def should_pnl_cut(side: str, mark: float, entry: float, lev: float = None) -> bool:
+def should_pnl_cut(side: str, mark: float, entry: float, lev: float | None = None) -> bool:
+    """ROE 기반 컷(-STOP_ROE 이하)이면 True."""
     lev = float(lev or LEVERAGE or 1.0)
     if entry <= 0 or lev <= 0: return False
     roe = _signed_change_pct(side, mark, entry) * lev
     return roe <= -abs(STOP_ROE)
 
 def _update_local_state_from_exchange():
+    """원격 포지션을 로컬 캐시에 반영."""
     opens = _safe_get_positions()
     with _POS_LOCK:
         seen = set()
         for p in opens:
-            sym = convert_symbol(p.get("symbol") or "")
+            sym  = convert_symbol(p.get("symbol") or "")
             side = _norm_side(p.get("side"))
             if not sym or side not in ("long","short"):
                 continue
@@ -122,18 +152,20 @@ def _update_local_state_from_exchange():
             if k not in seen and position_data.get(k,{}).get("size",0) <= 0:
                 position_data.pop(k, None)
 
-# -------- Capacity Guard --------
+# =========================
+# Capacity Guard
+# =========================
 def _capacity_loop():
     while True:
         try:
             opens = _safe_get_positions()
-            long_c = sum(1 for p in opens if _norm_side(p.get("side"))=="long"  and float(p.get("size") or 0)>0)
-            short_c= sum(1 for p in opens if _norm_side(p.get("side"))=="short" and float(p.get("size") or 0)>0)
+            long_c  = sum(1 for p in opens if _norm_side(p.get("side"))=="long"  and float(p.get("size") or 0)>0)
+            short_c = sum(1 for p in opens if _norm_side(p.get("side"))=="short" and float(p.get("size") or 0)>0)
             with _CAP_LOCK:
-                _CAPACITY["last_count"] = long_c + short_c
-                _CAPACITY["long_count"] = long_c
-                _CAPACITY["short_count"]= short_c
-                _CAPACITY["blocked"] = (_CAPACITY["last_count"] >= MAX_OPEN_POSITIONS)
+                _CAPACITY["last_count"]  = long_c + short_c
+                _CAPACITY["long_count"]  = long_c
+                _CAPACITY["short_count"] = short_c
+                _CAPACITY["blocked"]     = (_CAPACITY["last_count"] >= MAX_OPEN_POSITIONS)
                 _CAPACITY["long_blocked"]  = (not LONG_BYPASS_CAP)  and _CAPACITY["blocked"]
                 _CAPACITY["short_blocked"] = (not SHORT_BYPASS_CAP) and _CAPACITY["blocked"]
         except Exception as e:
@@ -143,17 +175,20 @@ def _capacity_loop():
 def start_capacity_guard():
     threading.Thread(target=_capacity_loop, name="capacity-guard", daemon=True).start()
 
-# -------- Trading Ops --------
+# =========================
+# Trading Ops
+# =========================
 def enter_position(symbol: str, side: str = "long", usdt_amount: Optional[float] = None,
                    leverage: Optional[float] = None, timeframe: Optional[str] = None):
+    """시장가 신규 진입."""
     symbol = convert_symbol(symbol)
     side   = _norm_side(side)
     amount = float(usdt_amount or DEFAULT_AMOUNT)
     k = _key(symbol, side)
 
-    # 중복 진입 방지
+    # 원격 중복 방지
     for p in _safe_get_positions():
-        if convert_symbol(p.get("symbol"))==symbol and _norm_side(p.get("side"))==side and float(p.get("size") or 0) > 0:
+        if convert_symbol(p.get("symbol")) == symbol and _norm_side(p.get("side")) == side and float(p.get("size") or 0) > 0:
             send_telegram(f"⚠️ OPEN SKIP: already open {side.upper()} {symbol}")
             return {"ok": False, "reason": "dup_open"}
 
@@ -192,6 +227,7 @@ def enter_position(symbol: str, side: str = "long", usdt_amount: Optional[float]
     return {"ok": True}
 
 def reduce_by_contracts(symbol: str, contracts: float, side: str):
+    """정확 수량(계약수) 줄이기."""
     symbol = convert_symbol(symbol); side = _norm_side(side)
     if contracts <= 0: return {"ok": False, "reason": "bad_contracts"}
     spec = get_symbol_spec(symbol)
@@ -207,23 +243,25 @@ def reduce_by_contracts(symbol: str, contracts: float, side: str):
 
 def take_partial_profit(symbol: str, ratio: float, side: str = "long", reason: str = "tp"):
     """
-    ratio > 0 → 잔량 비율만큼 감축
-    reason="tp_qty:<수량>" 형태 → 정확 수량만큼 감축
+    부분 청산:
+      - ratio > 0 이면 잔량 * ratio 만큼 감축
+      - reason="tp_qty:<수량>" 형태면 정확 수량으로 감축(우선)
     """
     symbol = convert_symbol(symbol); side = _norm_side(side)
 
-    # qty 지시가 main에서 들어온 경우: reason="tp_qty:<n>"
     tp_qty = None
     if isinstance(reason, str) and reason.startswith("tp_qty:"):
-        try: tp_qty = float(reason.split(":",1)[1])
-        except Exception: tp_qty = None
+        try:
+            tp_qty = float(reason.split(":", 1)[1])
+        except Exception:
+            tp_qty = None
 
     if tp_qty is None and (ratio is None or ratio <= 0 or ratio > 1):
         return {"ok": False, "reason": "bad_ratio_or_qty"}
 
     held = 0.0
     for p in _safe_get_positions():
-        if convert_symbol(p.get("symbol"))==symbol and _norm_side(p.get("side"))==side:
+        if convert_symbol(p.get("symbol")) == symbol and _norm_side(p.get("side")) == side:
             held = float(p.get("size") or 0.0); break
     if held <= 0:
         send_telegram(f"⚠️ TP SKIP: 원격 포지션 없음 {symbol}_{side}")
@@ -244,6 +282,7 @@ def take_partial_profit(symbol: str, ratio: float, side: str = "long", reason: s
     else:
         send_telegram(f"🏁 TP({reason}) {side.upper()} {symbol} -{ratio*100:.0f}%")
 
+    # 플래그/BE 무장
     with _POS_LOCK:
         d = position_data.setdefault(_key(symbol, side), {})
         d.setdefault("tp1_done", False)
@@ -261,6 +300,7 @@ def take_partial_profit(symbol: str, ratio: float, side: str = "long", reason: s
     return {"ok": True}
 
 def _policy_close_blocked(symbol: str, side: str, reason: str, entry: float) -> bool:
+    """추세 보호 정책: 특정 상황에서 policy close 차단."""
     if not TREND_PROTECT:
         return False
     try:
@@ -272,8 +312,10 @@ def _policy_close_blocked(symbol: str, side: str, reason: str, entry: float) -> 
         age  = time.time() - float(d.get("ts_open", time.time()))
         tp_ok = (PROTECT_AFTER_TP1 and d.get("tp1_done")) or (PROTECT_AFTER_TP2 and d.get("tp2_done"))
         be_armed = d.get("be_armed")
+        # TP 이후 일정 시간, 플러스 ROE 범위 내에서는 policy close 차단
         if tp_ok and roe > POLICY_CLOSE_ALLOW_NEG_ROE and age < POLICY_CLOSE_MIN_HOLD_SEC:
             return True
+        # 본절 무장 후 플러스 구간 유지 땐 차단
         if be_armed:
             if (side=="long" and mark > entry) or (side=="short" and mark < entry):
                 return True
@@ -282,11 +324,12 @@ def _policy_close_blocked(symbol: str, side: str, reason: str, entry: float) -> 
         return False
 
 def close_position(symbol: str, side: str = "long", reason: str = "manual"):
+    """즉시 종료(전량 시장가)."""
     symbol = convert_symbol(symbol); side = _norm_side(side)
 
     held = entry = 0.0
     for p in _safe_get_positions():
-        if convert_symbol(p.get("symbol"))==symbol and _norm_side(p.get("side"))==side:
+        if convert_symbol(p.get("symbol")) == symbol and _norm_side(p.get("side")) == side:
             held  = float(p.get("size") or 0.0)
             entry = float(p.get("entryPrice") or 0.0)
             break
@@ -311,15 +354,14 @@ def close_position(symbol: str, side: str = "long", reason: str = "manual"):
         send_telegram(f"❌ CLOSE fail {symbol}_{side}: {resp}")
         return {"ok": False, "resp": resp}
 
+    # 로그/알림
     with _POS_LOCK:
         d = position_data.get(_key(symbol, side), {})
         ts_open = float(d.get("ts_open", time.time()))
     log_close_trade(
         ts_open=ts_open, ts_close=time.time(), symbol=symbol, side=side,
-        entry=entry, exit=exit_px, size=qty, pnl_usdt=realized,
-        leverage=LEVERAGE
+        entry=entry, exit=exit_px, size=qty, pnl_usdt=realized, leverage=LEVERAGE
     )
-
     sign = " +" if realized >= 0 else " "
     send_telegram(
         "✅ CLOSE {side} {sym} ({reason})\n"
@@ -335,7 +377,9 @@ def close_position(symbol: str, side: str = "long", reason: str = "manual"):
     LAST_EXIT_TS[_key(symbol, side)] = time.time()
     return {"ok": True}
 
-# -------- Watchdog --------
+# =========================
+# Watchdog: 가격 ±2%/ROE -10% 즉시 종료 + BE
+# =========================
 def _watchdog_loop():
     confirm_cnt: Dict[str, int] = {}
     last_hit_ts: Dict[str, float] = {}
@@ -354,8 +398,8 @@ def _watchdog_loop():
                 mark = float(get_last_price(symbol) or 0.0)
                 k = _key(symbol, side)
 
-                hit_pnl   = should_pnl_cut(side, mark, entry, LEVERAGE)          # ROE -10% 컷
-                hit_price = _price_drawdown_pct(side, mark, entry) >= STOP_PCT   # 가격 ±2% 컷
+                hit_pnl   = should_pnl_cut(side, mark, entry, LEVERAGE)          # ROE -10%
+                hit_price = _price_drawdown_pct(side, mark, entry) >= STOP_PCT   # ±2%
 
                 be_fire = False
                 with _POS_LOCK:
@@ -388,7 +432,9 @@ def _watchdog_loop():
 def start_watchdogs():
     threading.Thread(target=_watchdog_loop, name="stop-watchdog", daemon=True).start()
 
-# -------- Reconciler --------
+# =========================
+# Reconciler: 원격→로컬 동기화
+# =========================
 def _reconcile_loop():
     while True:
         try:
@@ -402,16 +448,18 @@ def _reconcile_loop():
 def start_reconciler():
     threading.Thread(target=_reconcile_loop, name="reconciler", daemon=True).start()
 
-# -------- Runtime overrides --------
+# =========================
+# 런타임 오버라이드/스냅샷
+# =========================
 def runtime_overrides(changed: Dict[str, Any]):
     global STOP_PCT, RECON_INTERVAL_SEC, TP1_PCT, TP2_PCT, TP3_PCT
     global STOP_ROE, REOPEN_COOLDOWN_SEC
-    if "STOP_PRICE_MOVE" in changed: STOP_PCT = float(changed["STOP_PRICE_MOVE"])
-    if "STOP_ROE" in changed:        STOP_ROE = float(changed["STOP_ROE"])
-    if "RECON_INTERVAL_SEC" in changed: RECON_INTERVAL_SEC = float(changed["RECON_INTERVAL_SEC"])
-    if "TP1_PCT" in changed: TP1_PCT = float(changed["TP1_PCT"])
-    if "TP2_PCT" in changed: TP2_PCT = float(changed["TP2_PCT"])
-    if "TP3_PCT" in changed: TP3_PCT = float(changed["TP3_PCT"])
+    if "STOP_PRICE_MOVE" in changed:     STOP_PCT = float(changed["STOP_PRICE_MOVE"])
+    if "STOP_ROE" in changed:            STOP_ROE = float(changed["STOP_ROE"])
+    if "RECON_INTERVAL_SEC" in changed:  RECON_INTERVAL_SEC = float(changed["RECON_INTERVAL_SEC"])
+    if "TP1_PCT" in changed:             TP1_PCT = float(changed["TP1_PCT"])
+    if "TP2_PCT" in changed:             TP2_PCT = float(changed["TP2_PCT"])
+    if "TP3_PCT" in changed:             TP3_PCT = float(changed["TP3_PCT"])
     if "REOPEN_COOLDOWN_SEC" in changed: REOPEN_COOLDOWN_SEC = float(changed["REOPEN_COOLDOWN_SEC"])
 
 def apply_runtime_overrides(changed: Dict[str, Any]):
@@ -420,3 +468,49 @@ def apply_runtime_overrides(changed: Dict[str, Any]):
 def get_pending_snapshot():
     with _POS_LOCK:
         return {"positions": dict(position_data)}
+
+# =========================
+# Startup: 모든 백그라운드 시작 + 이어받기 메시지
+# =========================
+def start_all_backgrounds():
+    """
+    부팅 시 한 번 호출.
+    - 거래소 포지션을 즉시 동기화해서 로컬 상태 초기화
+    - 이어받기 메시지 전송
+    - 용량가드, 리컨실러, 워치독 스레드 시작
+    """
+    try:
+        _update_local_state_from_exchange()  # 초기 동기화
+    except Exception as e:
+        print("init sync err:", e)
+
+    # 이어받기 안내
+    try:
+        opens = _safe_get_positions()
+        n = len([p for p in opens if float(p.get("size") or 0) > 0])
+        det = []
+        for p in opens:
+            try:
+                if float(p.get("size") or 0) <= 0:
+                    continue
+                det.append(f"{convert_symbol(p.get('symbol') or '')}_{_norm_side(p.get('side'))}")
+            except Exception:
+                pass
+        detail = (", ".join(det)) if det else "-"
+        send_telegram(f"🔗 Resumed {n} open positions: {detail}")
+    except Exception as e:
+        print("resume msg err:", e)
+
+    # 백그라운드 스레드 기동
+    try:
+        start_capacity_guard()
+    except Exception as e:
+        print("capacity guard start err:", e)
+    try:
+        start_reconciler()
+    except Exception as e:
+        print("reconciler start err:", e)
+    try:
+        start_watchdogs()
+    except Exception as e:
+        print("watchdog start err:", e)
