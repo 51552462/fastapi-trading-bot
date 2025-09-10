@@ -1,11 +1,8 @@
 # bitget_api_spot.py
 # ------------------------------------------------------------
-# Bitget Spot API helper (v2 symbol cache + v1 trading endpoints)
-# - Symbol/spec cache: /api/v2/spot/public/symbols
-# - Orders: /api/spot/v1/trade/orders
-# - Ticker: /api/spot/v1/market/ticker
-# - Balances: /api/v2/spot/account/assets  (v1 fallback)
-# - Telegram: from telegram_spot_bot import send_telegram
+# Bitget Spot API helper (v2 symbols cache + v1 trading endpoints)
+# 주문 심볼 기본: *_SPBL, 예외는 BASE_ONLY_SYMBOLS로 base 그대로.
+# 40034/40309 발생 시 base<->SPBL 형태로 1회 자동 재시도.
 # ------------------------------------------------------------
 import os
 import re
@@ -26,14 +23,11 @@ API_KEY        = os.getenv("BITGET_API_KEY", "")
 API_SECRET     = os.getenv("BITGET_API_SECRET", "")
 API_PASSPHRASE = os.getenv("BITGET_API_PASSWORD", "")
 
-# how long to block a symbol locally if exchange says removed
 REMOVED_BLOCK_TTL = int(os.getenv("REMOVED_BLOCK_TTL", "43200"))  # 12h
 SPOT_TICKER_TTL   = float(os.getenv("SPOT_TICKER_TTL", "2.5"))    # seconds
 
-# fuzzy alias(비슷한 심볼 자동 추정) 사용 여부
 AUTO_FUZZY_SYMBOL = os.getenv("AUTO_FUZZY_SYMBOL", "1") == "1"
 
-# alias map (TV → Bitget 실제 심볼)
 ALIASES: Dict[str, str] = {}
 _alias_env = os.getenv("SYMBOL_ALIASES_JSON", "")
 if _alias_env:
@@ -42,17 +36,16 @@ if _alias_env:
     except Exception:
         pass
 
-# base로만 주문해야 하는 예외 심볼(쉼표 분리) ex) PRIMEUSDT
 BASE_ONLY = set()
 _bo = os.getenv("BASE_ONLY_SYMBOLS", "")
 if _bo:
     BASE_ONLY = {s.strip().upper() for s in _bo.split(",") if s.strip()}
 
-# Telegram
+# Telegram (spot)
 try:
     from telegram_spot_bot import send_telegram
 except Exception:
-    def send_telegram(_msg: str):  # 안전한 no-op
+    def send_telegram(_msg: str):
         pass
 
 # ------------------------- small rate limiter -------------------------
@@ -90,9 +83,8 @@ def _norm(s: str) -> str:
     return (s or "").upper().replace("/", "").replace("-", "").replace("_", "")
 
 def convert_symbol(sym: str) -> str:
-    """TV에서 오는 문자열을 Bitget 표준 심볼(Base)로 정규화"""
     s = _norm(sym)
-    if s.endswith("PERP"):  # 파생 표기 제거
+    if s.endswith("PERP"):
         s = s[:-4]
     return ALIASES.get(s, s)
 
@@ -114,8 +106,7 @@ def is_symbol_removed(symbol: str) -> bool:
 
 # ----------------------- v2 products (spec) -----------------------
 _PROD_TS = 0.0
-# key -> spec; spec = {qtyStep, priceStep, minQuote, tradable, baseCoin, quoteCoin}
-_PROD: Dict[str, Dict] = {}
+_PROD: Dict[str, Dict] = {}  # key -> spec dict
 
 def _to_float(x, d=0.0):
     try:
@@ -131,7 +122,7 @@ def _to_float(x, d=0.0):
         return d
 
 def _refresh_products_cache_v2():
-    """/api/v2/spot/public/symbols 로 전체 스펙(정밀도/최소거래/상태) 캐시"""
+    """GET /api/v2/spot/public/symbols : 전체 스펙 캐시"""
     global _PROD_TS, _PROD
     path = "/api/v2/spot/public/symbols"
     try:
@@ -141,7 +132,7 @@ def _refresh_products_cache_v2():
         arr = j.get("data") or []
         m: Dict[str, Dict] = {}
         for it in arr:
-            sym_base = _norm(it.get("symbol") or "")  # e.g., PRIMEUSDT
+            sym_base = _norm(it.get("symbol") or "")
             if not sym_base:
                 continue
             qty_p   = int(_to_float(it.get("quantityPrecision"), 6))
@@ -157,9 +148,8 @@ def _refresh_products_cache_v2():
                 "baseCoin":  _norm(it.get("baseCoin") or ""),
                 "quoteCoin": _norm(it.get("quoteCoin") or ""),
             }
-            # base / base_SPBL 모두에 매핑(주문 호환 목적)
             m[sym_base] = spec
-            m[f"{sym_base}_SPBL"] = spec
+            m[f"{sym_base}_SPBL"] = spec  # 주문 문자열 호환 매핑
         _PROD = m
         _PROD_TS = time.time()
     except Exception as e:
@@ -170,10 +160,7 @@ def _ensure_products():
         _refresh_products_cache_v2()
 
 def _closest_symbol_guess(base: str) -> Optional[str]:
-    """
-    캐시에 base가 없을 때 비슷한 심볼 자동 추정 (옵션)
-    ex) MOEWUSDT -> MOODENGUSDT
-    """
+    """유사 심볼 추정(옵션) ex) MOEWUSDT → MOODENGUSDT"""
     if not AUTO_FUZZY_SYMBOL:
         return None
     pref = base.replace("USDT", "")
@@ -184,7 +171,6 @@ def _closest_symbol_guess(base: str) -> Optional[str]:
     for k in _PROD.keys():
         if not k.endswith("USDT"):
             continue
-        # prefix 매칭(우선순위: 동일 접두 → 앞 4자 → 앞 3자)
         if k.startswith(pref):
             score = 0
         elif k.startswith(pref[:4]):
@@ -234,16 +220,14 @@ def is_tradable(symbol: str) -> bool:
 # ----------------------- symbol for trading -----------------------
 def _spot_symbol(sym: str) -> str:
     """
-    주문/틱커에서 사용할 실제 심볼 문자열 생성
-    - BASE_ONLY_SYMBOLS에 있으면 base 그대로
-    - 아니면 *_SPBL (대부분의 v1 주문 엔드포인트 규칙과 호환)
-    - 단, base가 v2 캐시에 존재하면 base 그대로 써도 동작(호환성)
+    주문/틱커 심볼 생성 규칙:
+    - BASE_ONLY_SYMBOLS 에 포함된 것만 base 그대로
+    - 그 외는 기본적으로 *_SPBL 사용 (v1 주문 호환)
     """
-    _ensure_products()
     base = convert_symbol(sym)
-    if base in BASE_ONLY or base in _PROD:
+    if base in BASE_ONLY:
         return base
-    return base if base.endswith("_SPBL") else f"{base}_SPBL"
+    return f"{base}_SPBL"
 
 # --------------------------- ticker ---------------------------
 _SPOT_TICKER_CACHE: Dict[str, Tuple[float, float]] = {}
@@ -314,10 +298,6 @@ def _fetch_assets_v1() -> Dict[str, float]:
     return m
 
 def get_spot_balances(force: bool = False, coin: Optional[str] = None) -> Dict[str, float]:
-    """
-    coin 지정 시 해당 코인만(가능하면 v2), 미지정이면 전체.
-    force=True면 즉시 API 조회.
-    """
     global _BAL_TS, _BAL
     now = time.time()
     if not force and not coin and _BAL and now - _BAL_TS < 5.0:
@@ -333,7 +313,6 @@ def get_spot_balances(force: bool = False, coin: Optional[str] = None) -> Dict[s
         return _BAL
 
 def get_spot_free_qty(symbol: str, fresh: bool = False) -> float:
-    """기초코인 가용수량 조회 (e.g., OSMOUSDT → OSMO)"""
     base = convert_symbol(symbol).replace("USDT", "")
     if fresh:
         m = get_spot_balances(force=True, coin=base)
@@ -349,13 +328,11 @@ def _extract_code_text(resp_text: str) -> Dict[str, str]:
             return {"code": str(j.get("code", "")), "msg": str(j.get("msg", ""))}
     except Exception:
         pass
-    # best-effort 파싱
     m = re.search(r'"code"\s*:\s*"?(?P<code>\d+)"?', resp_text or "")
     n = re.search(r'"msg"\s*:\s*"(?P<msg>[^"]+)"', resp_text or "")
     return {"code": m.group("code") if m else "", "msg": n.group("msg") if n else ""}
 
 def _fmt_by_step(v: float, step: float) -> str:
-    """거래소 step에 맞춰 아래로 절삭한 문자열(소수 자릿수 포함)"""
     if step <= 0:
         return f"{v:.6f}".rstrip("0").rstrip(".")
     k = math.floor(float(v) / float(step)) * float(step)
@@ -364,7 +341,6 @@ def _fmt_by_step(v: float, step: float) -> str:
     return s.rstrip("0").rstrip(".") if "." in s else s
 
 def round_down_step(v: float, step: float) -> float:
-    """거래소 step(호가/수량 단위)에 맞춰 아래로 절삭한 float 반환"""
     if step is None or step <= 0:
         return float(v)
     return math.floor(float(v) / float(step)) * float(step)
@@ -372,41 +348,68 @@ def round_down_step(v: float, step: float) -> float:
 # ------------------------------ orders ------------------------------
 def place_spot_market_buy(symbol: str, usdt_amount: float) -> Dict:
     """
-    시장가 매수(quote 기준). Bitget v1 주문에서는 quantity에 USDT 금액을 넣는 형태로 호환.
+    시장가 매수(quote 기준). v1 주문에서는 quantity에 USDT 금액을 넣는 형태로 호환.
+    40034/40309 시 base<->SPBL로 1회 재시도.
     """
     if not is_tradable(symbol):
         mark_symbol_removed(symbol)
         return {"code": "LOCAL_SYMBOL_REMOVED", "msg": "symbol not tradable/removed"}
     spec = get_symbol_spec_spot(symbol)
     if float(usdt_amount) < float(spec.get("minQuote", 1.0)):
-        return {"code": "LOCAL_MIN_QUOTE", "msg": f"need>={spec.get('minQuote', 1.0)}USDT"}
+        return {"code": "LOCAL_MIN_QUOTE", "msg": f"need>={spec.get('minQuote',1.0)}USDT"}
 
-    sym = _spot_symbol(symbol)
-    path = "/api/spot/v1/trade/orders"
-    body = {
-        "symbol": sym,
-        "side": "buy",
-        "orderType": "market",
-        "force": "gtc",
-        # Bitget 호환용: market buy를 quote로 넣는 케이스
-        "quantity": _fmt_by_step(float(usdt_amount), 1e-6),
-    }
-    bj = json.dumps(body)
-    try:
+    sym1 = _spot_symbol(symbol)
+    base = convert_symbol(symbol)
+    sym2 = base if sym1.endswith("_SPBL") else f"{base}_SPBL"
+
+    def _send(sym: str) -> Dict:
+        path = "/api/spot/v1/trade/orders"
+        body = {
+            "symbol": sym,
+            "side": "buy",
+            "orderType": "market",
+            "force": "gtc",
+            "quantity": _fmt_by_step(float(usdt_amount), 1e-6),
+        }
+        bj = json.dumps(body)
         _rl("spot_order", 0.12)
-        res = requests.post(BASE_URL + path, headers=_headers("POST", path, bj), data=bj, timeout=15)
-        if res.status_code != 200:
-            info = _extract_code_text(res.text or "")
-            if info.get("code") in ("40309", "40034"):
-                mark_symbol_removed(symbol)
-            return {"code": f"HTTP_{res.status_code}", "msg": res.text}
-        return res.json()
-    except Exception as e:
-        return {"code": "LOCAL_EXCEPTION", "msg": str(e)}
+        r = requests.post(BASE_URL + path, headers=_headers("POST", path, bj), data=bj, timeout=15)
+        if r.status_code != 200:
+            return {"http": r.status_code, "text": r.text}
+        return r.json()
+
+    res = _send(sym1)
+    # 정상
+    if isinstance(res, dict) and ("code" in res) and str(res.get("code")) in ("00000", "0"):
+        return res
+
+    # HTTP 에러
+    if isinstance(res, dict) and "http" in res:
+        info = _extract_code_text(res.get("text") or "")
+        if info.get("code") in ("40309", "40034"):
+            res2 = _send(sym2)
+            if isinstance(res2, dict) and ("code" in res2) and str(res2.get("code")) in ("00000", "0"):
+                return res2
+            if "http" in res2:
+                return {"code": f"HTTP_{res2['http']}", "msg": res2["text"], "retry": sym2}
+            return res2
+        if info.get("code") == "40309":
+            mark_symbol_removed(symbol)
+        return {"code": f"HTTP_{res.get('http')}", "msg": res.get("text")}
+
+    # API 코드 에러
+    if str(res.get("code")) in ("40309", "40034"):
+        res2 = _send(sym2)
+        if isinstance(res2, dict) and ("code" in res2) and str(res2.get("code")) in ("00000", "0"):
+            return res2
+        return res2
+    return res
 
 def place_spot_market_sell_qty(symbol: str, qty: float) -> Dict:
     """
-    시장가 매도(기초코인 수량 기준). scale 오류가 뜰 경우 서버가 step 재계산하여 1회 재시도.
+    시장가 매도(기초코인 수량 기준).
+    scale 오류(40008 등) 시 step 재계산 후 1회 재시도.
+    40034/40309 시 base<->SPBL로 1회 재시도.
     """
     if qty <= 0:
         return {"code": "LOCAL_BAD_QTY", "msg": "qty<=0"}
@@ -417,43 +420,62 @@ def place_spot_market_sell_qty(symbol: str, qty: float) -> Dict:
     step = float(get_symbol_spec_spot(symbol).get("qtyStep", 1e-6))
     qty_str = _fmt_by_step(float(qty), step)
 
-    sym = _spot_symbol(symbol)
-    path = "/api/spot/v1/trade/orders"
-    body = {
-        "symbol": sym,
-        "side": "sell",
-        "orderType": "market",
-        "force": "gtc",
-        "quantity": qty_str,
-    }
-    bj = json.dumps(body)
-    try:
-        _rl("spot_order", 0.12)
-        res = requests.post(BASE_URL + path, headers=_headers("POST", path, bj), data=bj, timeout=15)
-        if res.status_code == 200:
-            return res.json()
+    sym1 = _spot_symbol(symbol)
+    base = convert_symbol(symbol)
+    sym2 = base if sym1.endswith("_SPBL") else f"{base}_SPBL"
 
-        txt = res.text or ""
+    def _send(sym: str, q: str) -> Dict:
+        path = "/api/spot/v1/trade/orders"
+        body = {"symbol": sym, "side": "sell", "orderType": "market", "force": "gtc", "quantity": q}
+        bj = json.dumps(body)
+        _rl("spot_order", 0.12)
+        r = requests.post(BASE_URL + path, headers=_headers("POST", path, bj), data=bj, timeout=15)
+        if r.status_code != 200:
+            return {"http": r.status_code, "text": r.text}
+        return r.json()
+
+    res = _send(sym1, qty_str)
+    if isinstance(res, dict) and ("code" in res) and str(res.get("code")) in ("00000", "0"):
+        return res
+
+    # HTTP 에러 → scale or symbol 문제 처리
+    if "http" in res:
+        txt = res.get("text") or ""
         info = _extract_code_text(txt)
-        # Bitget가 scale 오류를 반환할 때(40008 등) 자릿수 재조정 후 1회 재시도
+        # scale 재시도
         m = re.search(r"(?:checkBDScale|checkScale)[\"']?\s*[:=]\s*([0-9]+)", txt)
-        if res.status_code == 400 and m:
+        if res.get("http") == 400 and m:
             chk = int(m.group(1))
             step2 = 10 ** (-chk)
             qty2 = round_down_step(float(qty), step2)
-            bj2 = json.dumps({**body, "quantity": _fmt_by_step(qty2, step2)})
-            try:
-                send_telegram(f"[SPOT] retry sell {convert_symbol(symbol)} scale->{chk} qty={qty2}")
-            except Exception:
-                pass
-            _rl("spot_order", 0.12)
-            res2 = requests.post(BASE_URL + path, headers=_headers("POST", path, bj2), data=bj2, timeout=15)
-            if res2.status_code == 200:
-                return res2.json()
-            return {"code": f"HTTP_{res2.status_code}", "msg": res2.text, "retry_with_scale": chk}
+            res2 = _send(sym1, _fmt_by_step(qty2, step2))
+            if isinstance(res2, dict) and ("code" in res2) and str(res2.get("code")) in ("00000", "0"):
+                try:
+                    send_telegram(f"[SPOT] retry sell {convert_symbol(symbol)} scale->{chk} qty={qty2}")
+                except Exception:
+                    pass
+                return res2
+            if "http" in res2:
+                return {"code": f"HTTP_{res2['http']}", "msg": res2["text"], "retry_scale": chk}
+            return res2
 
+        # 심볼 미존재/삭제 → 반대 형태로 재시도
         if info.get("code") in ("40309", "40034"):
+            res2 = _send(sym2, qty_str)
+            if isinstance(res2, dict) and ("code" in res2) and str(res2.get("code")) in ("00000", "0"):
+                return res2
+            if "http" in res2:
+                return {"code": f"HTTP_{res2['http']}", "msg": res2["text"], "retry": sym2}
+            return res2
+
+        if info.get("code") == "40309":
             mark_symbol_removed(symbol)
-        return {"code": f"HTTP_{res.status_code}", "msg": txt}
-    except Exception as e:
-        return {"code": "LOCAL_EXCEPTION", "msg": str(e)}
+        return {"code": f"HTTP_{res.get('http')}", "msg": txt}
+
+    # API 코드 에러 → 심볼 재시도
+    if str(res.get("code")) in ("40309", "40034"):
+        res2 = _send(sym2, qty_str)
+        if isinstance(res2, dict) and ("code" in res2) and str(res2.get("code")) in ("00000", "0"):
+            return res2
+        return res2
+    return res
