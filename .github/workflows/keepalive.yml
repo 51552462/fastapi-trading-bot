@@ -2,7 +2,7 @@ name: KeepAlive Ping
 
 on:
   schedule:
-    - cron: "*/5 * * * *"   # 5분마다(UTC)
+    - cron: "*/1 * * * *"     # 매 분(UTC)
   workflow_dispatch:
 
 concurrency:
@@ -16,16 +16,15 @@ jobs:
     permissions: {}
 
     steps:
-      # 초 단위 지터로 충돌 완화
       - name: Random jitter
-        run: sleep $((RANDOM % 20))
+        run: sleep $((20 + RANDOM % 25))
 
       - name: Show tick (UTC)
         run: date -u +"UTC %Y-%m-%d %H:%M:%S"
 
       - name: Ping /health
         env:
-          HEALTH_URL: https://fastapi-trading-bot-9rme.onrender.com/health
+          HEALTH_URL: "https://fastapi-trading-bot-9rme.onrender.com/health"
         run: |
           set -e
           for i in 1 2 3; do
