@@ -14,7 +14,7 @@ from bitget_api_spot import (
 )
 
 try:
-    from telegram_bot import send_telegram
+    from telegram_spot_bot import send_telegram
 except Exception:
     def send_telegram(msg: str):
         print("[TG]", msg)
