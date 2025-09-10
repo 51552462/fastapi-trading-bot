@@ -128,7 +128,7 @@ def get_last_price(core: str)->Optional[float]:
     try:
         arr=j.get("data") or []
         if arr:
-            p=_f(arr[0][4])
+            p=_f(arr[0][4]);  # close
             if p: return p
     except: pass
     j=_req_public("GET","/api/mix/v1/market/ticker",{"symbol":ex_v1})
