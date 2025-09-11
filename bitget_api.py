@@ -3,16 +3,19 @@
 bitget_api.py  (USDT Perpetual Futures)
 
 - v2(USDT-FUTURES) 우선, 실패 시 v1(umcbl) 폴백
-- BITGET_HOST 가드: 잘못된 값이라도 https://api.bitget.com 으로 강제 교정
-- 포지션 조회: v2/v1 모두 POST 사용
+- BITGET_HOST 가드: 잘못된 값은 https://api.bitget.com 으로 강제 교정
+- 포지션 조회: v2/v1 모두 POST 엔드포인트 사용
 - 주문: placeOrder v2 (reduceOnly = "YES"/"NO")
 - sizeStep / minTradeNum 반올림
 - 심볼 변환 v2('BTCUSDT') <-> v1('BTCUSDT_UMCBL')
 
-✅ 과거 코드 호환 별칭
-    convert_symbol()   → convert_symbol_v2()
-    get_last_price()   → get_ticker_last()
-    get_open_positions() → get_positions()
+✅ 과거 코드 호환 별칭들
+    convert_symbol()              → convert_symbol_v2()
+    get_last_price()              → get_ticker_last()
+    get_open_positions()          → get_positions()
+    place_market_order()          → place_order_market()
+    market_open() / market_open_by_usdt()
+    close_position()              → close_position_full()
 """
 
 from __future__ import annotations
@@ -314,6 +317,11 @@ def place_order_market(symbol_v2: str, side: str, size: float, reduce_only: bool
         print("[placeOrder v2] ERROR:", r)
     return r
 
+# ✅ 구버전 호환(가장 많이 쓰이는 별칭)
+def place_market_order(symbol_v2: str, side: str, size: float, reduce_only: bool = False) -> Dict[str, Any]:
+    """alias for place_order_market"""
+    return place_order_market(symbol_v2, side, size, reduce_only)
+
 def close_position_full(symbol_v2: str, side: str) -> Dict[str, Any]:
     pos_list = get_positions(symbol_v2)
     total = 0.0
@@ -325,8 +333,12 @@ def close_position_full(symbol_v2: str, side: str) -> Dict[str, Any]:
     opp = "sell" if side == "long" else "buy"
     return place_order_market(symbol_v2, opp, total, reduce_only=True)
 
+# ✅ 구버전 호환
+def close_position(symbol_v2: str, side: str) -> Dict[str, Any]:
+    return close_position_full(symbol_v2, side)
+
 # ============================
-# 금액→수량 변환
+# 금액(USDT) → 수량 변환 + 별칭
 # ============================
 
 def quote_to_size(symbol_v2: str, usdt_amount: float, leverage: float = 1.0) -> float:
@@ -335,6 +347,18 @@ def quote_to_size(symbol_v2: str, usdt_amount: float, leverage: float = 1.0) -> 
         raise RuntimeError("price<=0")
     raw = (usdt_amount * leverage) / px
     return round_size(symbol_v2, raw)
+
+def place_market_order_by_usdt(symbol_v2: str, side: str, usdt_amount: float,
+                               leverage: float = 1.0, reduce_only: bool = False) -> Dict[str, Any]:
+    size = quote_to_size(symbol_v2, usdt_amount, leverage)
+    return place_order_market(symbol_v2, side, size, reduce_only)
+
+# ✅ 구버전 호환
+def market_open(symbol_v2: str, side: str, usdt_amount: float, leverage: float = 1.0) -> Dict[str, Any]:
+    return place_market_order_by_usdt(symbol_v2, side, usdt_amount, leverage, reduce_only=False)
+
+def market_open_by_usdt(symbol_v2: str, side: str, usdt_amount: float, leverage: float = 1.0) -> Dict[str, Any]:
+    return market_open(symbol_v2, side, usdt_amount, leverage)
 
 # ============================
 # 재시작 메시지
@@ -353,13 +377,11 @@ __all__ = [
     "get_contract_v2", "get_size_step", "round_size",
     "get_ticker_last", "get_last_price",
     "get_positions", "get_open_positions",
-    "place_order_market", "close_position_full",
+    "place_order_market", "place_market_order",
+    "place_market_order_by_usdt", "market_open", "market_open_by_usdt",
+    "close_position_full", "close_position",
     "quote_to_size", "resume_positions_message",
 ]
-
-# ============================
-# 모듈 테스트
-# ============================
 
 if __name__ == "__main__":
     try:
