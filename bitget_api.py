@@ -1,12 +1,13 @@
-# bitget_api.py  — Bitget USDT-Futures helper (v2 우선 + v1 폴백)
-# 기능 요약
-# - v2 계약/티커/포지션/주문을 우선 시도 → 실패(code != "00000", lastPr 누락 등) 시 v1로 자동 폴백
-# - v1과 v2의 차이(심볼 표기, productType, reduceOnly 등) 자동 변환
-# - 계약 캐시(/contracts), sizeStep/minSize/pricePlace 유지
-# - 시장가 OPEN: reduceOnly="NO"(v2) / "false"(v1)
-# - 시장가 CLOSE: reduceOnly="YES"(v2) / "true"(v1) + 40017일 때 1 step 줄여 재시도
-# - 포지션: v2(holdSide 1row)와 v1(long/short nested) 모두 공통 포맷으로 반환
-# - 상세 로깅으로 원인 추적([ticker] ERROR, [positions] ERROR 등)
+# -*- coding: utf-8 -*-
+"""
+bitget_api.py  (USDT Perpetual Futures)
+- v2 우선, 실패시 v1 폴백
+- 호스트 강제 교정 가드
+- positions 조회는 v2/v1 모두 POST
+- reduceOnly: "YES"/"NO"
+- sizeStep / minTradeNum 반올림
+- 심볼 변환 v2('BTCUSDT') <-> v1('BTCUSDT_UMCBL')
+"""
 
 from __future__ import annotations
 
@@ -14,257 +15,217 @@ import os
 import hmac
 import time
 import json
-import math
 import base64
 import hashlib
-import threading
-from typing import Dict, Any, Optional, List
+from typing import Any, Dict, List, Optional, Tuple
 
 import requests
 
-# ────────────────────────────────────────────────────────────
-# ENV / CONST
-BITGET_HOST = os.getenv("BITGET_HOST", "https://api.bitget.com").rstrip("/")
-API_KEY = os.getenv("BITGET_API_KEY", "")
-API_SECRET = os.getenv("BITGET_API_SECRET", "")
-API_PASSPHRASE = os.getenv("BITGET_PASSPHRASE", "")
+# =========================
+# 환경변수 & 상수
+# =========================
 
-# v2 공식 productType
-PRODUCT_TYPE_V2 = "USDT-FUTURES"
-# v1 productType (USDT Perp. Linear)
-PRODUCT_TYPE_V1 = "umcbl"
+API_KEY = os.getenv("BITGET_API_KEY", "").strip()
+API_SECRET = os.getenv("BITGET_API_SECRET", "").strip()
+API_PASSPHRASE = os.getenv("BITGET_API_PASSPHRASE", "").strip()
 
-MARGIN_COIN = os.getenv("BITGET_MARGIN_COIN", "USDT")
-TIMEOUT = (7, 15)
+PRODUCT_TYPE_V2 = "USDT-FUTURES"   # v2 명시
+PRODUCT_TYPE_V1 = "umcbl"          # v1 명시(USDT Perp)
 
-# ────────────────────────────────────────────────────────────
-# HTTP + SIGN (v1/v2 동일 사인룰)
-def _ts_ms() -> str:
+TIMEOUT = (8, 15)  # (connect, read)
+
+# ── Host resolver: 환경변수가 잘못되어도 Bitget로 강제 교정
+def _resolve_host() -> str:
+    raw = os.getenv("BITGET_HOST", "https://api.bitget.com").strip()
+    low = raw.lower()
+    if "bitget.com" not in low:
+        print(f"[FATAL] BITGET_HOST looks wrong: {raw} -> forcing https://api.bitget.com")
+        return "https://api.bitget.com"
+    return raw.rstrip("/")
+
+BITGET_HOST = _resolve_host()
+print(f"[bitget] host={BITGET_HOST}")
+
+_session = requests.Session()
+
+
+# =========================
+# 유틸
+# =========================
+
+def _now_ms() -> str:
     return str(int(time.time() * 1000))
 
-def _sign(timestamp: str, method: str, path: str, body: str = "") -> str:
-    msg = f"{timestamp}{method.upper()}{path}{body}"
-    mac = hmac.new(API_SECRET.encode(), msg.encode(), hashlib.sha256)
+def _b64_hmac_sha256(msg: str, secret: str) -> str:
+    mac = hmac.new(secret.encode("utf-8"), msg.encode("utf-8"), hashlib.sha256)
     return base64.b64encode(mac.digest()).decode()
 
-def _headers(method: str, path: str, body: str = "") -> Dict[str, str]:
-    ts = _ts_ms()
-    sign = _sign(ts, method, path, body)
+def _headers(ts: str, sign: str) -> Dict[str, str]:
     return {
         "ACCESS-KEY": API_KEY,
         "ACCESS-SIGN": sign,
         "ACCESS-TIMESTAMP": ts,
         "ACCESS-PASSPHRASE": API_PASSPHRASE,
         "Content-Type": "application/json",
-        "locale": "en-US",
+        # "X-CHANNEL-API-CODE": "bitget-python",  # 선택
     }
 
-def _req_get(path: str, params: Optional[Dict[str, Any]] = None, auth: bool = False) -> Dict[str, Any]:
+def _sign(ts: str, method: str, path: str, body: str) -> str:
+    # Bitget: signText = timestamp + method + requestPath + body
+    return _b64_hmac_sha256(ts + method + path + body, API_SECRET)
+
+def _request(method: str, path: str, body: Optional[Dict[str, Any]] = None, auth: bool = False) -> Dict[str, Any]:
     url = BITGET_HOST + path
-    if not auth:
-        r = requests.get(url, params=params or {}, timeout=TIMEOUT)
-        return r.json()
-    q = ""
-    if params:
-        from urllib.parse import urlencode
-        q = "?" + urlencode(params)
-    h = _headers("GET", path + q)
-    r = requests.get(url, params=params or {}, headers=h, timeout=TIMEOUT)
-    return r.json()
+    data = "" if body is None else json.dumps(body, separators=(",", ":"), ensure_ascii=False)
+    hdrs = {"Content-Type": "application/json"}
+    if auth:
+        ts = _now_ms()
+        sign = _sign(ts, method.upper(), path, data)
+        hdrs = _headers(ts, sign)
 
-def _req_post(path: str, payload: Dict[str, Any], auth: bool = True) -> Dict[str, Any]:
-    url = BITGET_HOST + path
-    body = json.dumps(payload, separators=(",", ":"))
-    if not auth:
-        r = requests.post(url, data=body, timeout=TIMEOUT, headers={"Content-Type": "application/json"})
-        return r.json()
-    h = _headers("POST", path, body)
-    r = requests.post(url, data=body, headers=h, timeout=TIMEOUT)
-    return r.json()
+    try:
+        if method.upper() == "GET":
+            resp = _session.get(url, headers=hdrs, timeout=TIMEOUT)
+        elif method.upper() == "POST":
+            resp = _session.post(url, headers=hdrs, data=data, timeout=TIMEOUT)
+        else:
+            raise ValueError(f"Unsupported method: {method}")
+    except requests.RequestException as e:
+        return {"code": "HTTP_ERR", "msg": str(e), "data": None}
 
-# v2 helpers
-def _get_v2(path: str, params: Optional[Dict[str, Any]] = None, auth: bool = False) -> Dict[str, Any]:
-    return _req_get(path, params, auth)
+    try:
+        return resp.json()
+    except Exception:
+        return {"code": f"HTTP_{resp.status_code}", "msg": resp.text, "data": None}
 
-def _post_v2(path: str, payload: Dict[str, Any], auth: bool = True) -> Dict[str, Any]:
-    return _req_post(path, payload, auth)
+def _get_v2(path: str, auth: bool = False) -> Dict[str, Any]:
+    return _request("GET", path, None, auth=auth)
 
-# v1 helpers
-def _get_v1(path: str, params: Optional[Dict[str, Any]] = None, auth: bool = False) -> Dict[str, Any]:
-    return _req_get(path, params, auth)
+def _post_v2(path: str, body: Dict[str, Any], auth: bool = False) -> Dict[str, Any]:
+    return _request("POST", path, body, auth=auth)
 
-def _post_v1(path: str, payload: Dict[str, Any], auth: bool = True) -> Dict[str, Any]:
-    return _req_post(path, payload, auth)
+def _get_v1(path: str, auth: bool = False) -> Dict[str, Any]:
+    return _request("GET", path, None, auth=auth)
 
-# ────────────────────────────────────────────────────────────
-# SYMBOL CONVERT
-def convert_symbol_v2(s: str) -> str:
-    """DOGEUSDT 형태로 정규화 (v2)"""
-    s = (s or "").upper().replace(" ", "")
-    if s.endswith("_UMCBL") or s.endswith("_DMCBL"):
-        s = s.split("_")[0]
-    if not s.endswith("USDT"):
-        if s.endswith("USD"):
-            s += "T"
-        elif "USDT" not in s:
-            s += "USDT"
-    return s
+def _post_v1(path: str, body: Dict[str, Any], auth: bool = False) -> Dict[str, Any]:
+    return _request("POST", path, body, auth=auth)
 
-def convert_symbol_v1(s: str) -> str:
-    """v1 심볼(DOGEUSDT_UMCBL)로 변환"""
-    s2 = convert_symbol_v2(s)
-    if not s2.endswith("_UMCBL"):
-        s2 = f"{s2}_UMCBL"
-    return s2
 
-# 외부에서 공통 사용
-def convert_symbol(s: str) -> str:
-    return convert_symbol_v2(s)
+# =========================
+# 심볼 변환
+# =========================
 
-# ────────────────────────────────────────────────────────────
-# CONTRACTS CACHE (v2 → 실패시 v1로 폴백)
-_CONTRACTS_LOCK = threading.RLock()
-_CONTRACTS: Dict[str, Dict[str, Any]] = {}
-_LAST_LOAD = 0.0
-_LOAD_INTERVAL = 60.0
+def convert_symbol_v2(v1_symbol: str) -> str:
+    """v1: BTCUSDT_UMCBL -> v2: BTCUSDT"""
+    if not v1_symbol:
+        return ""
+    if v1_symbol.endswith("_UMCBL"):
+        return v1_symbol[:-6]
+    return v1_symbol
 
-def _load_contracts_v2() -> Optional[Dict[str, Dict[str, Any]]]:
-    resp = _get_v2("/api/v2/mix/market/contracts", {"productType": PRODUCT_TYPE_V2})
-    if str(resp.get("code")) != "00000":
-        print("[contracts v2] ERROR:", resp)
-        return None
-    rows = resp.get("data") or []
-    tmp: Dict[str, Dict[str, Any]] = {}
-    for it in rows:
-        sym = (it.get("symbol") or "").upper()
-        if not sym:
+def convert_symbol_v1(v2_symbol: str) -> str:
+    """v2: BTCUSDT -> v1: BTCUSDT_UMCBL"""
+    if not v2_symbol:
+        return ""
+    if v2_symbol.endswith("_UMCBL"):
+        return v2_symbol
+    return f"{v2_symbol}_UMCBL"
+
+
+# =========================
+# 계약/틱/스텝 유틸
+# =========================
+
+_contract_cache: Dict[str, Dict[str, Any]] = {}
+
+def get_contract_v2(symbol_v2: str) -> Dict[str, Any]:
+    """v2 계약 정보 조회 (캐시)"""
+    s = symbol_v2.upper()
+    if s in _contract_cache:
+        return _contract_cache[s]
+
+    # v2: Get All Symbols - Contracts
+    r = _get_v2("/api/v2/mix/market/contracts")
+    if str(r.get("code")) != "00000":
+        print("[contracts v2] ERROR:", r)
+        return {}
+
+    for it in r.get("data") or []:
+        if it.get("productType") != PRODUCT_TYPE_V2:
             continue
-        tmp[sym] = {
-            "symbol": sym,
-            "pricePlace": int(it.get("pricePlace") or 4),
-            "priceEndStep": float(it.get("priceEndStep") or 0.0001),
-            "sizePlace": int(it.get("sizePlace") or 3),
-            "sizeMultiplier": float(it.get("sizeMultiplier") or 1),
-            "sizeStep": float(it.get("minTradeNum") or 0.001),
-            "minSize": float(it.get("minTradeNum") or 0.001),
-        }
-    return tmp
+        if it.get("symbol", "").upper() == s:
+            _contract_cache[s] = it
+            return it
+    return {}
 
-def _load_contracts_v1() -> Optional[Dict[str, Dict[str, Any]]]:
-    resp = _get_v1("/api/mix/v1/market/contracts", {"productType": PRODUCT_TYPE_V1})
-    if str(resp.get("code")) != "00000":
-        print("[contracts v1] ERROR:", resp)
-        return None
-    rows = resp.get("data") or []
-    tmp: Dict[str, Dict[str, Any]] = {}
-    for it in rows:
-        # v1은 symbol이 DOGEUSDT_UMCBL 형식. v2키로 저장
-        sym_v1 = (it.get("symbol") or "").upper()
-        if not sym_v1:
-            continue
-        sym_v2 = convert_symbol_v2(sym_v1)
-        tmp[sym_v2] = {
-            "symbol": sym_v2,
-            "pricePlace": int(it.get("pricePlace") or 4),
-            "priceEndStep": float(it.get("priceEndStep") or 0.0001),
-            "sizePlace": int(it.get("sizePlace") or 3),
-            "sizeMultiplier": float(it.get("sizeMultiplier") or 1),
-            "sizeStep": float(it.get("minTradeNum") or 0.001),
-            "minSize": float(it.get("minTradeNum") or 0.001),
-        }
-    return tmp
+def get_size_step(symbol_v2: str) -> Tuple[float, float]:
+    """(sizeStep, minTradeNum)"""
+    c = get_contract_v2(symbol_v2)
+    size_step = float(c.get("sizeStep") or 0.0)
+    min_trade = float(c.get("minTradeNum") or 0.0)
+    if size_step <= 0:
+        size_step = 0.001
+    if min_trade <= 0:
+        min_trade = size_step
+    return size_step, min_trade
 
-def _load_contracts(force: bool = False) -> None:
-    global _LAST_LOAD, _CONTRACTS
-    now = time.time()
-    if not force and (now - _LAST_LOAD) < _LOAD_INTERVAL and _CONTRACTS:
-        return
-    try:
-        tmp = _load_contracts_v2()
-        if tmp is None or not tmp:
-            tmp = _load_contracts_v1()
-        if tmp:
-            with _CONTRACTS_LOCK:
-                _CONTRACTS = tmp
-                _LAST_LOAD = now
-    except Exception as e:
-        print("contract load err:", e)
+def round_size(symbol_v2: str, size: float) -> float:
+    step, min_num = get_size_step(symbol_v2)
+    if step <= 0:
+        return max(size, 0.0)
+    # step 단위 내림
+    k = int(size / step)
+    adj = k * step
+    if adj < min_num:
+        adj = min_num
+    return round(adj, 10)
 
-def _ensure_contract(sym_v2: str) -> Optional[Dict[str, Any]]:
-    _load_contracts(force=False)
-    s = sym_v2.upper()
-    with _CONTRACTS_LOCK:
-        if s in _CONTRACTS:
-            return _CONTRACTS[s]
-    _load_contracts(force=True)
-    with _CONTRACTS_LOCK:
-        return _CONTRACTS.get(s)
+def get_ticker_last(symbol_v2: str) -> float:
+    """v2 ticker.lastPr, fallback v1"""
+    s = symbol_v2.upper()
+    r = _get_v2(f"/api/v2/mix/market/ticker?symbol={s}")
+    if str(r.get("code")) == "00000":
+        d = r.get("data") or {}
+        lp = d.get("lastPr")
+        try:
+            v = float(lp)
+            if v > 0:
+                return v
+        except Exception:
+            pass
 
-def get_symbol_spec(symbol: str) -> Dict[str, Any]:
-    sym = convert_symbol_v2(symbol)
-    spec = _ensure_contract(sym)
-    if not spec:
-        raise ValueError(f"LOCAL_CONTRACT_FAIL: {sym} not found in /contracts(v2,v1)")
-    return spec
+    # fallback v1
+    v1s = convert_symbol_v1(s)
+    r1 = _get_v1(f"/api/mix/v1/market/ticker?symbol={v1s}")
+    if str(r1.get("code")) == "00000":
+        d = r1.get("data") or {}
+        for key in ("last", "close"):
+            try:
+                v = float(d.get(key))
+                if v > 0:
+                    return v
+            except Exception:
+                pass
+    raise RuntimeError(f"tickerNone: {symbol_v2}")
 
-# ────────────────────────────────────────────────────────────
-# TICKER (v2 → v1 폴백)
-def get_last_price(symbol: str) -> Optional[float]:
-    sym_v2 = convert_symbol_v2(symbol)
-    # v2
-    try:
-        for _ in range(2):
-            r2 = _get_v2("/api/v2/mix/market/ticker", {"symbol": sym_v2})
-            c2 = str(r2.get("code"))
-            if c2 == "00000":
-                d = r2.get("data") or {}
-                px = d.get("lastPr")
-                if px not in (None, "", "null"):
-                    px = float(px)
-                    if px > 0:
-                        return px
-                print(f"[ticker v2] MISSING lastPr sym={sym_v2} raw={d}")
-            else:
-                print(f"[ticker v2] ERROR code={c2} sym={sym_v2} resp={r2}")
-            time.sleep(0.15)
-    except Exception as e:
-        print("ticker v2 err:", e)
 
-    # v1
-    try:
-        sym_v1 = convert_symbol_v1(sym_v2)
-        for _ in range(2):
-            r1 = _get_v1("/api/mix/v1/market/ticker", {"symbol": sym_v1})
-            c1 = str(r1.get("code"))
-            if c1 == "00000":
-                d = r1.get("data") or {}
-                px = d.get("last") or d.get("close") or d.get("lastPrice")
-                if px not in (None, "", "null"):
-                    px = float(px)
-                    if px > 0:
-                        print(f"[ticker] fallback v1 used sym={sym_v1}")
-                        return px
-                print(f"[ticker v1] MISSING last sym={sym_v1} raw={d}")
-            else:
-                print(f"[ticker v1] ERROR code={c1} sym={sym_v1} resp={r1}")
-            time.sleep(0.15)
-    except Exception as e:
-        print("ticker v1 err:", e)
-    return None
+# =========================
+# 포지션 조회 (PATCH 적용)
+# =========================
 
-# ────────────────────────────────────────────────────────────
-# POSITIONS (v2 → v1 폴백, 공통 포맷: symbol/side/size/entryPrice/leverage)
 def _positions_v2(symbol_v2: Optional[str]) -> List[Dict[str, Any]]:
     out: List[Dict[str, Any]] = []
     if symbol_v2:
-        resp = _get_v2("/api/v2/mix/position/singlePosition",
-                       {"symbol": symbol_v2, "productType": PRODUCT_TYPE_V2}, auth=True)
+        payload = {"symbol": symbol_v2, "productType": PRODUCT_TYPE_V2}
+        resp = _post_v2("/api/v2/mix/position/singlePosition", payload, auth=True)
     else:
-        resp = _get_v2("/api/v2/mix/position/allPosition",
-                       {"productType": PRODUCT_TYPE_V2}, auth=True)
+        payload = {"productType": PRODUCT_TYPE_V2}
+        resp = _post_v2("/api/v2/mix/position/allPosition", payload, auth=True)
+
     if str(resp.get("code")) != "00000":
         print("[positions v2] ERROR:", resp)
         return out
+
     rows = resp.get("data") or []
     for it in rows:
         sym = convert_symbol_v2(it.get("symbol") or "")
@@ -287,19 +248,21 @@ def _positions_v1(symbol_v2: Optional[str]) -> List[Dict[str, Any]]:
     out: List[Dict[str, Any]] = []
     if symbol_v2:
         sym_v1 = convert_symbol_v1(symbol_v2)
-        resp = _get_v1("/api/mix/v1/position/singlePosition",
-                       {"symbol": sym_v1, "productType": PRODUCT_TYPE_V1}, auth=True)
+        payload = {"symbol": sym_v1, "productType": PRODUCT_TYPE_V1}
+        resp = _post_v1("/api/mix/v1/position/singlePosition", payload, auth=True)
     else:
-        resp = _get_v1("/api/mix/v1/position/allPosition",
-                       {"productType": PRODUCT_TYPE_V1}, auth=True)
+        payload = {"productType": PRODUCT_TYPE_V1}
+        resp = _post_v1("/api/mix/v1/position/allPosition", payload, auth=True)
+
     if str(resp.get("code")) != "00000":
         print("[positions v1] ERROR:", resp)
         return out
+
     rows = resp.get("data") or []
     for it in rows:
         sym_v1 = it.get("symbol") or ""
         sym = convert_symbol_v2(sym_v1)
-        # v1은 long/short 하위객체
+        # v1 포맷: {"long":{...}, "short":{...}}
         for side_key in ("long", "short"):
             sub = it.get(side_key) or {}
             size = float(sub.get("total") or sub.get("available") or 0)
@@ -314,203 +277,97 @@ def _positions_v1(symbol_v2: Optional[str]) -> List[Dict[str, Any]]:
             })
     return out
 
-def get_open_positions(symbol: Optional[str] = None) -> List[Dict[str, Any]]:
-    sym_v2 = convert_symbol_v2(symbol) if symbol else None
-    try:
-        out = _positions_v2(sym_v2)
-        if out:
-            return out
-    except Exception as e:
-        print("positions v2 err:", e)
-    try:
-        out = _positions_v1(sym_v2)
-        if out:
-            print("[positions] fallback v1 used")
-        return out
-    except Exception as e:
-        print("positions v1 err:", e)
-        return []
+def get_positions(symbol_v2: Optional[str] = None) -> List[Dict[str, Any]]:
+    """심볼 지정 시 해당 심볼만, 없으면 전체"""
+    v2 = _positions_v2(symbol_v2)
+    if v2:
+        return v2
+    print("[positions] fallback v1 used")
+    return _positions_v1(symbol_v2)
 
-# ────────────────────────────────────────────────────────────
-# SIZE UTILS
-def round_down_step(x: float, step: float) -> float:
-    if step <= 0:
-        return float(x)
-    return math.floor(x / step) * step
 
-def _usdt_to_size(usdt: float, price: float, size_step: float, min_size: float) -> float:
-    if price <= 0:
-        return 0.0
-    size = float(usdt) / float(price)
-    size = round_down_step(size, size_step)
-    if size < min_size:
-        return 0.0
-    return size
+# =========================
+# 주문
+# =========================
 
-# ────────────────────────────────────────────────────────────
-# ORDERS (v2 → v1 폴백)
-def place_market_order(symbol: str, usdt_amount: float, side: str, leverage: Optional[float] = None) -> Dict[str, Any]:
-    """시장가 OPEN (reduceOnly NO)."""
-    try:
-        sym_v2 = convert_symbol_v2(symbol)
-        spec = get_symbol_spec(sym_v2)
-    except Exception as e:
-        return {"code": "LOCAL_CONTRACT_FAIL", "msg": str(e)}
+def _reduce_only_to_str(flag: bool) -> str:
+    # v2는 YES/NO 여야 함 (Bitget가 확인해준 사항)
+    return "YES" if flag else "NO"
 
-    price = get_last_price(sym_v2)
-    if price is None or price <= 0:
-        return {"code": "LOCAL_TICKER_FAIL", "msg": "ticker_none"}
+def place_order_market(symbol_v2: str, side: str, size: float, reduce_only: bool = False) -> Dict[str, Any]:
+    """
+    side: 'buy' (long open / short close) | 'sell' (short open / long close)
+    size: contracts (코인 수량)
+    """
+    size_adj = round_size(symbol_v2, float(size))
+    if size_adj <= 0:
+        return {"code": "SIZE_ERR", "msg": "size<=0", "data": None}
 
-    size = _usdt_to_size(float(usdt_amount or 0), price, float(spec["sizeStep"]), float(spec["minSize"]))
-    if size <= 0:
-        return {"code": "LOCAL_TICKER_FAIL", "msg": "ticker_none or size<=0"}
-
-    # 방향
-    dir_side = "buy" if side.lower().startswith("l") else "sell"
-
-    # v2 시도
-    payload_v2 = {
-        "symbol": sym_v2,
+    payload = {
+        "symbol": symbol_v2.upper(),
         "productType": PRODUCT_TYPE_V2,
-        "marginCoin": MARGIN_COIN,
+        "marginCoin": "USDT",
         "orderType": "market",
-        "side": dir_side,
-        "size": str(size),
-        "reduceOnly": "NO",     # v2: YES/NO
+        "side": side,  # 'buy' or 'sell'
+        "size": f"{size_adj}",
+        "reduceOnly": _reduce_only_to_str(reduce_only),
     }
-    if leverage:
-        payload_v2["leverage"] = str(leverage)
+    r = _post_v2("/api/v2/mix/order/placeOrder", payload, auth=True)
+    if str(r.get("code")) != "00000":
+        print("[placeOrder v2] ERROR:", r)
+    return r
 
+def close_position_full(symbol_v2: str, side: str) -> Dict[str, Any]:
+    """
+    side: 'long' or 'short'  (닫을 포지션 방향)
+    내부적으로 반대 side로 reduceOnly=YES 시장가 발주
+    """
+    pos_list = get_positions(symbol_v2)
+    total = 0.0
+    for p in pos_list:
+        if p["symbol"].upper() == symbol_v2.upper() and p["side"] == side:
+            total += float(p["size"])
+    if total <= 0:
+        return {"code": "NO_POSITION", "msg": "no position", "data": None}
+
+    opp = "sell" if side == "long" else "buy"
+    return place_order_market(symbol_v2, opp, total, reduce_only=True)
+
+
+# =========================
+# 금액 → 수량 변환(시장가 진입용)
+# =========================
+
+def quote_to_size(symbol_v2: str, usdt_amount: float, leverage: float = 1.0) -> float:
+    """
+    usdt 금액을 수량(코인)으로 변환. Bitget USDT-Perp 기준.
+    """
+    px = get_ticker_last(symbol_v2)
+    if px <= 0:
+        raise RuntimeError("price<=0")
+    raw = (usdt_amount * leverage) / px
+    return round_size(symbol_v2, raw)
+
+
+# =========================
+# 테스트 헬퍼
+# =========================
+
+def resume_positions_message() -> str:
+    items = get_positions(None)
+    if not items:
+        return "Resumed 0 open positions: -"
+    tags = [f"{it['symbol']}_{it['side']}" for it in items]
+    return f"Resumed {len(items)} open positions: " + ", ".join(tags)
+
+
+# =========================
+# 모듈 직접 실행 테스트
+# =========================
+
+if __name__ == "__main__":
+    # 간단 점검 루틴
     try:
-        r2 = _post_v2("/api/v2/mix/order/placeOrder", payload_v2, auth=True)
-        if str(r2.get("code")) == "00000":
-            return r2
-        print("[order v2 OPEN] ERROR:", r2)
+        print(resume_positions_message())
     except Exception as e:
-        print("order v2 open err:", e)
-
-    # v1 폴백
-    try:
-        sym_v1 = convert_symbol_v1(sym_v2)
-        payload_v1 = {
-            "symbol": sym_v1,
-            "productType": PRODUCT_TYPE_V1,
-            "marginCoin": MARGIN_COIN,
-            "orderType": "market",
-            "side": dir_side,
-            "size": str(size),
-            "reduceOnly": "false",  # v1: true/false
-        }
-        if leverage:
-            payload_v1["leverage"] = str(leverage)
-        r1 = _post_v1("/api/mix/v1/order/placeOrder", payload_v1, auth=True)
-        if str(r1.get("code")) != "00000":
-            print("[order v1 OPEN] ERROR:", r1)
-        else:
-            print("[order] fallback v1 used OPEN")
-        return r1
-    except Exception as e:
-        print("order v1 open err:", e)
-        return {"code": "LOCAL_ORDER_FAIL", "msg": str(e)}
-
-def place_reduce_by_size(symbol: str, contracts: float, side: str) -> Dict[str, Any]:
-    """시장가 reduceOnly CLOSE. 보유수량 초과 clamp + 40017 1회 재시도."""
-    sym_v2 = convert_symbol_v2(symbol)
-    spec = get_symbol_spec(sym_v2)
-
-    # 현재 보유(해당 side) 수량
-    held = 0.0
-    for p in get_open_positions(sym_v2):
-        if convert_symbol_v2(p.get("symbol")) == sym_v2 and (p.get("side") or "") == side:
-            held = float(p.get("size") or 0.0)
-            break
-    if held <= 0:
-        return {"code": "LOCAL_NO_POS", "msg": "no_position"}
-
-    step = float(spec["sizeStep"])
-    qty = round_down_step(float(contracts or 0), step)
-    if qty <= 0:
-        return {"code": "LOCAL_BAD_QTY", "msg": "qty<=0"}
-
-    max_qty = round_down_step(held, step)
-    if qty > max_qty:
-        qty = max_qty
-    if qty <= 0:
-        return {"code": "LOCAL_CLAMP_ZERO", "msg": "clamped_to_zero"}
-
-    # reduceOnly는 반대 방향
-    dir_side = "sell" if side == "long" else "buy"
-
-    # v2 우선
-    payload_v2 = {
-        "symbol": sym_v2,
-        "productType": PRODUCT_TYPE_V2,
-        "marginCoin": MARGIN_COIN,
-        "orderType": "market",
-        "side": dir_side,
-        "size": str(qty),
-        "reduceOnly": "YES",
-    }
-    try:
-        r2 = _post_v2("/api/v2/mix/order/placeOrder", payload_v2, auth=True)
-        c2 = str(r2.get("code"))
-        if c2 == "00000":
-            return r2
-        if c2 == "40017":
-            retry_qty = round_down_step(qty - step, step)
-            if retry_qty > 0:
-                payload_v2["size"] = str(retry_qty)
-                r2b = _post_v2("/api/v2/mix/order/placeOrder", payload_v2, auth=True)
-                return {"first": r2, "retry": r2b}
-        print("[order v2 CLOSE] ERROR:", r2)
-    except Exception as e:
-        print("order v2 close err:", e)
-
-    # v1 폴백
-    try:
-        sym_v1 = convert_symbol_v1(sym_v2)
-        payload_v1 = {
-            "symbol": sym_v1,
-            "productType": PRODUCT_TYPE_V1,
-            "marginCoin": MARGIN_COIN,
-            "orderType": "market",
-            "side": dir_side,
-            "size": str(qty),
-            "reduceOnly": "true",
-        }
-        r1 = _post_v1("/api/mix/v1/order/placeOrder", payload_v1, auth=True)
-        c1 = str(r1.get("code"))
-        if c1 != "00000":
-            if c1 == "40017":
-                retry_qty = round_down_step(qty - step, step)
-                if retry_qty > 0:
-                    payload_v1["size"] = str(retry_qty)
-                    r1b = _post_v1("/api/mix/v1/order/placeOrder", payload_v1, auth=True)
-                    print("[order] fallback v1 used CLOSE with retry")
-                    return {"first": r1, "retry": r1b}
-            print("[order v1 CLOSE] ERROR:", r1)
-        else:
-            print("[order] fallback v1 used CLOSE")
-        return r1
-    except Exception as e:
-        print("order v1 close err:", e)
-        return {"code": "LOCAL_ORDER_FAIL", "msg": str(e)}
-
-# ────────────────────────────────────────────────────────────
-# 공개 (디버그용)
-def _get(path: str, params: Optional[Dict[str, Any]] = None, auth: bool = False) -> Dict[str, Any]:
-    """server의 /debug에서 사용하기 위한 공개 함수(v2 기본)."""
-    return _get_v2(path, params, auth)
-
-PRODUCT_TYPE = PRODUCT_TYPE_V2
-
-__all__ = [
-    "PRODUCT_TYPE",
-    "convert_symbol",
-    "get_symbol_spec",
-    "get_last_price",
-    "get_open_positions",
-    "place_market_order",
-    "place_reduce_by_size",
-    "_get",
-]
+        print("resume error:", e)
