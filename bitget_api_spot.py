@@ -327,8 +327,8 @@ def _post_v2_place_order(body: Dict[str, Any]) -> Dict[str, Any]:
 def place_spot_market_buy(symbol: str, usdt_amount: float) -> Dict[str, Any]:
     """
     시장가 매수 (quote USDT 금액 기반)
-    - 먼저 quoteQty 필드로 전송
-    - 실패 시 quantity 로 1회 폴백
+    - 먼저 quoteOrderQty 필드로 전송
+    - 실패 시 size(기초코인 수량)로 1회 폴백
     - minQuote 미만이면 로컬 스킵
     """
     base = convert_symbol(symbol)
@@ -341,35 +341,37 @@ def place_spot_market_buy(symbol: str, usdt_amount: float) -> Dict[str, Any]:
     if float(usdt_amount) < min_quote:
         return {"code": "LOCAL_MIN_QUOTE", "msg": f"need>={min_quote}USDT"}
 
-    # 1) quoteQty 로 우선 시도
+    # 1) USDT 금액으로 주문: quoteOrderQty
     body1 = {
         "symbol": base,
         "side": "buy",
         "orderType": "market",
         "force": "gtc",
-        "quoteQty": _fmt_by_step(float(usdt_amount), 1e-6),
+        "quoteOrderQty": _fmt_by_step(float(usdt_amount), 1e-6),
     }
     res = _post_v2_place_order(body1)
     if isinstance(res, dict) and ("code" in res) and str(res.get("code")) in ("00000", "0"):
         return res
 
-    # 2) 실패 시 quantity 로 폴백
+    # 2) 실패 시 size(기초코인 수량)로 폴백
+    px = get_last_price_spot(base) or 0.0
+    qty_guess = (float(usdt_amount) / px) if px > 0 else float(usdt_amount)
+    step = float(spec.get("qtyStep", 1e-6))
     body2 = {
         "symbol": base,
         "side": "buy",
         "orderType": "market",
         "force": "gtc",
-        "quantity": _fmt_by_step(float(usdt_amount), 1e-6),
+        "size": _fmt_by_step(qty_guess, step),
     }
     res2 = _post_v2_place_order(body2)
     if isinstance(res2, dict) and ("code" in res2) and str(res2.get("code")) in ("00000", "0"):
         try:
-            send_telegram(f"[SPOT] BUY {base} via quantity fallback {usdt_amount}")
+            send_telegram(f"[SPOT] BUY {base} via size fallback ~{qty_guess}")
         except Exception:
             pass
         return res2
 
-    # HTTP 에러 포맷 or API 코드 에러
     if isinstance(res2, dict) and "http" in res2:
         info = _extract_code_text(res2.get("text", "") or "")
         if info.get("code") in ("40309", "40034"):
@@ -402,14 +404,14 @@ def place_spot_market_sell_qty(symbol: str, qty: float) -> Dict[str, Any]:
         if notional < min_quote:
             return {"code": "LOCAL_TOO_SMALL", "msg": f"order notional {notional:.4f} < {min_quote} USDT"}
 
-    qty_str = _fmt_by_step(float(qty), step)
+    size_str = _fmt_by_step(float(qty), step)
 
     body1 = {
         "symbol": base,
         "side": "sell",
         "orderType": "market",
         "force": "gtc",
-        "quantity": qty_str,
+        "size": size_str,
     }
     res = _post_v2_place_order(body1)
     if isinstance(res, dict) and ("code" in res) and str(res.get("code")) in ("00000", "0"):
@@ -420,18 +422,18 @@ def place_spot_market_sell_qty(symbol: str, qty: float) -> Dict[str, Any]:
         txt = res.get("text") or ""
         info = _extract_code_text(txt)
 
-        # scale 재시도 (checkBDScale= or checkScale=)
+        # scale 재시도 (checkBDScale / checkScale)
         m = re.search(r"(?:checkBDScale|checkScale)[\"']?\s*[:=]\s*([0-9]+)", txt)
         if res.get("http") == 400 and m:
             chk = int(m.group(1))
             step2 = 10 ** (-chk)
             qty2 = round_down_step(float(qty), step2)
             body2 = {"symbol": base, "side": "sell", "orderType": "market", "force": "gtc",
-                     "quantity": _fmt_by_step(qty2, step2)}
+                     "size": _fmt_by_step(qty2, step2)}
             res2 = _post_v2_place_order(body2)
             if isinstance(res2, dict) and ("code" in res2) and str(res2.get("code")) in ("00000", "0"):
                 try:
-                    send_telegram(f"[SPOT] retry sell {base} scale->{chk} qty={qty2}")
+                    send_telegram(f"[SPOT] retry sell {base} scale->{chk} size={qty2}")
                 except Exception:
                     pass
                 return res2
