@@ -1,12 +1,17 @@
 # -*- coding: utf-8 -*-
 """
 bitget_api.py  (USDT Perpetual Futures)
-- v2 우선, 실패시 v1 폴백
-- 호스트 강제 교정 가드
-- positions 조회는 v2/v1 모두 POST
-- reduceOnly: "YES"/"NO"
+
+✅ 핵심 포인트
+- v2(USDT-FUTURES) 우선, 실패 시 v1(umcbl) 폴백
+- BITGET_HOST 가드: 잘못된 값이라도 https://api.bitget.com 으로 강제 교정
+- 포지션 조회: v2/v1 모두 POST (Bitget 권장)
+- 주문: placeOrder v2 (reduceOnly = "YES"/"NO")
 - sizeStep / minTradeNum 반올림
 - 심볼 변환 v2('BTCUSDT') <-> v1('BTCUSDT_UMCBL')
+- ✅ 과거 코드 호환 별칭:
+    convert_symbol()  → convert_symbol_v2()
+    get_last_price()  → get_ticker_last()
 """
 
 from __future__ import annotations
@@ -21,21 +26,22 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import requests
 
-# =========================
+# =========================================================
 # 환경변수 & 상수
-# =========================
+# =========================================================
 
 API_KEY = os.getenv("BITGET_API_KEY", "").strip()
 API_SECRET = os.getenv("BITGET_API_SECRET", "").strip()
 API_PASSPHRASE = os.getenv("BITGET_PASSPHRASE", "").strip()
 
-PRODUCT_TYPE_V2 = "USDT-FUTURES"   # v2 명시
-PRODUCT_TYPE_V1 = "umcbl"          # v1 명시(USDT Perp)
+PRODUCT_TYPE_V2 = "USDT-FUTURES"   # v2 productType
+PRODUCT_TYPE_V1 = "umcbl"          # v1 productType (USDT Perp)
 
 TIMEOUT = (8, 15)  # (connect, read)
 
-# ── Host resolver: 환경변수가 잘못되어도 Bitget로 강제 교정
+
 def _resolve_host() -> str:
+    """환경변수가 잘못되어도 Bitget 기본 호스트로 강제."""
     raw = os.getenv("BITGET_HOST", "https://api.bitget.com").strip()
     low = raw.lower()
     if "bitget.com" not in low:
@@ -43,15 +49,15 @@ def _resolve_host() -> str:
         return "https://api.bitget.com"
     return raw.rstrip("/")
 
+
 BITGET_HOST = _resolve_host()
 print(f"[bitget] host={BITGET_HOST}")
 
 _session = requests.Session()
 
-
-# =========================
-# 유틸
-# =========================
+# =========================================================
+# 서명/요청 유틸
+# =========================================================
 
 def _now_ms() -> str:
     return str(int(time.time() * 1000))
@@ -109,10 +115,9 @@ def _get_v1(path: str, auth: bool = False) -> Dict[str, Any]:
 def _post_v1(path: str, body: Dict[str, Any], auth: bool = False) -> Dict[str, Any]:
     return _request("POST", path, body, auth=auth)
 
-
-# =========================
+# =========================================================
 # 심볼 변환
-# =========================
+# =========================================================
 
 def convert_symbol_v2(v1_symbol: str) -> str:
     """v1: BTCUSDT_UMCBL -> v2: BTCUSDT"""
@@ -130,15 +135,13 @@ def convert_symbol_v1(v2_symbol: str) -> str:
         return v2_symbol
     return f"{v2_symbol}_UMCBL"
 
-# --- Backward compatibility alias (for older code that imports convert_symbol)
+# ✅ 과거 코드 호환: 기존 코드가 convert_symbol() 을 임포트하면 v2 변환을 제공
 def convert_symbol(sym: str) -> str:
-    # 기존 코드가 기대하던 동작: v1('BTCUSDT_UMCBL') -> v2('BTCUSDT')
     return convert_symbol_v2(sym)
 
-
-# =========================
-# 계약/틱/스텝 유틸
-# =========================
+# =========================================================
+# 계약/스텝/틱
+# =========================================================
 
 _contract_cache: Dict[str, Dict[str, Any]] = {}
 
@@ -177,15 +180,14 @@ def round_size(symbol_v2: str, size: float) -> float:
     step, min_num = get_size_step(symbol_v2)
     if step <= 0:
         return max(size, 0.0)
-    # step 단위 내림
-    k = int(size / step)
+    k = int(size / step)  # step 단위 내림
     adj = k * step
     if adj < min_num:
         adj = min_num
     return round(adj, 10)
 
 def get_ticker_last(symbol_v2: str) -> float:
-    """v2 ticker.lastPr, fallback v1"""
+    """v2 ticker.lastPr, fallback v1(last/close)"""
     s = symbol_v2.upper()
     r = _get_v2(f"/api/v2/mix/market/ticker?symbol={s}")
     if str(r.get("code")) == "00000":
@@ -212,15 +214,18 @@ def get_ticker_last(symbol_v2: str) -> float:
                 pass
     raise RuntimeError(f"tickerNone: {symbol_v2}")
 
+# ✅ 과거 코드 호환: 기존 이름 유지
+def get_last_price(symbol_v2: str) -> float:
+    return get_ticker_last(symbol_v2)
 
-# =========================
-# 포지션 조회 (POST 사용)
-# =========================
+# =========================================================
+# 포지션 조회 (v2/v1 모두 POST)
+# =========================================================
 
 def _positions_v2(symbol_v2: Optional[str]) -> List[Dict[str, Any]]:
     out: List[Dict[str, Any]] = []
     if symbol_v2:
-        payload = {"symbol": symbol_v2, "productType": PRODUCT_TYPE_V2}
+        payload = {"symbol": symbol_v2.upper(), "productType": PRODUCT_TYPE_V2}
         resp = _post_v2("/api/v2/mix/position/singlePosition", payload, auth=True)
     else:
         payload = {"productType": PRODUCT_TYPE_V2}
@@ -266,7 +271,7 @@ def _positions_v1(symbol_v2: Optional[str]) -> List[Dict[str, Any]]:
     for it in rows:
         sym_v1 = it.get("symbol") or ""
         sym = convert_symbol_v2(sym_v1)
-        # v1 포맷: {"long":{...}, "short":{...}}
+        # v1은 {"long": {...}, "short": {...}} 구조
         for side_key in ("long", "short"):
             sub = it.get(side_key) or {}
             size = float(sub.get("total") or sub.get("available") or 0)
@@ -282,26 +287,25 @@ def _positions_v1(symbol_v2: Optional[str]) -> List[Dict[str, Any]]:
     return out
 
 def get_positions(symbol_v2: Optional[str] = None) -> List[Dict[str, Any]]:
-    """심볼 지정 시 해당 심볼만, 없으면 전체"""
+    """심볼 지정 시 해당만, 없으면 전체."""
     v2 = _positions_v2(symbol_v2)
     if v2:
         return v2
     print("[positions] fallback v1 used")
     return _positions_v1(symbol_v2)
 
-
-# =========================
-# 주문
-# =========================
+# =========================================================
+# 주문(시장가)
+# =========================================================
 
 def _reduce_only_to_str(flag: bool) -> str:
-    # v2는 YES/NO 여야 함
-    return "YES" if flag else "NO"
+    return "YES" if flag else "NO"  # v2는 YES/NO 문자열
 
 def place_order_market(symbol_v2: str, side: str, size: float, reduce_only: bool = False) -> Dict[str, Any]:
     """
-    side: 'buy' (long open / short close) | 'sell' (short open / long close)
-    size: contracts (코인 수량)
+    side: 'buy' (long open / short close)
+          'sell' (short open / long close)
+    size: 계약 수량(코인 수량)
     """
     size_adj = round_size(symbol_v2, float(size))
     if size_adj <= 0:
@@ -324,7 +328,7 @@ def place_order_market(symbol_v2: str, side: str, size: float, reduce_only: bool
 def close_position_full(symbol_v2: str, side: str) -> Dict[str, Any]:
     """
     side: 'long' or 'short'  (닫을 포지션 방향)
-    내부적으로 반대 side로 reduceOnly=YES 시장가 발주
+    내부적으로 반대 방향으로 reduceOnly=YES 시장가 발주
     """
     pos_list = get_positions(symbol_v2)
     total = 0.0
@@ -337,10 +341,9 @@ def close_position_full(symbol_v2: str, side: str) -> Dict[str, Any]:
     opp = "sell" if side == "long" else "buy"
     return place_order_market(symbol_v2, opp, total, reduce_only=True)
 
-
-# =========================
+# =========================================================
 # 금액 → 수량 변환(시장가 진입용)
-# =========================
+# =========================================================
 
 def quote_to_size(symbol_v2: str, usdt_amount: float, leverage: float = 1.0) -> float:
     """
@@ -352,10 +355,9 @@ def quote_to_size(symbol_v2: str, usdt_amount: float, leverage: float = 1.0) -> 
     raw = (usdt_amount * leverage) / px
     return round_size(symbol_v2, raw)
 
-
-# =========================
-# 테스트 헬퍼
-# =========================
+# =========================================================
+# 재시작 메세지 헬퍼
+# =========================================================
 
 def resume_positions_message() -> str:
     items = get_positions(None)
@@ -364,13 +366,11 @@ def resume_positions_message() -> str:
     tags = [f"{it['symbol']}_{it['side']}" for it in items]
     return f"Resumed {len(items)} open positions: " + ", ".join(tags)
 
-
-# =========================
+# =========================================================
 # 모듈 직접 실행 테스트
-# =========================
+# =========================================================
 
 if __name__ == "__main__":
-    # 간단 점검 루틴
     try:
         print(resume_positions_message())
     except Exception as e:
