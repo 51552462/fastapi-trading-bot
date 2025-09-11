@@ -27,7 +27,7 @@ import requests
 
 API_KEY = os.getenv("BITGET_API_KEY", "").strip()
 API_SECRET = os.getenv("BITGET_API_SECRET", "").strip()
-API_PASSPHRASE = os.getenv("BITGET_API_PASSPHRASE", "").strip()
+API_PASSPHRASE = os.getenv("BITGET_PASSPHRASE", "").strip()
 
 PRODUCT_TYPE_V2 = "USDT-FUTURES"   # v2 명시
 PRODUCT_TYPE_V1 = "umcbl"          # v1 명시(USDT Perp)
@@ -67,7 +67,6 @@ def _headers(ts: str, sign: str) -> Dict[str, str]:
         "ACCESS-TIMESTAMP": ts,
         "ACCESS-PASSPHRASE": API_PASSPHRASE,
         "Content-Type": "application/json",
-        # "X-CHANNEL-API-CODE": "bitget-python",  # 선택
     }
 
 def _sign(ts: str, method: str, path: str, body: str) -> str:
@@ -130,6 +129,11 @@ def convert_symbol_v1(v2_symbol: str) -> str:
     if v2_symbol.endswith("_UMCBL"):
         return v2_symbol
     return f"{v2_symbol}_UMCBL"
+
+# --- Backward compatibility alias (for older code that imports convert_symbol)
+def convert_symbol(sym: str) -> str:
+    # 기존 코드가 기대하던 동작: v1('BTCUSDT_UMCBL') -> v2('BTCUSDT')
+    return convert_symbol_v2(sym)
 
 
 # =========================
@@ -210,7 +214,7 @@ def get_ticker_last(symbol_v2: str) -> float:
 
 
 # =========================
-# 포지션 조회 (PATCH 적용)
+# 포지션 조회 (POST 사용)
 # =========================
 
 def _positions_v2(symbol_v2: Optional[str]) -> List[Dict[str, Any]]:
@@ -291,7 +295,7 @@ def get_positions(symbol_v2: Optional[str] = None) -> List[Dict[str, Any]]:
 # =========================
 
 def _reduce_only_to_str(flag: bool) -> str:
-    # v2는 YES/NO 여야 함 (Bitget가 확인해준 사항)
+    # v2는 YES/NO 여야 함
     return "YES" if flag else "NO"
 
 def place_order_market(symbol_v2: str, side: str, size: float, reduce_only: bool = False) -> Dict[str, Any]:
