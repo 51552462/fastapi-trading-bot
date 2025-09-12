@@ -1,266 +1,232 @@
 # -*- coding: utf-8 -*-
 """
-Bitget USDT-FUTURES (v2) 전용 경량 래퍼
-- positions:  single-position / all-position
-- ticker:     /mix/market/ticker (lastPr)
-- contracts:  /mix/market/contracts (사이즈 정책)
-- order:      /mix/order/placeOrder (reduceOnly = "YES"/"NO")
+Bitget v2 REST helper (USDT-FUTURES 전용)
+- 심볼 변환, 계약정보 캐시(contracts), 사이즈 라운딩(sizeStep/minTradeNum/sizeMult)
+- 포지션 조회 (single-position / all-position)
+- 시세 조회 (ticker)
+- 마켓 주문(placeOrder), 포지션 마켓 청산(현재 포지션 사이즈 자동 탐지)
+- reduceOnly: "YES"/"NO" (Bitget v2 요구)
 """
 
-import os
-import time
-import hmac
-import json
-import math
-import hashlib
-from typing import Dict, Any, Optional, List, Tuple
+from __future__ import annotations
+import os, time, hmac, hashlib, json, math, threading
+from typing import Dict, Any, List, Optional, Tuple
 import requests
 
-BITGET_HOST = os.getenv("BITGET_HOST", "https://api.bitget.com")
-API_KEY = os.getenv("BITGET_API_KEY", "")
-API_SECRET = os.getenv("BITGET_API_SECRET", "")
-API_PASSPHRASE = os.getenv("BITGET_API_PASSPHRASE", "")
+BITGET_HOST = "https://api.bitget.com"  # v2 고정
+PRODUCT_TYPE = "USDT-FUTURES"
+MARGIN_COIN  = "USDT"
 
-PRODUCT_TYPE = os.getenv("PRODUCT_TYPE", "USDT-FUTURES")
-MARGIN_COIN = os.getenv("MARGIN_COIN", "USDT")
+_API_KEY       = os.getenv("BITGET_API_KEY", "")
+_API_SECRET    = os.getenv("BITGET_API_SECRET", "")
+_API_PASSPHRASE= os.getenv("BITGET_API_PASSPHRASE", "")
 
-# ---- utilities --------------------------------------------------------------
+# ---- Simple logger ---------------------------------------------------------
+def _log(*args):
+    print("[bitget]", *args, flush=True)
 
-class BgError(Exception):
-    pass
-
-def _now_ms() -> str:
+# ---- HTTP / sign -----------------------------------------------------------
+def _ts_ms() -> str:
     return str(int(time.time() * 1000))
 
-def _sign_v2(ts: str, method: str, path: str, query: str = "", body: str = "") -> str:
-    """
-    v2 사인 규격
-    prehash = timestamp + method + path + (queryString) + body
-    - queryString은 '?' 포함해서 붙인다 (없으면 빈 문자열)
-    """
-    prehash = ts + method.upper() + path + (f"?{query}" if query else "") + body
-    mac = hmac.new(API_SECRET.encode(), prehash.encode(), hashlib.sha256).digest()
-    return base64_b64encode(mac)
+def _sign(pre_hash: str) -> str:
+    return hmac.new(_API_SECRET.encode(), pre_hash.encode(), hashlib.sha256).hexdigest()
 
-def base64_b64encode(b: bytes) -> str:
-    import base64
-    return base64.b64encode(b).decode()
-
-def _headers(ts: str, sign: str) -> Dict[str, str]:
-    # ACCESS-TYPE=2 (현물=1, 선물/마진=2)
+def _headers(ts: str, body: str) -> Dict[str, str]:
+    pre_hash = ts + "application/json" + body
+    sign = _sign(pre_hash)
     return {
-        "ACCESS-KEY": API_KEY,
+        "ACCESS-KEY": _API_KEY,
         "ACCESS-SIGN": sign,
         "ACCESS-TIMESTAMP": ts,
-        "ACCESS-PASSPHRASE": API_PASSPHRASE,
-        "ACCESS-TYPE": "2",
-        "Content-Type": "application/json",
+        "ACCESS-PASSPHRASE": _API_PASSPHRASE,
+        "Content-Type": "application/json"
     }
 
-def _req(
-    method: str,
-    path: str,
-    params: Optional[Dict[str, Any]] = None,
-    body: Optional[Dict[str, Any]] = None,
-    timeout: int = 15,
-) -> Dict[str, Any]:
+def _get(path: str, params: Dict[str, Any]) -> Dict[str, Any]:
+    url = BITGET_HOST + path
+    ts = _ts_ms()
+    # v2 GET은 body가 비어있는 형태로 sign (문서 예시 동일)
+    headers = _headers(ts, "")
+    r = requests.get(url, headers=headers, params=params, timeout=10)
+    r.raise_for_status()
+    return r.json()
+
+def _post(path: str, payload: Dict[str, Any]) -> Dict[str, Any]:
+    url = BITGET_HOST + path
+    ts = _ts_ms()
+    body = json.dumps(payload, separators=(",", ":"), ensure_ascii=False)
+    headers = _headers(ts, body)
+    r = requests.post(url, headers=headers, data=body, timeout=10)
+    r.raise_for_status()
+    return r.json()
+
+# ---- Symbol helpers --------------------------------------------------------
+def convert_symbol(sym: str) -> str:
     """
-    공통 요청기.
-    - v2 서명
-    - 성공코드 '00000' 확인
+    TradingView 등에서 오는 'DOGEUSDT' → Bitget v2 'DOGEUSDT'
+    (지금은 동일 포맷이지만, 확장성 위해 함수로 유지)
     """
-    if not (API_KEY and API_SECRET and API_PASSPHRASE):
-        raise BgError("Bitget API env missing (BITGET_API_KEY/SECRET/PASSPHRASE)")
+    return sym.replace("_", "").upper()
 
-    params = params or {}
-    body = body or {}
+# ---- Contracts cache (sizeStep/minTradeNum/sizeMult) ----------------------
+_contracts_cache: Dict[str, Dict[str, Any]] = {}
+_contracts_lock  = threading.Lock()
+_contracts_last  = 0
+_CONTRACTS_TTL   = 60 * 5  # 5분
 
-    query = "&".join([f"{k}={params[k]}" for k in sorted(params)]) if params else ""
-    body_str = json.dumps(body, separators=(",", ":"), ensure_ascii=False) if body else ""
+def refresh_contracts_cache(force: bool = False) -> None:
+    global _contracts_last
+    now = time.time()
+    with _contracts_lock:
+        if not force and (now - _contracts_last) < _CONTRACTS_TTL and _contracts_cache:
+            return
+        res = _get("/api/v2/mix/market/contracts", {"productType": PRODUCT_TYPE})
+        if str(res.get("code")) != "00000":
+            raise RuntimeError(f"contracts fail: {res}")
+        data = res.get("data", [])
+        _contracts_cache.clear()
+        for c in data:
+            sym = c.get("symbol")
+            _contracts_cache[sym] = c
+        _contracts_last = now
+        _log(f"contracts cached: {len(_contracts_cache)}")
 
-    ts = _now_ms()
-    url = BITGET_HOST + path + (f"?{query}" if query else "")
-    sign = _sign_v2(ts, method, path, query, body_str)
-    headers = _headers(ts, sign)
+def _get_contract(sym: str) -> Dict[str, Any]:
+    refresh_contracts_cache()
+    c = _contracts_cache.get(sym)
+    if not c:
+        # 강제 갱신 후 한번 더 시도
+        refresh_contracts_cache(force=True)
+        c = _contracts_cache.get(sym)
+    if not c:
+        raise RuntimeError(f"contract not found: {sym}")
+    return c
 
-    fn = requests.get if method.upper() == "GET" else requests.post
-    resp = fn(url, headers=headers, data=body_str if body else None, timeout=timeout)
-    try:
-        js = resp.json()
-    except Exception:
-        raise BgError(f"HTTP {resp.status_code} non-JSON: {resp.text[:200]}")
+def _round_size(sym: str, size: float) -> float:
+    c = _get_contract(sym)
+    step = float(c.get("sizeStep", 0))
+    min_num = float(c.get("minTradeNum", 0))
+    mult = float(c.get("sizeMultiplier", c.get("sizeMult", 1)))  # 호환 필드
+    if step <= 0:
+        return size
+    # floor to step
+    q = math.floor(size / step) * step
+    if q < min_num:
+        q = min_num
+    # 미래 호환성 (사이즈 배수 제약)
+    if mult and mult > 0:
+        q = math.floor(q / mult) * mult
+        if q < mult:
+            q = mult
+    # 반올림 소수 제한(실수 오차 정리)
+    prec = max(0, -int(math.log10(step))) if step < 1 else 0
+    return float(f"{q:.{prec}f}")
 
-    if js.get("code") != "00000":
-        raise BgError(f"{js.get('code')}: {js.get('msg')} (data={js.get('data')})")
-    return js
-
-def _symbol(s: str) -> str:
+# ---- Public market ---------------------------------------------------------
+def get_last_price(sym: str) -> float:
     """
-    변형된 입력 심볼을 표준 선물 심볼로 보정
-    예) DOGEUSDT, DOGEUSDT_UMCBL, dogeusdt → DOGEUSDT
+    v2 ticker: /api/v2/mix/market/ticker
+    lastPr == None 이면 markPrice 또는 bestAsk 사용 (Bitget팀 안내에 따라 주로 lastPr 정상)
     """
-    s = (s or "").upper()
-    s = s.replace("_UMCBL", "").replace("-UMCBL", "")
-    s = s.replace("_USDT", "USDT").replace("-USDT", "USDT")
-    return s
+    s = convert_symbol(sym)
+    res = _get("/api/v2/mix/market/ticker", {"symbol": s})
+    if str(res.get("code")) != "00000":
+        raise RuntimeError(f"ticker fail: {res}")
+    d = res.get("data") or {}
+    # Bitget팀 피드백: lastPr가 정상. 만약 None이면 보조가격 사용
+    price = d.get("lastPr")
+    if price is None:
+        price = d.get("markPrice") or d.get("bestAsk") or d.get("bestBid")
+    if price is None:
+        raise RuntimeError(f"ticker no price: {res}")
+    return float(price)
 
-# ---- market / contracts -----------------------------------------------------
-
-# contracts 캐시 (사이즈 규칙)
-_CONTRACTS_CACHE: Tuple[float, List[Dict[str, Any]]] = (0, [])
-
-def _get_contracts() -> List[Dict[str, Any]]:
+# ---- Positions -------------------------------------------------------------
+def get_positions_by_symbol(sym: str) -> Dict[str, Any]:
     """
-    /api/v2/mix/market/contracts?productType=USDT-FUTURES
+    /api/v2/mix/position/single-position
     """
-    global _CONTRACTS_CACHE
-    ts, data = _CONTRACTS_CACHE
-    if time.time() - ts < 60 and data:
-        return data
-
-    js = _req(
-        "GET",
-        "/api/v2/mix/market/contracts",
-        params={"productType": PRODUCT_TYPE},
-    )
-    arr = js.get("data") or []
-    _CONTRACTS_CACHE = (time.time(), arr)
-    return arr
-
-def _contract_info(symbol: str) -> Dict[str, Any]:
-    symbol = _symbol(symbol)
-    for it in _get_contracts():
-        if (it.get("symbol") or "").upper() == symbol:
-            return it
-    raise BgError(f"contracts not found for {symbol} (productType={PRODUCT_TYPE})")
-
-def _round_size(symbol: str, size: float) -> float:
-    """
-    Bitget 가이드: floor to sizeStep (또는 sizeMulti) & >= minTradeNum
-    """
-    info = _contract_info(symbol)
-    # 가능한 키들 (계정마다 스펙 필드명이 다를 수 있어 다 받아줌)
-    step = float(info.get("sizeStep") or info.get("sizePrecision") or info.get("sizeTick") or 0.0) or 0.001
-    mult = float(info.get("sizeMult") or info.get("sizeMultiplier") or 1.0)
-    min_qty = float(info.get("minTradeNum") or info.get("minOrderSize") or step)
-
-    # sizeMult가 있으면 해당 배수로 맞추기
-    if mult and mult > 1.0:
-        size = math.floor(size / mult) * mult
-
-    # step 배수로 내림
-    size = math.floor(size / step) * step
-
-    if size < min_qty:
-        # 최소 주문수량을 만족하도록 보정 (내림 후 0되면 최소로 올림)
-        size = math.floor(min_qty / step) * step
-        if size < min_qty:
-            size = min_qty
-    return float(f"{size:.10f}".rstrip("0").rstrip("."))
-
-# ---- market/ticker ----------------------------------------------------------
-
-def get_last_price(symbol: str) -> float:
-    """
-    /api/v2/mix/market/ticker?productType=USDT-FUTURES&symbol=CETUSUSDT
-    return: lastPr (float)
-    """
-    symbol = _symbol(symbol)
-    js = _req(
-        "GET",
-        "/api/v2/mix/market/ticker",
-        params={"productType": PRODUCT_TYPE, "symbol": symbol},
-    )
-    data = js.get("data") or {}
-    last = data.get("lastPr")
-    if last in (None, "", "null"):
-        # 지원팀 코멘트: lastPr는 보통 null이 아님 → 방어적으로 예외 처리
-        raise BgError(f"ticker.lastPr null for {symbol}")
-    return float(last)
-
-# ---- positions --------------------------------------------------------------
+    s = convert_symbol(sym)
+    res = _get("/api/v2/mix/position/single-position", {
+        "symbol": s, "marginCoin": MARGIN_COIN
+    })
+    if str(res.get("code")) != "00000":
+        raise RuntimeError(f"single-position fail: {res}")
+    return res.get("data") or {}
 
 def get_positions_all() -> List[Dict[str, Any]]:
     """
-    /api/v2/mix/position/all-position?marginCoin=USDT&productType=USDT-FUTURES
+    /api/v2/mix/position/all-position
     """
-    js = _req(
-        "GET",
-        "/api/v2/mix/position/all-position",
-        params={"marginCoin": MARGIN_COIN, "productType": PRODUCT_TYPE},
-    )
-    return js.get("data") or []
+    res = _get("/api/v2/mix/position/all-position", {
+        "productType": PRODUCT_TYPE, "marginCoin": MARGIN_COIN
+    })
+    if str(res.get("code")) != "00000":
+        raise RuntimeError(f"all-position fail: {res}")
+    return res.get("data") or []
 
-def get_position_single(symbol: str) -> Dict[str, Any]:
-    """
-    /api/v2/mix/position/single-position?marginCoin=USDT&productType=USDT-FUTURES&symbol=DOGEUSDT
-    """
-    symbol = _symbol(symbol)
-    js = _req(
-        "GET",
-        "/api/v2/mix/position/single-position",
-        params={"marginCoin": MARGIN_COIN, "productType": PRODUCT_TYPE, "symbol": symbol},
-    )
-    # 없으면 빈 dict 반환
-    return (js.get("data") or {}) if isinstance(js.get("data"), dict) else {}
-
-# ---- orders -----------------------------------------------------------------
-
+# ---- Trading (market) ------------------------------------------------------
 def place_market_order(
-    symbol: str,
-    side: str,             # 'buy' or 'sell'
-    size: float,
+    sym: str,
+    side: str,            # "buy" | "sell"
+    size: float,          # 계약 수량(코인 단위, Futures size 규칙 적용)
     reduce_only: bool = False,
+    client_order_id: Optional[str] = None,
 ) -> Dict[str, Any]:
     """
-    /api/v2/mix/order/placeOrder
-    필수 파라미터:
-      - symbol, productType, marginCoin
-      - side: 'buy'|'sell'
-      - orderType: 'market'
-      - size: string (sizeStep/sizeMult에 맞춘 내림)
-      - reduceOnly: 'YES'|'NO'
+    v2 placeOrder (market)
+    reduceOnly: "YES"/"NO"
+    size는 sizeStep/minTradeNum/sizeMult에 맞춰 floor 라운딩
     """
-    symbol = _symbol(symbol)
-    size_adj = _round_size(symbol, float(size))
-    body = {
-        "symbol": symbol,
+    s = convert_symbol(sym)
+    q = _round_size(s, float(size))
+    payload = {
+        "symbol": s,
         "productType": PRODUCT_TYPE,
         "marginCoin": MARGIN_COIN,
-        "side": side,
         "orderType": "market",
-        "size": str(size_adj),
+        "side": "buy" if side.lower().startswith("b") else "sell",
+        "size": f"{q}",
         "reduceOnly": "YES" if reduce_only else "NO",
     }
-    js = _req("POST", "/api/v2/mix/order/placeOrder", body=body)
-    return js.get("data") or {}
+    if client_order_id:
+        payload["clientOid"] = client_order_id
 
-# ---- helpers for bot --------------------------------------------------------
+    res = _post("/api/v2/mix/order/placeOrder", payload)
+    if str(res.get("code")) != "00000":
+        raise RuntimeError(f"placeOrder fail: {res}")
+    return res
 
-def open_position_by_usdt(symbol: str, side: str, usdt_amount: float, leverage: float = 1.0) -> Dict[str, Any]:
-    """
-    '금액(USDT)' 기반 시장가 진입 → 계약 수량으로 변환
-    (대략) size = (usdt * leverage) / last_price
-    이후 sizeStep/Mult 규칙에 맞춰 내림
-    """
-    px = get_last_price(symbol)
-    raw_size = (float(usdt_amount) * float(leverage)) / px
-    size_adj = _round_size(symbol, raw_size)
-    return place_market_order(symbol, side=side, size=size_adj, reduce_only=False)
+def _current_net_size(sym: str) -> float:
+    d = get_positions_by_symbol(sym)
+    # one-way 모드 기준: holdSide=long/short 각각 available/total 등 존재
+    # 간단화: longSize - shortSize (없으면 0)
+    long_sz  = float(d.get("long", {}).get("total", 0.0)) if isinstance(d.get("long"), dict) else 0.0
+    short_sz = float(d.get("short", {}).get("total", 0.0)) if isinstance(d.get("short"), dict) else 0.0
+    return long_sz - short_sz  # >0 long 보유, <0 short 보유
 
-def close_position_all(symbol: str, side_was_long: bool) -> Dict[str, Any]:
+def close_position_market(sym: str, reason: str = "manual") -> Dict[str, Any]:
     """
-    포지션 즉시 청산(전량):
-      - 롱 보유 → sell with reduceOnly YES
-      - 숏 보유 → buy  with reduceOnly YES
-    남은 수량은 single-position에서 available 로 추정.
+    현재 보유 포지션을 반대 사이드 market 주문으로 청산
     """
-    sym = _symbol(symbol)
-    pos = get_position_single(sym)
-    size = float(pos.get("available", 0) or pos.get("total", 0) or 0)
-    if size <= 0:
-        return {"skipped": True, "reason": "no_position"}
+    s = convert_symbol(sym)
+    net = _current_net_size(s)
+    if abs(net) <= 0:
+        return {"ok": True, "skipped": True, "reason": "no_position"}
 
-    close_side = "sell" if side_was_long else "buy"
-    size_adj = _round_size(sym, size)
-    return place_market_order(sym, side=close_side, size=size_adj, reduce_only=True)
+    side = "sell" if net > 0 else "buy"  # long -> sell, short -> buy
+    res = place_market_order(s, side=side, size=abs(net), reduce_only=True,
+                             client_order_id=f"close_{int(time.time())}")
+    return {"ok": True, "res": res, "closed": abs(net), "side": side, "reason": reason}
+
+# ---- export ---------------------------------------------------------------
+__all__ = [
+    "convert_symbol",
+    "refresh_contracts_cache",
+    "get_last_price",
+    "get_positions_all",
+    "get_positions_by_symbol",
+    "place_market_order",
+    "close_position_market",
+]
