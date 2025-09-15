@@ -117,3 +117,4 @@ def can_open(new_pos: Dict) -> bool:
         send_telegram(f"⛔ RiskGuard(Total) {net_risk+new_r:.2f} > cap {total_cap:.2f}")
         return False
     return True
+
