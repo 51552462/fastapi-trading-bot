@@ -23,7 +23,7 @@ from bitget_api import get_open_positions, get_last_price
 
 app = FastAPI()
 
-# ───── Health / Root
+# ───── Health  Root
 @app.get("/health")
 async def health():
     return {"ok": True}
@@ -33,11 +33,11 @@ async def root():
     return {"ok": True, "name": "trading-bot"}
 
 # ───── 진단
-@app.get("/diag/env")
+@app.get("/diagenv")
 async def diag_env():
     keys = [
         "BITGET_PRODUCT_TYPE",
-        "BITGET_POSITION_MODE",
+        "BITGET_POSITION_MODE", 
         "BITGET_MARGIN_MODE",
         "AMOUNT_MODE",
         "BITGET_HOST",
@@ -47,15 +47,15 @@ async def diag_env():
     ]
     return {k: os.getenv(k) for k in keys}
 
-@app.get("/diag/positions")
-async def diag_positions(symbol: str | None = None):
+@app.get("/diagpositions")
+async def diag_positions(symbol: str = None):
     try:
         pos = get_open_positions(symbol)
         return {"ok": True, "count": len(pos), "data": pos}
     except Exception as e:
         return {"ok": False, "err": f"{type(e).__name__}: {e}"}
 
-@app.get("/diag/ticker")
+@app.get("/diagticker")
 async def diag_ticker(symbol: str):
     try:
         p = get_last_price(symbol)
@@ -63,9 +63,9 @@ async def diag_ticker(symbol: str):
     except Exception as e:
         return {"ok": False, "err": f"{type(e).__name__}: {e}"}
 
-# ───── 최근 수신/에러 로그(간단)
-_LAST_SIGNALS: deque[dict] = deque(maxlen=50)
-_LAST_ERRORS: deque[dict] = deque(maxlen=50)
+# ───── 최근 수신에러 로그(간단)
+_LAST_SIGNALS = deque(maxlen=50)
+_LAST_ERRORS = deque(maxlen=50)
 
 def _record_signal(j: dict, note: str = "") -> None:
     try:
@@ -79,17 +79,17 @@ def _record_error(where: str, err: str) -> None:
     except Exception:
         pass
 
-@app.get("/diag/signals")
+@app.get("/diagsignals")
 async def diag_signals():
     return {"ok": True, "recent": list(_LAST_SIGNALS)}
 
-@app.get("/diag/errors")
+@app.get("/diagerrors")
 async def diag_errors():
     return {"ok": True, "recent": list(_LAST_ERRORS)}
 
 # ───── Webhook dedupe (3s window)
 _DEDUPE_WIN = 3.0
-_LAST_BODIES: deque[tuple[float, str]] = deque(maxlen=200)
+_LAST_BODIES = deque(maxlen=200)
 
 async def _read_json_safely(req: Request) -> Tuple[Dict[str, Any], str]:
     raw = await req.body()
@@ -163,28 +163,28 @@ def _handle_signal(j: Dict[str, Any]) -> Dict[str, Any]:
 @app.post("/signal")
 async def signal(req: Request):
     j, raw = await _read_json_safely(req)
-    _record_signal(j, note="/signal")
+    _record_signal(j, note="signal")
     if not _should_bypass_dedupe(j, req) and _dedupe_check(raw):
         return JSONResponse({"ok": True, "deduped": True})
     try:
         res = _handle_signal(j)
         return JSONResponse(res)
     except Exception as e:
-        _record_error("signal", f"{type(e).__name__}:{e}")
-        return JSONResponse({"ok": False, "msg": f"server_err:{e}"}, status_code=500)
+        _record_error("signal", f"{type(e).__name__}: {e}")
+        return JSONResponse({"ok": False, "msg": f"server_err: {e}"}, status_code=500)
 
 @app.post("/signal/{tail:path}")
 async def signal_tail(tail: str, req: Request):
     j, raw = await _read_json_safely(req)
-    _record_signal(j, note=f"/signal/{tail}")
+    _record_signal(j, note=f"signal/{tail}")
     if not _should_bypass_dedupe(j, req) and _dedupe_check(raw):
         return JSONResponse({"ok": True, "deduped": True})
     try:
         res = _handle_signal(j)
         return JSONResponse(res)
     except Exception as e:
-        _record_error("signal_tail", f"{type(e).__name__}:{e}")
-        return JSONResponse({"ok": False, "msg": f"server_err:{e}"}, status_code=500)
+        _record_error("signal_tail", f"{type(e).__name__}: {e}")
+        return JSONResponse({"ok": False, "msg": f"server_err: {e}"}, status_code=500)
 
 # ───── 논블로킹 스타트업 (헬스 먼저 OK)
 def _late_start() -> None:
