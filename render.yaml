@@ -89,7 +89,7 @@ services:
 
       # 포지션 수 제한
       - key: MAX_OPEN_POSITIONS
-        value: "120"
+        value: "50"
       - key: LONG_BYPASS_CAP
         value: "1"
 
@@ -100,3 +100,4 @@ services:
         sync: false
       - key: BITGET_API_PASSWORD
         sync: false
+
