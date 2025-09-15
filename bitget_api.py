@@ -21,6 +21,10 @@ _API_KEY       = os.getenv("BITGET_API_KEY", "")
 _API_SECRET    = os.getenv("BITGET_API_SECRET", "")
 _API_PASSPHRASE= os.getenv("BITGET_API_PASSPHRASE", "")
 
+# API 키 검증
+if not _API_KEY or not _API_SECRET or not _API_PASSPHRASE:
+    raise RuntimeError("BITGET_API_KEY, BITGET_API_SECRET, BITGET_API_PASSPHRASE 환경변수가 필요합니다")
+
 # ---- Simple logger ---------------------------------------------------------
 def _log(*args):
     print("[bitget]", *args, flush=True)
@@ -48,18 +52,32 @@ def _get(path: str, params: Dict[str, Any]) -> Dict[str, Any]:
     ts = _ts_ms()
     # v2 GET은 body가 비어있는 형태로 sign (문서 예시 동일)
     headers = _headers(ts, "")
-    r = requests.get(url, headers=headers, params=params, timeout=10)
-    r.raise_for_status()
-    return r.json()
+    try:
+        r = requests.get(url, headers=headers, params=params, timeout=10)
+        r.raise_for_status()
+        return r.json()
+    except requests.exceptions.RequestException as e:
+        _log(f"GET {path} failed: {e}")
+        raise RuntimeError(f"API request failed: {e}")
+    except Exception as e:
+        _log(f"GET {path} error: {e}")
+        raise RuntimeError(f"API error: {e}")
 
 def _post(path: str, payload: Dict[str, Any]) -> Dict[str, Any]:
     url = BITGET_HOST + path
     ts = _ts_ms()
     body = json.dumps(payload, separators=(",", ":"), ensure_ascii=False)
     headers = _headers(ts, body)
-    r = requests.post(url, headers=headers, data=body, timeout=10)
-    r.raise_for_status()
-    return r.json()
+    try:
+        r = requests.post(url, headers=headers, data=body, timeout=10)
+        r.raise_for_status()
+        return r.json()
+    except requests.exceptions.RequestException as e:
+        _log(f"POST {path} failed: {e}")
+        raise RuntimeError(f"API request failed: {e}")
+    except Exception as e:
+        _log(f"POST {path} error: {e}")
+        raise RuntimeError(f"API error: {e}")
 
 # ---- Symbol helpers --------------------------------------------------------
 def convert_symbol(sym: str) -> str:
@@ -167,7 +185,7 @@ def get_positions_all() -> List[Dict[str, Any]]:
     return res.get("data") or []
 
 # ---- Trading (market) ------------------------------------------------------
-def place_market_order(
+def _place_market_order_internal(
     sym: str,
     side: str,            # "buy" | "sell"
     size: float,          # 계약 수량(코인 단위, Futures size 규칙 적용)
@@ -216,17 +234,170 @@ def close_position_market(sym: str, reason: str = "manual") -> Dict[str, Any]:
         return {"ok": True, "skipped": True, "reason": "no_position"}
 
     side = "sell" if net > 0 else "buy"  # long -> sell, short -> buy
-    res = place_market_order(s, side=side, size=abs(net), reduce_only=True,
+    res = _place_market_order_internal(s, side=side, size=abs(net), reduce_only=True,
                              client_order_id=f"close_{int(time.time())}")
     return {"ok": True, "res": res, "closed": abs(net), "side": side, "reason": reason}
+
+# ---- Additional functions for trader.py compatibility ---------------------
+def get_open_positions(symbol: Optional[str] = None) -> List[Dict[str, Any]]:
+    """
+    trader.py에서 사용하는 get_open_positions 함수
+    """
+    try:
+        if symbol:
+            pos = get_positions_by_symbol(symbol)
+            # 단일 포지션을 리스트 형태로 변환
+            positions = []
+            if pos.get("long", {}).get("total", 0) > 0:
+                positions.append({
+                    "symbol": symbol,
+                    "side": "long",
+                    "size": pos["long"]["total"],
+                    "entryPrice": pos["long"].get("averageOpenPrice", 0),
+                    "liq_price": pos["long"].get("liquidationPrice", 0)
+                })
+            if pos.get("short", {}).get("total", 0) > 0:
+                positions.append({
+                    "symbol": symbol,
+                    "side": "short", 
+                    "size": pos["short"]["total"],
+                    "entryPrice": pos["short"].get("averageOpenPrice", 0),
+                    "liq_price": pos["short"].get("liquidationPrice", 0)
+                })
+            return positions
+        else:
+            # 모든 포지션 조회
+            all_positions = get_positions_all()
+            positions = []
+            for pos in all_positions:
+                symbol = pos.get("symbol")
+                if pos.get("long", {}).get("total", 0) > 0:
+                    positions.append({
+                        "symbol": symbol,
+                        "side": "long",
+                        "size": pos["long"]["total"],
+                        "entryPrice": pos["long"].get("averageOpenPrice", 0),
+                        "liq_price": pos["long"].get("liquidationPrice", 0)
+                    })
+                if pos.get("short", {}).get("total", 0) > 0:
+                    positions.append({
+                        "symbol": symbol,
+                        "side": "short",
+                        "size": pos["short"]["total"], 
+                        "entryPrice": pos["short"].get("averageOpenPrice", 0),
+                        "liq_price": pos["short"].get("liquidationPrice", 0)
+                    })
+            return positions
+    except Exception as e:
+        _log(f"get_open_positions error: {e}")
+        return []
+
+def place_market_order_with_amount(symbol: str, amount: float, side: str, leverage: float = 1.0) -> Dict[str, Any]:
+    """
+    trader.py에서 사용하는 place_market_order 함수 (amount 기반)
+    """
+    try:
+        # amount를 USDT 기준으로 받아서 계약 수량으로 변환
+        price = get_last_price(symbol)
+        if price <= 0:
+            raise RuntimeError(f"Invalid price for {symbol}: {price}")
+        
+        # USDT amount를 계약 수량으로 변환
+        size = amount / price
+        
+        # 레버리지 적용
+        if leverage > 1:
+            size = size * leverage
+            
+        return _place_market_order_internal(symbol, side, size)
+    except Exception as e:
+        _log(f"place_market_order_with_amount error: {e}")
+        return {"code": "50000", "msg": str(e)}
+
+def place_reduce_by_size(symbol: str, size: float, side: str) -> Dict[str, Any]:
+    """
+    trader.py에서 사용하는 place_reduce_by_size 함수
+    """
+    try:
+        return _place_market_order_internal(symbol, side, size, reduce_only=True)
+    except Exception as e:
+        _log(f"place_reduce_by_size error: {e}")
+        return {"code": "50000", "msg": str(e)}
+
+# trader.py 호환성을 위한 별칭
+def place_market_order(symbol: str, amount: float, side: str, leverage: float = 1.0) -> Dict[str, Any]:
+    """
+    trader.py 호환성을 위한 place_market_order 함수
+    """
+    return place_market_order_with_amount(symbol, amount, side, leverage)
+
+def get_symbol_spec(symbol: str) -> Dict[str, Any]:
+    """
+    trader.py에서 사용하는 get_symbol_spec 함수
+    """
+    try:
+        return _get_contract(symbol)
+    except Exception as e:
+        _log(f"get_symbol_spec error: {e}")
+        return {"sizeStep": 0.001, "minTradeNum": 0.001, "sizeMultiplier": 1}
+
+def round_down_step(size: float, step: float) -> float:
+    """
+    trader.py에서 사용하는 round_down_step 함수
+    """
+    if step <= 0:
+        return size
+    return math.floor(size / step) * step
+
+def get_account_equity() -> Optional[float]:
+    """
+    계정 자본 조회 (risk_guard.py에서 사용)
+    """
+    try:
+        # 계정 정보 조회
+        res = _get("/api/v2/mix/account/accounts", {
+            "productType": PRODUCT_TYPE,
+            "marginCoin": MARGIN_COIN
+        })
+        if str(res.get("code")) != "00000":
+            return None
+        data = res.get("data", [])
+        if data:
+            return float(data[0].get("equity", 0))
+        return None
+    except Exception as e:
+        _log(f"get_account_equity error: {e}")
+        return None
+
+def get_wallet_balance(coin: str = "USDT") -> Optional[Dict[str, Any]]:
+    """
+    월렛 잔고 조회 (risk_guard.py에서 사용)
+    """
+    try:
+        res = _get("/api/v2/spot/wallet/account-assets", {"coin": coin})
+        if str(res.get("code")) != "00000":
+            return None
+        data = res.get("data", [])
+        if data:
+            return data[0]
+        return None
+    except Exception as e:
+        _log(f"get_wallet_balance error: {e}")
+        return None
 
 # ---- export ---------------------------------------------------------------
 __all__ = [
     "convert_symbol",
-    "refresh_contracts_cache",
+    "refresh_contracts_cache", 
     "get_last_price",
     "get_positions_all",
     "get_positions_by_symbol",
     "place_market_order",
     "close_position_market",
+    "get_open_positions",
+    "place_reduce_by_size", 
+    "get_symbol_spec",
+    "round_down_step",
+    "get_account_equity",
+    "get_wallet_balance",
 ]
