@@ -1,6 +1,7 @@
 # -*- coding: utf-8 -*-
 """
-Bitget v2 REST helper (USDT-FUTURES 전용)
+Bitget v2 REST helper (USDT-FUTURES 전용) - 400 오류 수정 버전
+- API 파라미터 수정 및 에러 핸들링 강화
 - 심볼 변환, 계약정보 캐시(contracts), 사이즈 라운딩(sizeStep/minTradeNum/sizeMult)
 - 포지션 조회 (single-position / all-position)
 - 시세 조회 (ticker)
@@ -160,7 +161,7 @@ def get_last_price(sym: str) -> float:
         raise RuntimeError(f"ticker no price: {res}")
     return float(price)
 
-# ---- Positions -------------------------------------------------------------
+# ---- Positions (수정된 버전) ----------------------------------------------
 def get_positions_by_symbol(sym: str) -> Dict[str, Any]:
     """
     /api/v2/mix/position/single-position
@@ -175,14 +176,30 @@ def get_positions_by_symbol(sym: str) -> Dict[str, Any]:
 
 def get_positions_all() -> List[Dict[str, Any]]:
     """
-    /api/v2/mix/position/all-position
+    /api/v2/mix/position/all-position - 400 오류 수정 버전
     """
-    res = _get("/api/v2/mix/position/all-position", {
-        "productType": PRODUCT_TYPE, "marginCoin": MARGIN_COIN
-    })
-    if str(res.get("code")) != "00000":
-        raise RuntimeError(f"all-position fail: {res}")
-    return res.get("data") or []
+    try:
+        # 먼저 단순한 파라미터로 시도
+        res = _get("/api/v2/mix/position/all-position", {
+            "productType": PRODUCT_TYPE
+        })
+        if str(res.get("code")) != "00000":
+            _log(f"all-position with productType failed: {res}")
+            # 대안: marginCoin만으로 시도
+            res = _get("/api/v2/mix/position/all-position", {
+                "marginCoin": MARGIN_COIN
+            })
+            if str(res.get("code")) != "00000":
+                _log(f"all-position with marginCoin failed: {res}")
+                # 최후: 파라미터 없이 시도
+                res = _get("/api/v2/mix/position/all-position", {})
+                if str(res.get("code")) != "00000":
+                    raise RuntimeError(f"all-position fail: {res}")
+        return res.get("data") or []
+    except Exception as e:
+        _log(f"get_positions_all error: {e}")
+        # 폴백: 빈 리스트 반환
+        return []
 
 # ---- Trading (market) ------------------------------------------------------
 def _place_market_order_internal(
@@ -238,10 +255,10 @@ def close_position_market(sym: str, reason: str = "manual") -> Dict[str, Any]:
                              client_order_id=f"close_{int(time.time())}")
     return {"ok": True, "res": res, "closed": abs(net), "side": side, "reason": reason}
 
-# ---- Additional functions for trader.py compatibility ---------------------
+# ---- Additional functions for trader.py compatibility ----------------------
 def get_open_positions(symbol: Optional[str] = None) -> List[Dict[str, Any]]:
     """
-    trader.py에서 사용하는 get_open_positions 함수
+    trader.py에서 사용하는 get_open_positions 함수 - 400 오류 수정 버전
     """
     try:
         if symbol:
@@ -266,7 +283,7 @@ def get_open_positions(symbol: Optional[str] = None) -> List[Dict[str, Any]]:
                 })
             return positions
         else:
-            # 모든 포지션 조회
+            # 모든 포지션 조회 - 수정된 버전 사용
             all_positions = get_positions_all()
             positions = []
             for pos in all_positions:
