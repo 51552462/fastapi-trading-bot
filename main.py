@@ -1,254 +1,276 @@
-# main.py — FastAPI entrypoint (workers + watchdog + reconciler + guards + KPI + AI)
-import os, time, json, threading
-from typing import Any, Dict, Optional
-from fastapi import FastAPI, Request, Header, HTTPException
-from fastapi.responses import JSONResponse
-from pydantic import BaseModel
+import os, time, json, hashlib, threading, queue, re
+from collections import deque
+from typing import Dict, Any
+from fastapi import FastAPI, Request
+
 from trader import (
-    enter_position, close_position, take_partial_profit,
-    start_watchdogs, start_reconciler, start_capacity_guard,
-    apply_runtime_overrides, get_pending_snapshot
+    enter_position, take_partial_profit, close_position, reduce_by_contracts,
+    start_watchdogs, start_reconciler, get_pending_snapshot, start_capacity_guard
 )
+from telegram_bot import send_telegram
+from bitget_api import convert_symbol, get_open_positions
 
+# ── 금액 관련 ENV (side별 기본값 추가)
+DEFAULT_AMOUNT         = float(os.getenv("DEFAULT_AMOUNT", "15"))
+DEFAULT_AMOUNT_LONG    = float(os.getenv("DEFAULT_AMOUNT_LONG", "80"))  # ← 기본 80
+DEFAULT_AMOUNT_SHORT   = float(os.getenv("DEFAULT_AMOUNT_SHORT", "40"))  # ← 기본 40
+LEVERAGE               = float(os.getenv("LEVERAGE", "5"))
+DEDUP_TTL              = float(os.getenv("DEDUP_TTL", "15"))
+BIZDEDUP_TTL           = float(os.getenv("BIZDEDUP_TTL", "3"))
+
+WORKERS                = int(os.getenv("WORKERS", "6"))
+QUEUE_MAX              = int(os.getenv("QUEUE_MAX", "2000"))
+LOG_INGRESS            = os.getenv("LOG_INGRESS", "0") == "1"
+
+FORCE_DEFAULT_AMOUNT   = os.getenv("FORCE_DEFAULT_AMOUNT", "0") == "1"  # 1이면 신호 amount 무시
+
+# 심볼별 우선 금액
+SYMBOL_AMOUNT_JSON = os.getenv("SYMBOL_AMOUNT_JSON", "")
 try:
-    from kpi_pipeline import start_kpi_pipeline, aggregate_and_save, list_trades
+    SYMBOL_AMOUNT = json.loads(SYMBOL_AMOUNT_JSON) if SYMBOL_AMOUNT_JSON else {}
 except Exception:
-    def start_kpi_pipeline(): ...
-    def aggregate_and_save(): return {}
-    def list_trades(limit: int = 200): return []
+    SYMBOL_AMOUNT = {}
 
-try:
-    from telegram_bot import send_telegram
-except Exception:
-    def send_telegram(msg: str): print("[TG]", msg)
+app = FastAPI()
 
-try:
-    from bitget_api import symbol_exists, get_last_price, convert_symbol, get_open_positions
-except Exception:
-    def symbol_exists(symbol: str) -> bool: return True
-    def get_last_price(symbol: str) -> float: return 0.0
-    def convert_symbol(s: str) -> str: return (s or "").upper()
-    def get_open_positions(*args, **kwargs) -> list: return []
+INGRESS_LOG: deque = deque(maxlen=200)
+_DEDUP: Dict[str, float] = {}
+_BIZDEDUP: Dict[str, float] = {}
+_task_q: "queue.Queue[Dict[str, Any]]" = queue.Queue(maxsize=QUEUE_MAX)
 
-ADMIN_TOKEN = os.getenv("ADMIN_TOKEN", "")
-POLICY_ENABLE = os.getenv("POLICY_ENABLE", "1") == "1"
-AI_ORCH_APPLY_MODE = os.getenv("AI_ORCH_APPLY_MODE", "live").lower().strip()
-POLICY_CLOSE_ENABLE = os.getenv("POLICY_CLOSE_ENABLE", "0") == "1"  # 기본 OFF
-REPORT_DIR = os.getenv("REPORT_DIR", "./reports")
-KPIS_JSON = os.path.join(REPORT_DIR, "kpis.json")
-APP_NAME = os.getenv("APP_NAME", "fastapi-trading-bot")
-APP_VER = os.getenv("APP_VER", "2025-09-09")
+# ─────────────────────────────────────────────────────────────
+# 유틸
+# ─────────────────────────────────────────────────────────────
+def _dedup_key(d: Dict[str, Any]) -> str:
+    return hashlib.sha1(json.dumps(d, sort_keys=True).encode()).hexdigest()
 
-app = FastAPI(title=APP_NAME, version=APP_VER)
+def _norm_symbol(sym: str) -> str:
+    return convert_symbol(sym)
 
-class SignalReq(BaseModel):
-    type: str
-    symbol: str
-    side: Optional[str] = None
-    amount: Optional[float] = None
-    timeframe: Optional[str] = None
-    # === 추가: 커스텀 분할/감축 입력 ===
-    ratio: Optional[float] = None      # 0.0~1.0
-    percent: Optional[float] = None    # 0~100
-    qty: Optional[float] = None        # 계약수(선택)
+def _infer_side(side: str, default: str = "long") -> str:
+    s = (side or "").strip().lower()
+    return s if s in ("long", "short") else default
 
-class AdminRuntimeReq(BaseModel):
-    STOP_ROE: Optional[float] = None
-    STOP_PRICE_MOVE: Optional[float] = None
-    RECON_INTERVAL_SEC: Optional[float] = None
-    TP1_PCT: Optional[float] = None
-    TP2_PCT: Optional[float] = None
-    TP3_PCT: Optional[float] = None
-    REOPEN_COOLDOWN_SEC: Optional[float] = None
+def _norm_type(typ: str) -> str:
+    t = (typ or "").strip().lower()
+    t = re.sub(r"[\s_\-]+", "", t)
+    aliases = {
+        "tp_1": "tp1", "tp_2": "tp2", "tp_3": "tp3",
+        "takeprofit1": "tp1", "takeprofit2": "tp2", "takeprofit3": "tp3",
+        "sl_1": "sl1", "sl_2": "sl2",
+        "stopfull": "stoploss", "stopall": "stoploss", "stop": "stoploss",
+        "fullexit": "stoploss", "exitall": "stoploss",
+        "emaexit": "emaexit",
+        "failcut": "failcut",
+        "closeposition": "close", "closeall": "close",
+        "reducecontracts": "reducebycontracts",
+        "reduce_by_contracts": "reducebycontracts",
+    }
+    return aliases.get(t, t)
 
-class KPIReq(BaseModel):
-    win_rate: Optional[float] = None
-    avg_r: Optional[float] = None
-    roi_per_hour: Optional[float] = None
-    max_dd: Optional[float] = None
-    n_trades: Optional[int] = None
-    streak_win: Optional[int] = None
-    streak_loss: Optional[int] = None
-    avg_hold_sec: Optional[int] = None
+def _resolve_amount(symbol: str, side: str, payload: Dict[str, Any]) -> float:
+    """
+    우선순위(기본): signal.amount > SYMBOL_AMOUNT > side-default > DEFAULT_AMOUNT
+    FORCE_DEFAULT_AMOUNT=1이면: side-default > DEFAULT_AMOUNT (신호 무시)
+    """
+    if not FORCE_DEFAULT_AMOUNT:
+        if "amount" in payload and str(payload["amount"]).strip() != "":
+            try:
+                return float(payload["amount"])
+            except Exception:
+                pass
+        if symbol in SYMBOL_AMOUNT and str(SYMBOL_AMOUNT[symbol]).strip() != "":
+            try:
+                return float(SYMBOL_AMOUNT[symbol])
+            except Exception:
+                pass
+    # side별 기본값
+    if side == "long":
+        return float(DEFAULT_AMOUNT_LONG)
+    if side == "short":
+        return float(DEFAULT_AMOUNT_SHORT)
+    # 최후 보루
+    return float(DEFAULT_AMOUNT)
 
-def _load_kpis() -> Dict[str, Any]:
+# ─────────────────────────────────────────────────────────────
+# Payload 파서(느슨하게)
+# ─────────────────────────────────────────────────────────────
+async def _parse_any(req: Request) -> Dict[str, Any]:
     try:
-        if not os.path.exists(KPIS_JSON): return {}
-        with open(KPIS_JSON, "r", encoding="utf-8") as f:
-            return json.load(f)
+        return await req.json()
     except Exception:
-        return {}
-
-def _save_kpis(obj: Dict[str, Any]):
-    os.makedirs(REPORT_DIR, exist_ok=True)
-    tmp = KPIS_JSON + ".tmp"
-    with open(tmp, "w", encoding="utf-8") as f:
-        json.dump(obj, f, ensure_ascii=False, indent=2)
-    os.replace(tmp, KPIS_JSON)
-
-@app.get("/")
-def root(): return {"ok": True, "name": APP_NAME, "version": APP_VER}
-
-@app.get("/health")
-def health(): return {"ok": True, "ts": int(time.time())}
-
-@app.get("/version")
-def version(): return {"ok": True, "version": APP_VER}
-
-@app.post("/signal")
-def signal(req: SignalReq):
-    t    = (req.type or "").lower().strip()
-    sym  = convert_symbol(req.symbol)
-    side = (req.side or "").lower().strip() or "long"
-    amt  = req.amount
-    tf   = req.timeframe
-
-    # 커스텀 분할 입력 정규화
-    ratio = req.ratio
-    if ratio is None and req.percent is not None:
-        ratio = max(0.0, min(1.0, float(req.percent)/100.0))
-    # side 보정(롱/숏 외 텍스트 들어오면 추론)
-    if side not in ("long","short"):
-        if "short" in side or "sell" in side: side = "short"
-        else: side = "long"
-
+        pass
     try:
-        # === 진입 ===
-        if t in ("entry", "open"):
-            if side not in ("long", "short"): raise HTTPException(400, "side must be long/short")
-            r = enter_position(sym, side=side, usdt_amount=amt, timeframe=tf)
-            return {"ok": True, "res": r}
+        raw = (await req.body()).decode(errors="ignore").strip()
+        if raw:
+            try: return json.loads(raw)
+            except Exception:
+                fixed = raw.replace("'", '"'); return json.loads(fixed)
+    except Exception:
+        pass
+    try:
+        form = await req.form()
+        payload = form.get("payload") or form.get("data")
+        if payload: return json.loads(payload)
+    except Exception:
+        pass
+    try:
+        txt = (await req.body()).decode(errors="ignore")
+        d: Dict[str, Any] = {}
+        for part in re.split(r"[\n,]+", txt):
+            if ":" in part:
+                k, v = part.split(":", 1)
+                d[k.strip()] = v.strip()
+        if d: return d
+    except Exception:
+        pass
+    raise ValueError("cannot parse request")
 
-        # === 전량 종료 ===
-        if t in ("close", "exit"):
-            if side not in ("long", "short"): raise HTTPException(400, "side must be long/short")
-            r = close_position(sym, side=side, reason="signal_close")
-            return {"ok": True, "res": r}
+# ─────────────────────────────────────────────────────────────
+# 시그널 라우터
+# ─────────────────────────────────────────────────────────────
+def _handle_signal(data: Dict[str, Any]):
+    typ_raw = (data.get("type") or "")
+    symbol  = _norm_symbol(data.get("symbol", ""))
+    side    = _infer_side(data.get("side"), "long")
 
-        # === 분할 종료(커스텀) ===
-        if t in ("tp", "takeprofit", "partial", "trim"):
-            if ratio is None and req.qty is None:
-                raise HTTPException(400, "tp requires ratio/percent or qty")
-            if ratio is not None:
-                r = take_partial_profit(sym, ratio=float(ratio), side=side, reason="tp_custom")
-                return {"ok": True, "res": r}
-            else:
-                # qty 지시: trader가 현재 잔량 읽어서 정확 수량만 감축
-                r = take_partial_profit(sym, ratio=-1.0, side=side, reason=f"tp_qty:{req.qty}")
-                return {"ok": True, "res": r}
+    if not symbol:
+        send_telegram("⚠️ symbol 없음: " + json.dumps(data)); return
 
-        # === 분할 종료(프리셋) ===
-        if t in ("tp1", "tp_1", "takeprofit1", "tp_30"):
-            r = take_partial_profit(sym, ratio=float(os.getenv("TP1_PCT", "0.30")), side=side, reason="tp1")
-            return {"ok": True, "res": r}
-        if t in ("tp2", "tp_2", "takeprofit2", "tp_40"):
-            r = take_partial_profit(sym, ratio=float(os.getenv("TP2_PCT", "0.5714286")), side=side, reason="tp2")
-            return {"ok": True, "res": r}
-        if t in ("tp3", "tp_3", "takeprofit3", "tp_all", "close_rest"):
-            r = take_partial_profit(sym, ratio=float(os.getenv("TP3_PCT", "1.0")), side=side, reason="tp3")
-            return {"ok": True, "res": r}
+    amount   = _resolve_amount(symbol, side, data)
+    leverage = float(data.get("leverage", LEVERAGE))
 
-        # === 즉시 포지션 종료(손절/BE/즉시청산) ===
-        if t in ("stop","sl","sl1","sl2","cut","failcut","emaexit","liquidation","kill","exitnow","close_now","be","breakeven"):
-            if side not in ("long", "short"): raise HTTPException(400, "side must be long/short")
-            reason = (
-                "breakeven" if t in ("be","breakeven")
-                else ("failcut" if t in ("failcut","sl1","sl2","emaexit","liquidation") else "stop")
-            )
-            r = close_position(sym, side=side, reason=reason)
-            return {"ok": True, "res": r}
+    t = _norm_type(typ_raw)
 
-        raise HTTPException(400, f"unknown type: {t}")
-    except HTTPException:
-        raise
-    except Exception as e:
-        return JSONResponse({"ok": False, "error": str(e)}, status_code=500)
+    now = time.time()
+    bizkey = f"{t}:{symbol}:{side}"
+    last = _BIZDEDUP.get(bizkey, 0.0)
+    if now - last < BIZDEDUP_TTL: return
+    _BIZDEDUP[bizkey] = now
 
-@app.post("/admin/runtime")
-def admin_runtime(req: AdminRuntimeReq, request: Request, x_admin_token: str = Header(default="")):
-    if not ADMIN_TOKEN or x_admin_token != ADMIN_TOKEN:
-        raise HTTPException(401, "invalid admin token")
-    changed: Dict[str, Any] = {k:v for k,v in req.dict().items() if v is not None}
-    if not changed: return {"ok": True, "changed": {}}
-    apply_runtime_overrides(changed)
-    send_telegram(f"🧠 AI 튜너 조정\n{', '.join([f'{k}={v}' for k, v in changed.items()])}")
-    return {"ok": True, "changed": changed}
+    if LOG_INGRESS:
+        try: send_telegram(f"📥 {t} {symbol} {side} amt={amount}")
+        except: pass
 
-@app.post("/reports/kpis")
-def post_kpis(req: KPIReq):
-    cur = _load_kpis()
-    for k, v in req.dict().items():
-        if v is not None: cur[k] = v
-    cur["updated_ts"] = int(time.time())
-    _save_kpis(cur)
-    return {"ok": True, "kpis": cur}
+    if t == "entry":
+        enter_position(symbol, amount, side=side, leverage=leverage); return
 
-@app.get("/reports/kpis")
-def get_kpis(): return {"ok": True, "kpis": _load_kpis()}
+    if t in ("tp1","tp2","tp3"):
+        pct = float(os.getenv("TP1_PCT","0.30")) if t=="tp1" else float(os.getenv("TP2_PCT","0.40")) if t=="tp2" else float(os.getenv("TP3_PCT","0.30"))
+        take_partial_profit(symbol, pct, side=side); return
 
-@app.get("/reports/trades")
-def get_trades(limit: int = 200): return {"ok": True, "trades": list_trades(limit=limit)}
+    CLOSE_KEYS = {"stoploss","emaexit","failcut","fullexit","close","exit","liquidation","sl1","sl2"}
+    if t in CLOSE_KEYS:
+        close_position(symbol, side=side, reason=t); return
 
-@app.get("/debug/symbol/{symbol}")
-def debug_symbol(symbol: str):
-    core = convert_symbol(symbol)
-    return {"ok": True, "symbol": core, "exists": symbol_exists(core), "last": get_last_price(core)}
-
-@app.get("/debug/positions")
-def debug_positions():
-    try: return {"ok": True, "positions": get_open_positions(None)}
-    except Exception as e: return {"ok": False, "error": str(e)}
-
-@app.get("/snapshot")
-def snapshot(): return {"ok": True, "snapshot": get_pending_snapshot()}
-
-def _orch_logic_from_kpi(kpi: Dict[str, Any]) -> Dict[str, Any]:
-    changed: Dict[str, Any] = {}
-    win = float(kpi.get("win_rate", 0.0) or 0.0)
-    avg_r = float(kpi.get("avg_r", 0.0) or 0.0)
-    roi_h = float(kpi.get("roi_per_hour", 0.0) or 0.0)
-    mdd = float(kpi.get("max_dd", 0.0) or 0.0)
-    if roi_h < 0.0 or mdd < -0.15:
-        changed["STOP_PRICE_MOVE"] = 0.025; changed["STOP_ROE"] = 0.08; changed["REOPEN_COOLDOWN_SEC"] = 120
-    elif win > 0.50 and avg_r > 0.25:
-        changed["STOP_PRICE_MOVE"] = 0.018; changed["STOP_ROE"] = 0.10; changed["REOPEN_COOLDOWN_SEC"] = 90
-    return changed
-
-def _orchestrator_loop():
-    if not POLICY_ENABLE:
-        print("[orch] disabled (POLICY_ENABLE=0)")
+    if t == "reducebycontracts":
+        contracts = float(data.get("contracts", 0))
+        if contracts > 0: reduce_by_contracts(symbol, contracts, side=side)
         return
-    send_telegram("🧠 Policy manager started")
-    send_telegram("🤖 AI expert started")
-    send_telegram("🧠 Orchestrator started")
-    first_announce = True
+
+    if t in ("tailtouch","info","debug"): return
+
+    send_telegram("❓ 알 수 없는 신호: " + json.dumps(data))
+
+# ─────────────────────────────────────────────────────────────
+# 워커/엔드포인트/시작
+# ─────────────────────────────────────────────────────────────
+def _worker_loop(idx: int):
     while True:
         try:
-            kpi = _load_kpis()
-            win = float(kpi.get("win_rate", 0.0) or 0.0)
-            avg_r = float(kpi.get("avg_r", 0.0) or 0.0)
-            n = int(kpi.get("n_trades", 0) or 0)
-            if first_announce:
-                send_telegram(f"🤖 AI 튜너 조정\n- WinRate={win*100:.1f}% AvgR={avg_r:.2f} N={n}\n• 신호: worst=0.0% (버킷Top=0.0%, 24hTop=0.0%), state.stable_seq=0")
-                first_announce = False
-            changed = _orch_logic_from_kpi(kpi)
-            if changed and AI_ORCH_APPLY_MODE == "live":
-                apply_runtime_overrides(changed)
-                send_telegram("🤖 AI 튜너 조정\n" + ", ".join([f"{k}={v}" for k, v in changed.items()]))
+            data = _task_q.get()
+            if data is None: continue
+            _handle_signal(data)
         except Exception as e:
-            print("orchestrator err:", e)
-        time.sleep(30)
+            print(f"[worker-{idx}] error:", e)
+        finally:
+            _task_q.task_done()
 
-def _boot():
-    try: start_kpi_pipeline()
-    except Exception as e: print("kpi pipeline start err:", e)
-    start_watchdogs(); start_reconciler(); start_capacity_guard()
-    threading.Thread(target=_orchestrator_loop, name="ai-orchestrator", daemon=True).start()
-    send_telegram("✅ FastAPI up (workers + watchdog + reconciler + guards + AI)")
+async def _ingest(req: Request):
+    now = time.time()
+    try:
+        data = await _parse_any(req)
+    except Exception as e:
+        return {"ok": False, "error": f"bad_payload: {e}"}
+
+    dk = _dedup_key(data)
+    if dk in _DEDUP and now - _DEDUP[dk] < DEDUP_TTL:
+        return {"ok": True, "dedup": True}
+    _DEDUP[dk] = now
+
+    INGRESS_LOG.append({"ts": now, "ip": (req.client.host if req and req.client else "?"), "data": data})
+    try:
+        _task_q.put_nowait(data)
+    except queue.Full:
+        send_telegram("⚠️ queue full → drop signal: " + json.dumps(data))
+        return {"ok": False, "queued": False, "reason": "queue_full"}
+    return {"ok": True, "queued": True, "qsize": _task_q.qsize()}
+
+app = FastAPI()
+
+@app.get("/")
+def root():
+    return {"ok": True}
+
+@app.post("/signal")
+async def signal(req: Request):
+    return await _ingest(req)
+
+@app.post("/webhook")
+async def webhook(req: Request):
+    return await _ingest(req)
+
+@app.post("/alert")
+async def alert(req: Request):
+    return await _ingest(req)
+
+@app.get("/health")
+def health():
+    return {"ok": True, "ingress": len(INGRESS_LOG), "queue": _task_q.qsize(), "workers": WORKERS}
+
+@app.get("/ingress")
+def ingress():
+    return list(INGRESS_LOG)[-30:]
+
+@app.get("/positions")
+def positions():
+    return {"positions": get_open_positions()}
+
+@app.get("/queue")
+def queue_size():
+    return {"size": _task_q.qsize(), "max": QUEUE_MAX}
+
+@app.get("/config")
+def config():
+    return {
+        "DEFAULT_AMOUNT": DEFAULT_AMOUNT,
+        "DEFAULT_AMOUNT_LONG": DEFAULT_AMOUNT_LONG,
+        "DEFAULT_AMOUNT_SHORT": DEFAULT_AMOUNT_SHORT,
+        "FORCE_DEFAULT_AMOUNT": FORCE_DEFAULT_AMOUNT,
+        "LEVERAGE": LEVERAGE,
+        "DEDUP_TTL": DEDUP_TTL, "BIZDEDUP_TTL": BIZDEDUP_TTL,
+        "WORKERS": WORKERS, "QUEUE_MAX": QUEUE_MAX,
+        "LOG_INGRESS": LOG_INGRESS,
+        "SYMBOL_AMOUNT": SYMBOL_AMOUNT,
+    }
+
+@app.get("/pending")
+def pending():
+    return get_pending_snapshot()
 
 @app.on_event("startup")
-def on_startup(): _boot()
-
-if __name__ == "__main__":
-    import uvicorn
-    uvicorn.run("main:app", host="0.0.0.0", port=int(os.getenv("PORT", "8080")), reload=False)
+def on_startup():
+    for i in range(WORKERS):
+        t = threading.Thread(target=_worker_loop, args=(i,), daemon=True, name=f"signal-worker-{i}")
+        t.start()
+    start_capacity_guard()
+    start_watchdogs()
+    start_reconciler()
+    try:
+        threading.Thread(
+            target=send_telegram,
+            args=("✅ FastAPI up (workers + watchdog + reconciler + capacity-guard)",),
+            daemon=True
+        ).start()
+    except Exception:
+        pass
