@@ -1,3 +1,4 @@
+# -*- coding: utf-8 -*-
 import os, time, json, hashlib, threading, queue, re
 from collections import deque
 from typing import Dict, Any
@@ -179,7 +180,17 @@ def _worker_loop(idx: int):
     while True:
         try:
             data = _task_q.get()
-            if data is None: continue
+            if data is None:
+                continue
+            # ✅ 추가: 혹시 문자열이 큐에 섞여 들어와도 dict 보장
+            if isinstance(data, (str, bytes)):
+                try:
+                    data = json.loads(data)
+                except Exception:
+                    raise ValueError("queue item is not a valid JSON string")
+            if not isinstance(data, dict):
+                raise ValueError("queue item is not a dict")
+
             _handle_signal(data)
         except Exception as e:
             print(f"[worker-{idx}] error:", e)
@@ -200,7 +211,7 @@ async def _ingest(req: Request):
 
     INGRESS_LOG.append({"ts": now, "ip": (req.client.host if req and req.client else "?"), "data": data})
     try:
-        _task_q.put_nowait(data)
+        _task_q.put_nowait(data)  # dict 그대로 큐에 넣음
     except queue.Full:
         send_telegram("⚠️ queue full → drop signal: " + json.dumps(data))
         return {"ok": False, "queued": False, "reason": "queue_full"}
