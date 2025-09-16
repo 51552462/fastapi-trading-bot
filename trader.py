@@ -1,3 +1,5 @@
+# trader.py
+# -*- coding: utf-8 -*-
 import os, time, threading
 from typing import Dict, Optional
 
@@ -148,9 +150,25 @@ def get_pending_snapshot() -> Dict[str, Dict]:
         }
 
 # ============================================================================
+# 숫자 파싱 보강 (float(dict) 예외 방어)
+# ============================================================================
+def _to_float(x) -> float:
+    try:
+        if isinstance(x, (int, float)):
+            return float(x)
+        if isinstance(x, str):
+            xs = x.strip()
+            if xs == "" or xs.lower() == "null":
+                return 0.0
+            return float(xs)
+        # dict/list 등은 0 처리
+        return 0.0
+    except Exception:
+        return 0.0
+
+# ============================================================================
 # 원격 포지션 조회 헬퍼
 # ============================================================================
-
 def _get_remote(symbol: str, side: Optional[str] = None):
     symbol = convert_symbol(symbol)
     for p in get_open_positions():
@@ -161,14 +179,14 @@ def _get_remote(symbol: str, side: Optional[str] = None):
 def _get_remote_any_side(symbol: str):
     symbol = convert_symbol(symbol)
     for p in get_open_positions():
-        if p.get("symbol") == symbol and float(p.get("size") or 0) > 0:
+        sz = _to_float(p.get("size"))
+        if p.get("symbol") == symbol and sz > 0:
             return p
     return None
 
 # ============================================================================
 # 손익/리스크 계산
 # ============================================================================
-
 def _pnl_usdt(entry: float, exit: float, notional: float, side: str) -> float:
     pct = (exit - entry) / entry if side == "long" else (entry - exit) / entry
     return notional * pct
@@ -193,7 +211,6 @@ def _adverse_move_ratio(entry: float, last: float, side: str) -> float:
 # ============================================================================
 # 용량(상한) 가드 — 숏만 제한, 롱은 무제한
 # ============================================================================
-
 def _total_open_positions_now() -> int:
     try:
         return len(get_open_positions()) + _local_open_count()
@@ -248,7 +265,6 @@ def start_capacity_guard():
 # ============================================================================
 # 진입 중복/인플라이트 가드
 # ============================================================================
-
 _ENTRY_BUSY: Dict[str, float] = {}
 _RECENT_OK: Dict[str, float]  = {}
 _ENTRY_G_LOCK = threading.Lock()
@@ -278,7 +294,6 @@ def _recent_ok(key: str) -> bool:
 # ============================================================================
 # Trading Ops
 # ============================================================================
-
 def enter_position(symbol: str, usdt_amount: float, side: str = "long", leverage: float = None):
     """
     - 용량 가드(숏 제한/롱 무제한)
@@ -327,8 +342,8 @@ def enter_position(symbol: str, usdt_amount: float, side: str = "long", leverage
 
             _set_busy(key)
 
-            last = get_last_price(symbol)
-            if not last or last <= 0:
+            last = _to_float(get_last_price(symbol))
+            if last <= 0:
                 if TRACE_LOG:
                     send_telegram(f"❗ ticker_fail {symbol} trace={trace}")
                 return
@@ -338,7 +353,7 @@ def enter_position(symbol: str, usdt_amount: float, side: str = "long", leverage
                 side=("buy" if side == "long" else "sell"),
                 leverage=lev, reduce_only=False
             )
-            code = str(resp.get("code", ""))
+            code = str(resp.get("code", "")) if isinstance(resp, dict) else ""
             if TRACE_LOG:
                 send_telegram(f"📦 order_resp code={code} {symbol} {side} trace={trace}")
 
@@ -379,12 +394,12 @@ def take_partial_profit(symbol: str, pct: float, side: str = "long"):
 
     with _lock_for(key):
         p = _get_remote(symbol, side)
-        if not p or float(p.get("size", 0)) <= 0:
+        if not p or _to_float(p.get("size")) <= 0:
             send_telegram(f"⚠️ TP 스킵: 원격 포지션 없음 {_key(symbol, side)}")
             return
 
-        size_step = float(get_symbol_spec(symbol).get("sizeStep", 0.001))
-        cur_size  = float(p["size"])
+        size_step = _to_float(get_symbol_spec(symbol).get("sizeStep", 0.001))
+        cur_size  = _to_float(p.get("size"))
         cut_size  = round_down_step(cur_size * float(pct), size_step)
         if cut_size <= 0:
             send_telegram(f"⚠️ TP 스킵: 계산된 사이즈=0 ({_key(symbol, side)})")
@@ -403,9 +418,9 @@ def take_partial_profit(symbol: str, pct: float, side: str = "long"):
                 send_telegram(f"📌 pending add [tp] {pk}")
 
         resp = place_reduce_by_size(symbol, cut_size, side)
-        exit_price = get_last_price(symbol) or float(p.get("entry_price", 0))
+        exit_price = _to_float(get_last_price(symbol)) or _to_float(p.get("entry_price"))
         if str(resp.get("code", "")) == "00000":
-            entry = float(p.get("entry_price", 0))
+            entry = _to_float(p.get("entry_price"))
             realized = _pnl_usdt(entry, exit_price, entry * cut_size, side)
             send_telegram(
                 f"🤑 TP {int(pct*100)}% {side.upper()} {symbol}\n"
@@ -448,25 +463,25 @@ def close_position(symbol: str, side: str = "long", reason: str = "manual"):
         p = None
         for _ in range(3):
             p = _get_remote(symbol, side)
-            if p and float(p.get("size", 0)) > 0:
+            if p and _to_float(p.get("size")) > 0:
                 break
             time.sleep(0.15)
 
-        if not p or float(p.get("size", 0)) <= 0:
+        if not p or _to_float(p.get("size")) <= 0:
             with _POS_LOCK:
                 position_data.pop(key, None)
             _mark_done("close", pkey, "(no-remote)")
             send_telegram(f"⚠️ CLOSE 스킵: 원격 포지션 없음 {key} ({reason})")
             return
 
-        size = float(p["size"])
+        size = _to_float(p.get("size"))
         resp = place_reduce_by_size(symbol, size, side)
-        exit_price = get_last_price(symbol) or float(p.get("entry_price", 0))
+        exit_price = _to_float(get_last_price(symbol)) or _to_float(p.get("entry_price"))
         success = str(resp.get("code", "")) == "00000"
         ok = _sweep_full_close(symbol, side, "reconcile") if success else False
 
         if success or ok:
-            entry = float(p.get("entry_price", 0))
+            entry = _to_float(p.get("entry_price"))
             realized = _pnl_usdt(entry, exit_price, entry * size, side)
             with _POS_LOCK:
                 position_data.pop(key, None)
@@ -484,8 +499,8 @@ def reduce_by_contracts(symbol: str, contracts: float, side: str = "long"):
     side = (side or "long").lower()
     key = _key(symbol, side)
     with _lock_for(key):
-        step = float(get_symbol_spec(symbol).get("sizeStep", 0.001))
-        qty  = round_down_step(float(contracts), step)
+        step = _to_float(get_symbol_spec(symbol).get("sizeStep", 0.001))
+        qty  = round_down_step(_to_float(contracts), step)
         if qty <= 0:
             send_telegram(f"⚠️ reduceByContracts 스킵: step 미달 {key}")
             return
@@ -498,35 +513,33 @@ def reduce_by_contracts(symbol: str, contracts: float, side: str = "long"):
 # ============================================================================
 # 보조 루틴
 # ============================================================================
-
 def _sweep_full_close(symbol: str, side: str, reason: str, max_retry: int = 5, sleep_s: float = 0.3):
     """남은 잔량이 있으면 여러 번 감축해서 최대한 0에 가깝게 정리."""
     for _ in range(max_retry):
         p = _get_remote(symbol, side)
-        size = float(p["size"]) if p and p.get("size") else 0.0
+        size = _to_float(p.get("size")) if p else 0.0
         if size <= 0:
             return True
         place_reduce_by_size(symbol, size, side)
         time.sleep(sleep_s)
     p = _get_remote(symbol, side)
-    return (not p) or float(p.get("size", 0)) <= 0
+    return (not p) or _to_float(p.get("size")) <= 0
 
 # ============================================================================
 # 워치독: 가격기반 즉시 종료 + 마진기반 긴급정지
 # ============================================================================
-
 def _watchdog_loop():
     while True:
         try:
             for p in get_open_positions():
                 symbol = p.get("symbol")
                 side = (p.get("side") or "").lower()
-                entry = float(p.get("entry_price") or 0)
-                size = float(p.get("size") or 0)
+                entry = _to_float(p.get("entry_price"))
+                size  = _to_float(p.get("size"))
                 if not symbol or side not in ("long", "short") or entry <= 0 or size <= 0:
                     continue
 
-                last = get_last_price(symbol)
+                last = _to_float(get_last_price(symbol))
                 if not last:
                     continue
 
@@ -561,7 +574,6 @@ def _watchdog_loop():
 # ============================================================================
 # 브레이크이븐 워치독 (TP1/TP2 후 본절 하락/상승 시 전체 정산)
 # ============================================================================
-
 def _breakeven_watchdog():
     if not BE_ENABLE:
         return
@@ -570,8 +582,8 @@ def _breakeven_watchdog():
             for p in get_open_positions():
                 symbol = p.get("symbol")
                 side = (p.get("side") or "").lower()
-                entry = float(p.get("entry_price") or 0)
-                size = float(p.get("size") or 0)
+                entry = _to_float(p.get("entry_price"))
+                size  = _to_float(p.get("size"))
                 if not symbol or side not in ("long", "short") or entry <= 0 or size <= 0:
                     continue
 
@@ -579,12 +591,12 @@ def _breakeven_watchdog():
                 with _POS_LOCK:
                     st = position_data.get(key, {}) or {}
                     be_armed = bool(st.get("be_armed"))
-                    be_entry = float(st.get("be_entry") or 0.0)
+                    be_entry = _to_float(st.get("be_entry"))
 
                 if not (be_armed and be_entry > 0):
                     continue
 
-                last = get_last_price(symbol)
+                last = _to_float(get_last_price(symbol))
                 if not last:
                     continue
 
@@ -602,7 +614,6 @@ def _breakeven_watchdog():
 # ============================================================================
 # 재조정 루프(엔트리/클로즈/TP3 재시도)
 # ============================================================================
-
 def _reconciler_loop():
     while True:
         time.sleep(RECON_INTERVAL_SEC)
@@ -646,14 +657,14 @@ def _reconciler_loop():
                         )
                         item["last_try"] = now
                         item["attempts"] = item.get("attempts", 0) + 1
-                        code = str(resp.get("code", ""))
+                        code = str(resp.get("code", "")) if isinstance(resp, dict) else ""
 
                         if code == "00000":
                             _mark_done("entry", pkey)
                             with _POS_LOCK:
                                 position_data[key] = {
                                     "symbol": sym, "side": side, "entry_usd": amt,
-                                    "ts": time.time(), "entry_price": get_last_price(sym) or 0.0
+                                    "ts": time.time(), "entry_price": _to_float(get_last_price(sym)) or 0.0
                                 }
                             _mark_recent_ok(key)
                             send_telegram(f"🔁 ENTRY 재시도 성공 {side.upper()} {sym}")
@@ -671,7 +682,7 @@ def _reconciler_loop():
                 sym, side = item["symbol"], item["side"]
                 key = _key(sym, side)
                 p = _get_remote(sym, side)
-                if not p or float(p.get("size", 0)) <= 0:
+                if not p or _to_float(p.get("size")) <= 0:
                     _mark_done("close", pkey, "(no-remote)")
                     with _POS_LOCK:
                         position_data.pop(key, None)
@@ -684,7 +695,7 @@ def _reconciler_loop():
                     if RECON_DEBUG:
                         send_telegram(f"🔁 retry [close] {pkey}")
 
-                    size = float(p["size"])
+                    size = _to_float(p.get("size"))
                     resp = place_reduce_by_size(sym, size, side)
                     item["last_try"] = now
                     item["attempts"] = item.get("attempts", 0) + 1
@@ -703,14 +714,14 @@ def _reconciler_loop():
                 sym, side = item["symbol"], item["side"]
                 key = _key(sym, side)
                 p = _get_remote(sym, side)
-                if not p or float(p.get("size", 0)) <= 0:
+                if not p or _to_float(p.get("size")) <= 0:
                     _mark_done("tp", pkey, "(no-remote)")
                     continue
 
-                cur_size  = float(p["size"])
-                init_size = float(item.get("init_size") or cur_size)
-                cut_size  = float(item["cut_size"])
-                size_step = float(item.get("size_step", 0.001))
+                cur_size  = _to_float(p.get("size"))
+                init_size = _to_float(item.get("init_size") or cur_size)
+                cut_size  = _to_float(item["cut_size"])
+                size_step = _to_float(item.get("size_step", 0.001))
 
                 # 이미 감축된 양이 cut_size에 근접하면 완료 처리
                 achieved  = max(0.0, init_size - cur_size)
@@ -742,7 +753,6 @@ def _reconciler_loop():
 # ============================================================================
 # STRICT(상한) 예약/해제 — 숏만 대상
 # ============================================================================
-
 _RESERVE = {"short": 0}
 _RES_LOCK = threading.Lock()
 
@@ -768,7 +778,6 @@ def _strict_release(side: str):
 # ============================================================================
 # 외부에서 호출
 # ============================================================================
-
 def start_watchdogs():
     threading.Thread(target=_watchdog_loop, name="emergency-stop-watchdog", daemon=True).start()
     if os.getenv("BE_ENABLE", "1") == "1":
