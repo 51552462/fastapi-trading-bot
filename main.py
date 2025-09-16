@@ -13,8 +13,8 @@ from bitget_api import convert_symbol, get_open_positions
 
 # ── 금액 관련 ENV (side별 기본값; ENV로 덮어쓰기 가능)
 DEFAULT_AMOUNT         = float(os.getenv("DEFAULT_AMOUNT", "15"))
-DEFAULT_AMOUNT_LONG    = float(os.getenv("DEFAULT_AMOUNT_LONG", "100"))  # 롱 기본 100
-DEFAULT_AMOUNT_SHORT   = float(os.getenv("DEFAULT_AMOUNT_SHORT", "40"))   # 숏 기본 40
+DEFAULT_AMOUNT_LONG    = float(os.getenv("DEFAULT_AMOUNT_LONG", "100"))  # ← 롱 기본 100
+DEFAULT_AMOUNT_SHORT   = float(os.getenv("DEFAULT_AMOUNT_SHORT", "40"))   # ← 숏 기본 40
 LEVERAGE               = float(os.getenv("LEVERAGE", "5"))
 DEDUP_TTL              = float(os.getenv("DEDUP_TTL", "15"))
 BIZDEDUP_TTL           = float(os.getenv("BIZDEDUP_TTL", "3"))
@@ -23,8 +23,9 @@ WORKERS                = int(os.getenv("WORKERS", "6"))
 QUEUE_MAX              = int(os.getenv("QUEUE_MAX", "2000"))
 LOG_INGRESS            = os.getenv("LOG_INGRESS", "0") == "1"
 
-FORCE_DEFAULT_AMOUNT   = os.getenv("FORCE_DEFAULT_AMOUNT", "0") == "1"
+FORCE_DEFAULT_AMOUNT   = os.getenv("FORCE_DEFAULT_AMOUNT", "0") == "1"  # 1이면 신호 amount 무시
 
+# 심볼별 우선 금액
 SYMBOL_AMOUNT_JSON = os.getenv("SYMBOL_AMOUNT_JSON", "")
 try:
     SYMBOL_AMOUNT = json.loads(SYMBOL_AMOUNT_JSON) if SYMBOL_AMOUNT_JSON else {}
@@ -69,6 +70,10 @@ def _norm_type(typ: str) -> str:
     return aliases.get(t, t)
 
 def _resolve_amount(symbol: str, side: str, payload: Dict[str, Any]) -> float:
+    """
+    우선순위(기본): signal.amount > SYMBOL_AMOUNT > side-default > DEFAULT_AMOUNT
+    FORCE_DEFAULT_AMOUNT=1이면: side-default > DEFAULT_AMOUNT (신호 무시)
+    """
     if not FORCE_DEFAULT_AMOUNT:
         if "amount" in payload and str(payload["amount"]).strip() != "":
             try:
@@ -86,7 +91,7 @@ def _resolve_amount(symbol: str, side: str, payload: Dict[str, Any]) -> float:
         return float(DEFAULT_AMOUNT_SHORT)
     return float(DEFAULT_AMOUNT)
 
-# 느슨한 문자열 파서
+# 느슨 문자열→dict (워커 가드용)
 def _loose_kv_to_dict(txt: str) -> Dict[str, Any]:
     if not isinstance(txt, str):
         return {}
@@ -114,7 +119,7 @@ def _loose_kv_to_dict(txt: str) -> Dict[str, Any]:
             out[k] = v
     return out
 
-# Payload 파서
+# Payload 파서(느슨)
 async def _parse_any(req: Request) -> Dict[str, Any]:
     try:
         return await req.json()
@@ -131,7 +136,8 @@ async def _parse_any(req: Request) -> Dict[str, Any]:
                     return json.loads(fixed)
                 except Exception:
                     kv = _loose_kv_to_dict(raw)
-                    if kv: return kv
+                    if kv:
+                        return kv
     except Exception:
         pass
     try:
@@ -142,7 +148,8 @@ async def _parse_any(req: Request) -> Dict[str, Any]:
                 return json.loads(payload)
             except Exception:
                 kv = _loose_kv_to_dict(str(payload))
-                if kv: return kv
+                if kv:
+                    return kv
     except Exception:
         pass
     try:
@@ -152,7 +159,8 @@ async def _parse_any(req: Request) -> Dict[str, Any]:
             if ":" in part:
                 k, v = part.split(":", 1)
                 d[k.strip()] = v.strip()
-        if d: return d
+        if d:
+            return d
     except Exception:
         pass
     raise ValueError("cannot parse request")
@@ -161,12 +169,14 @@ async def _parse_any(req: Request) -> Dict[str, Any]:
 # 시그널 라우터
 # ─────────────────────────────────────────────────────────────
 def _handle_signal(data: Dict[str, Any]):
-    # type 키 fallback + 리스트 방어
+    # NEW: type 키가 리스트/튜플로 들어오는 방지
     if isinstance(data.get("type"), (list, tuple)):
         try:
             data["type"] = (data["type"][0] or "")
         except Exception:
             data["type"] = ""
+
+    # NEW: type 키 fallback (event/action/signalType 허용)
     typ_raw = (
         data.get("type")
         or data.get("event")
@@ -189,17 +199,20 @@ def _handle_signal(data: Dict[str, Any]):
     now = time.time()
     bizkey = f"{t}:{symbol}:{side}"
     last = _BIZDEDUP.get(bizkey, 0.0)
-    if now - last < BIZDEDUP_TTL: return
+    if now - last < BIZDEDUP_TTL:
+        return
     _BIZDEDUP[bizkey] = now
 
     if LOG_INGRESS:
-        try: send_telegram(f"📥 {t} {symbol} {side} amt={amount}")
-        except: pass
+        try:
+            send_telegram(f"📥 {t} {symbol} {side} amt={amount}")
+        except:
+            pass
 
     if t == "entry":
         enter_position(symbol, amount, side=side, leverage=leverage); return
 
-    if t in ("tp1","tp2","tp3"):
+    if t in ("tp1", "tp2", "tp3"):
         pct = float(os.getenv("TP1_PCT","0.30")) if t=="tp1" else float(os.getenv("TP2_PCT","0.40")) if t=="tp2" else float(os.getenv("TP3_PCT","0.30"))
         take_partial_profit(symbol, pct, side=side); return
 
@@ -209,10 +222,12 @@ def _handle_signal(data: Dict[str, Any]):
 
     if t == "reducebycontracts":
         contracts = float(data.get("contracts", 0))
-        if contracts > 0: reduce_by_contracts(symbol, contracts, side=side)
+        if contracts > 0:
+            reduce_by_contracts(symbol, contracts, side=side)
         return
 
-    if t in ("tailtouch","info","debug"): return
+    if t in ("tailtouch", "info", "debug"):
+        return
 
     send_telegram("❓ 알 수 없는 신호: " + json.dumps(data))
 
@@ -223,7 +238,10 @@ def _worker_loop(idx: int):
     while True:
         try:
             data = _task_q.get()
-            if data is None: continue
+            if data is None:
+                continue
+
+            # 문자열이 섞여도 안전하게 dict 표준화
             if isinstance(data, (str, bytes)):
                 try:
                     obj = json.loads(data)
@@ -236,12 +254,16 @@ def _worker_loop(idx: int):
             if not isinstance(data, dict) or not data:
                 send_telegram(f"[worker-{idx}] drop: queue item is not a valid JSON/KV string")
                 continue
+
             _handle_signal(data)
+
         except Exception as e:
             print(f"[worker-{idx}] error:", e)
         finally:
-            try: _task_q.task_done()
-            except: pass
+            try:
+                _task_q.task_done()
+            except Exception:
+                pass
 
 async def _ingest(req: Request):
     now = time.time()
@@ -249,10 +271,12 @@ async def _ingest(req: Request):
         data = await _parse_any(req)
     except Exception as e:
         return {"ok": False, "error": f"bad_payload: {e}"}
+
     dk = _dedup_key(data)
     if dk in _DEDUP and now - _DEDUP[dk] < DEDUP_TTL:
         return {"ok": True, "dedup": True}
     _DEDUP[dk] = now
+
     INGRESS_LOG.append({"ts": now, "ip": (req.client.host if req and req.client else "?"), "data": data})
     try:
         _task_q.put_nowait(data)
@@ -264,28 +288,36 @@ async def _ingest(req: Request):
 app = FastAPI()
 
 @app.get("/")
-def root(): return {"ok": True}
+def root():
+    return {"ok": True}
 
 @app.post("/signal")
-async def signal(req: Request): return await _ingest(req)
+async def signal(req: Request):
+    return await _ingest(req)
 
 @app.post("/webhook")
-async def webhook(req: Request): return await _ingest(req)
+async def webhook(req: Request):
+    return await _ingest(req)
 
 @app.post("/alert")
-async def alert(req: Request): return await _ingest(req)
+async def alert(req: Request):
+    return await _ingest(req)
 
 @app.get("/health")
-def health(): return {"ok": True, "ingress": len(INGRESS_LOG), "queue": _task_q.qsize(), "workers": WORKERS}
+def health():
+    return {"ok": True, "ingress": len(INGRESS_LOG), "queue": _task_q.qsize(), "workers": WORKERS}
 
 @app.get("/ingress")
-def ingress(): return list(INGRESS_LOG)[-30:]
+def ingress():
+    return list(INGRESS_LOG)[-30:]
 
 @app.get("/positions")
-def positions(): return {"positions": get_open_positions()}
+def positions():
+    return {"positions": get_open_positions()}
 
 @app.get("/queue")
-def queue_size(): return {"size": _task_q.qsize(), "max": QUEUE_MAX}
+def queue_size():
+    return {"size": _task_q.qsize(), "max": QUEUE_MAX}
 
 @app.get("/config")
 def config():
@@ -302,7 +334,8 @@ def config():
     }
 
 @app.get("/pending")
-def pending(): return get_pending_snapshot()
+def pending():
+    return get_pending_snapshot()
 
 @app.on_event("startup")
 def on_startup():
