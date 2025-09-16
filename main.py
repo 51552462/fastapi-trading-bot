@@ -11,10 +11,10 @@ from trader import (
 from telegram_bot import send_telegram
 from bitget_api import convert_symbol, get_open_positions
 
-# ── 금액 관련 ENV (side별 기본값 추가)
+# ── 금액 관련 ENV (side별 기본값; ENV로 덮어쓰기 가능)
 DEFAULT_AMOUNT         = float(os.getenv("DEFAULT_AMOUNT", "15"))
-DEFAULT_AMOUNT_LONG    = float(os.getenv("DEFAULT_AMOUNT_LONG", "80"))  # ← 기본 80
-DEFAULT_AMOUNT_SHORT   = float(os.getenv("DEFAULT_AMOUNT_SHORT", "40"))  # ← 기본 40
+DEFAULT_AMOUNT_LONG    = float(os.getenv("DEFAULT_AMOUNT_LONG", "100"))  # ← 기본 100 (요청 반영)
+DEFAULT_AMOUNT_SHORT   = float(os.getenv("DEFAULT_AMOUNT_SHORT", "40"))   # ← 기본 40
 LEVERAGE               = float(os.getenv("LEVERAGE", "5"))
 DEDUP_TTL              = float(os.getenv("DEDUP_TTL", "15"))
 BIZDEDUP_TTL           = float(os.getenv("BIZDEDUP_TTL", "3"))
@@ -94,27 +94,80 @@ def _resolve_amount(symbol: str, side: str, payload: Dict[str, Any]) -> float:
     return float(DEFAULT_AMOUNT)
 
 # ─────────────────────────────────────────────────────────────
+# 느슨한 문자열 파서(워커 가드에서 사용)
+# ─────────────────────────────────────────────────────────────
+def _loose_kv_to_dict(txt: str) -> Dict[str, Any]:
+    """
+    JSON 이 아니더라도 'key:value,key:value' 혹은 'key=value' 같은 형태를 dict로 변환.
+    실패하면 빈 dict 반환.
+    """
+    if not isinstance(txt, str):
+        return {}
+    s = txt.strip()
+    if not s:
+        return {}
+    # JSON 시도
+    try:
+        obj = json.loads(s)
+        if isinstance(obj, dict):
+            return obj
+    except Exception:
+        pass
+    # key:value / key=value 파싱
+    out: Dict[str, Any] = {}
+    parts = re.split(r"[\n,;]+", s)
+    for part in parts:
+        if ":" in part:
+            k, v = part.split(":", 1)
+        elif "=" in part:
+            k, v = part.split("=", 1)
+        else:
+            continue
+        k = k.strip()
+        v = v.strip().strip('"').strip("'")
+        if k:
+            out[k] = v
+    return out
+
+# ─────────────────────────────────────────────────────────────
 # Payload 파서(느슨하게)
 # ─────────────────────────────────────────────────────────────
 async def _parse_any(req: Request) -> Dict[str, Any]:
+    # 1) 정상 JSON
     try:
         return await req.json()
     except Exception:
         pass
+    # 2) raw body JSON or KV
     try:
         raw = (await req.body()).decode(errors="ignore").strip()
         if raw:
-            try: return json.loads(raw)
+            try:
+                return json.loads(raw)
             except Exception:
-                fixed = raw.replace("'", '"'); return json.loads(fixed)
+                fixed = raw.replace("'", '"')
+                try:
+                    return json.loads(fixed)
+                except Exception:
+                    kv = _loose_kv_to_dict(raw)
+                    if kv:
+                        return kv
     except Exception:
         pass
+    # 3) form
     try:
         form = await req.form()
         payload = form.get("payload") or form.get("data")
-        if payload: return json.loads(payload)
+        if payload:
+            try:
+                return json.loads(payload)
+            except Exception:
+                kv = _loose_kv_to_dict(str(payload))
+                if kv:
+                    return kv
     except Exception:
         pass
+    # 4) 마지막 시도: 줄바꿈/쉼표 기반 KV
     try:
         txt = (await req.body()).decode(errors="ignore")
         d: Dict[str, Any] = {}
@@ -122,7 +175,8 @@ async def _parse_any(req: Request) -> Dict[str, Any]:
             if ":" in part:
                 k, v = part.split(":", 1)
                 d[k.strip()] = v.strip()
-        if d: return d
+        if d:
+            return d
     except Exception:
         pass
     raise ValueError("cannot parse request")
@@ -146,17 +200,20 @@ def _handle_signal(data: Dict[str, Any]):
     now = time.time()
     bizkey = f"{t}:{symbol}:{side}"
     last = _BIZDEDUP.get(bizkey, 0.0)
-    if now - last < BIZDEDUP_TTL: return
+    if now - last < BIZDEDUP_TTL:
+        return
     _BIZDEDUP[bizkey] = now
 
     if LOG_INGRESS:
-        try: send_telegram(f"📥 {t} {symbol} {side} amt={amount}")
-        except: pass
+        try:
+            send_telegram(f"📥 {t} {symbol} {side} amt={amount}")
+        except:
+            pass
 
     if t == "entry":
         enter_position(symbol, amount, side=side, leverage=leverage); return
 
-    if t in ("tp1","tp2","tp3"):
+    if t in ("tp1", "tp2", "tp3"):
         pct = float(os.getenv("TP1_PCT","0.30")) if t=="tp1" else float(os.getenv("TP2_PCT","0.40")) if t=="tp2" else float(os.getenv("TP3_PCT","0.30"))
         take_partial_profit(symbol, pct, side=side); return
 
@@ -166,10 +223,12 @@ def _handle_signal(data: Dict[str, Any]):
 
     if t == "reducebycontracts":
         contracts = float(data.get("contracts", 0))
-        if contracts > 0: reduce_by_contracts(symbol, contracts, side=side)
+        if contracts > 0:
+            reduce_by_contracts(symbol, contracts, side=side)
         return
 
-    if t in ("tailtouch","info","debug"): return
+    if t in ("tailtouch", "info", "debug"):
+        return
 
     send_telegram("❓ 알 수 없는 신호: " + json.dumps(data))
 
@@ -182,20 +241,33 @@ def _worker_loop(idx: int):
             data = _task_q.get()
             if data is None:
                 continue
-            # ✅ 추가: 혹시 문자열이 큐에 섞여 들어와도 dict 보장
+
+            # ✅ 추가 가드: 문자열이 섞여도 안전하게 dict로 표준화
             if isinstance(data, (str, bytes)):
+                # 1) JSON 시도
                 try:
-                    data = json.loads(data)
+                    obj = json.loads(data)
+                    if isinstance(obj, dict):
+                        data = obj
+                    else:
+                        # 2) 느슨한 KV 파싱
+                        data = _loose_kv_to_dict(data) or {}
                 except Exception:
-                    raise ValueError("queue item is not a valid JSON string")
-            if not isinstance(data, dict):
-                raise ValueError("queue item is not a dict")
+                    data = _loose_kv_to_dict(data) or {}
+            # dict 보장 실패 시 드롭(에러 대신 알림만)
+            if not isinstance(data, dict) or not data:
+                send_telegram(f"[worker-{idx}] drop: queue item is not a valid JSON/KV string")
+                continue
 
             _handle_signal(data)
+
         except Exception as e:
             print(f"[worker-{idx}] error:", e)
         finally:
-            _task_q.task_done()
+            try:
+                _task_q.task_done()
+            except Exception:
+                pass
 
 async def _ingest(req: Request):
     now = time.time()
