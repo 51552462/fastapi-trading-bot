@@ -1,9 +1,17 @@
 # -*- coding: utf-8 -*-
 """
-Bitget REST API helper for USDT-M perpetual (UMCBL) — v2 우선, v1 폴백
-요구 인터페이스(트레이더와의 호환):
+Bitget REST API helper (USDT-M Perpetual)
+
+인터페이스(트레이더와 호환):
   convert_symbol, get_last_price, get_open_positions,
   place_market_order, place_reduce_by_size, get_symbol_spec, round_down_step
+
+주요 특징
+- v2 권장 엔드포인트 사용, v1 폴백
+- productType 기본값: USDT-FUTURES  (Bitget 공식 답변 반영)
+- Ticker 폴백: v2 ticker -> v2 mark -> v2 orderbook(mid) -> (옵션) v1
+- Positions: v2 all-position (400 응답 본문 로깅) -> (옵션) v2 single-position (힌트 심볼) -> v1
+- Order: v2 place-order 우선, 실패 시 v1 폴백
 """
 
 from __future__ import annotations
@@ -19,7 +27,7 @@ from typing import Any, Dict, Optional, Tuple, List
 from urllib.parse import urlencode
 
 # ─────────────────────────────────────────────────────────
-# ENV
+# ENV (필수/권장)
 # ─────────────────────────────────────────────────────────
 BASE_URL  = os.getenv("BITGET_BASE_URL", "https://api.bitget.com")
 
@@ -34,23 +42,27 @@ V2_MARK_PATH         = os.getenv("BITGET_V2_MARK_PATH", "/api/v2/mix/market/mark
 V2_DEPTH_PATH        = os.getenv("BITGET_V2_DEPTH_PATH", "/api/v2/mix/market/orderbook")
 V2_PLACE_ORDER_PATH  = os.getenv("BITGET_V2_PLACE_ORDER_PATH", "/api/v2/mix/order/place-order")
 V2_POSITIONS_PATH    = os.getenv("BITGET_V2_POSITIONS_PATH", "/api/v2/mix/position/all-position")
+V2_SINGLE_POSITION_PATH = os.getenv("BITGET_V2_SINGLE_POSITION_PATH", "/api/v2/mix/position/single-position")
 
-# v1 폴백
+# v1 폴백 경로
 V1_TICKER_PATH       = os.getenv("BITGET_V1_TICKER_PATH", "/api/mix/market/ticker")
 V1_PLACE_ORDER_PATH  = os.getenv("BITGET_V1_PLACE_ORDER_PATH", "/api/mix/v1/order/placeOrder")
 V1_POSITIONS_PATH    = os.getenv("BITGET_V1_POSITIONS_PATH", "/api/mix/v1/position/allPosition")
 
-# productType — 지원팀이 문서에서 두 표기를 모두 언급(umcbl / USDT-FUTURES)
-V2_PRODUCT_TYPE      = os.getenv("BITGET_V2_PRODUCT_TYPE", "umcbl")
-V2_PRODUCT_TYPE_ALT  = os.getenv("BITGET_V2_PRODUCT_TYPE_ALT", "USDT-FUTURES")  # fallback try
-MARGIN_COIN          = os.getenv("BITGET_MARGIN_COIN", "USDT")
+# productType — Bitget 공식: USDT-FUTURES / COIN-FUTURES / USDC-FUTURES
+V2_PRODUCT_TYPE      = os.getenv("BITGET_V2_PRODUCT_TYPE", "USDT-FUTURES")
+# 추가 시도 목록(쉼표구분). 기본은 COIN-FUTURES,USDC-FUTURES
+V2_PRODUCT_TYPE_ALTS = os.getenv("BITGET_V2_PRODUCT_TYPE_ALTS", "COIN-FUTURES,USDC-FUTURES")
+
+MARGIN_COIN          = os.getenv("BITGET_MARGIN_COIN", "USDT")        # 보통 USDT
+POSITION_SYMBOLS_HINT = os.getenv("POSITION_SYMBOLS_HINT", "")        # v2 single-position 폴백용 힌트(옵션)
 
 # 티커 품질/캐시
 STRICT_TICKER        = os.getenv("STRICT_TICKER", "0") == "1"
 ALLOW_DEPTH_FALLBACK = os.getenv("ALLOW_DEPTH_FALLBACK", "1") == "1"
 TICKER_TTL           = float(os.getenv("TICKER_TTL", "3"))
 
-# 심볼 별칭
+# 심볼 별칭(JSON)
 try:
     SYMBOL_ALIASES = json.loads(os.getenv("SYMBOL_ALIASES_JSON", "") or "{}")
 except Exception:
@@ -78,7 +90,7 @@ def _sign(message: str) -> str:
 def _auth_headers(method: str, path: str, query: Dict[str, Any] | None, body: str = "") -> Dict[str, str]:
     """
     Signature = base64(HmacSHA256(secret, timestamp + method + requestPath + '?' + queryString + body))
-    - GET: queryString는 urlencode로 직렬화한 것을 사용
+    GET 서명에는 queryString을 반드시 포함
     """
     ts = _ts_ms()
     qstr = urlencode(query or {})
@@ -102,6 +114,16 @@ def _http_get(path: str, params: Dict[str, Any], auth: bool = False, timeout: in
     r.raise_for_status()
     return r.json()
 
+def _http_get_raw(path: str, params: Dict[str, Any], auth: bool = False, timeout: int = 8) -> requests.Response:
+    """400 본문 로깅용 Raw GET"""
+    url = BASE_URL + path
+    if auth:
+        headers = _auth_headers("GET", path, params, "")
+        res = SESSION.get(url, params=params, headers=headers, timeout=timeout)
+    else:
+        res = SESSION.get(url, params=params, timeout=timeout)
+    return res
+
 def _http_post(path: str, payload: Dict[str, Any], auth: bool = True, timeout: int = 8) -> Dict[str, Any]:
     url = BASE_URL + path
     body = json.dumps(payload or {})
@@ -122,13 +144,14 @@ def convert_symbol(sym: str) -> str:
     return s.replace("-", "").replace("_", "")
 
 def _v2_product_types() -> List[str]:
-    # umcbl(기본) → USDT-FUTURES(대체) 순서로 시도
-    seen, out = set(), []
-    for x in (V2_PRODUCT_TYPE, V2_PRODUCT_TYPE_ALT):
-        x = (x or "").strip()
+    out: List[str] = []
+    seen = set()
+    for x in [V2_PRODUCT_TYPE] + [v.strip() for v in V2_PRODUCT_TYPE_ALTS.split(",") if v.strip()]:
+        x = x.strip()
         if x and x not in seen:
             seen.add(x); out.append(x)
-    return out if out else ["umcbl"]
+    # 비어있을 일은 없지만, 안전망
+    return out or ["USDT-FUTURES"]
 
 _spec_cache: Dict[str, Dict[str, Any]] = {}
 def get_symbol_spec(symbol: str) -> Dict[str, Any]:
@@ -145,7 +168,7 @@ def round_down_step(v: float, step: float) -> float:
     return math.floor(float(v) / float(step)) * float(step)
 
 # ─────────────────────────────────────────────────────────
-# Ticker (v2→mark→orderbook→v1) + 캐시
+# Ticker (v2 → mark → orderbook(mid) → v1) + 캐시
 # ─────────────────────────────────────────────────────────
 _ticker_cache: Dict[str, Tuple[float, float]] = {}
 
@@ -168,13 +191,15 @@ def _parse_ticker_v2(js: Dict[str, Any]) -> Optional[float]:
                 try:
                     px = float(v)
                     if px > 0: return px
-                except Exception: pass
+                except Exception:
+                    pass
         bid, ask = d.get("bestBid"), d.get("bestAsk")
         try:
             if bid not in (None, "") and ask not in (None, ""):
                 b = float(bid); a = float(ask)
                 if b > 0 and a > 0: return (a + b) / 2.0
-        except Exception: pass
+        except Exception:
+            pass
     return None
 
 def _get_ticker_v2(sym: str, product: str) -> Optional[float]:
@@ -229,8 +254,7 @@ def get_last_price(sym: str) -> Optional[float]:
 
     if USE_V2:
         s = symbol
-        products = _v2_product_types()
-        for product in products:
+        for product in _v2_product_types():
             px = _get_ticker_v2(s, product)
             if px: _cache_set(symbol, px); return px
             px = _get_mark_v2(s, product)
@@ -246,6 +270,7 @@ def get_last_price(sym: str) -> Optional[float]:
         _log(f"❌ Ticker 실패(최종): {symbol} v2=True")
         return None
 
+    # v1 우선
     px = _get_ticker_v1(symbol)
     if px: _cache_set(symbol, px); return px
     _log(f"❌ Ticker 실패(최종): {symbol} v2=False")
@@ -275,7 +300,8 @@ def place_market_order(symbol: str, usdt_amount: float, side: str, leverage: flo
         return {"code": "LOCAL_MIN_QTY", "msg": "size below step"}
 
     side_api = _api_side(side, reduce_only)
-    # v2 우선 — productType 다중 시도
+
+    # v2 우선 — productType 순차 시도
     if USE_V2:
         for product in _v2_product_types():
             payload_v2 = {
@@ -292,8 +318,7 @@ def place_market_order(symbol: str, usdt_amount: float, side: str, leverage: flo
             }
             try:
                 js = _http_post(V2_PLACE_ORDER_PATH, payload_v2, auth=True)
-                code = str(js.get("code", ""))
-                if code == "00000":
+                if str(js.get("code", "")) == "00000":
                     return js
                 _log(f"place v2 fail {sym}/{product}: {js}")
             except Exception as e:
@@ -321,7 +346,7 @@ def place_reduce_by_size(symbol: str, size: float, side: str) -> Dict[str, Any]:
     size = round_down_step(float(size), float(get_symbol_spec(sym).get("sizeStep", 0.001)))
     if size <= 0:
         return {"code": "LOCAL_BAD_QTY", "msg": "size<=0"}
-    # reduceOnly=True — 시장가 감축
+    # 시장가 감축(reduceOnly)
     return place_market_order(
         sym,
         usdt_amount=float(size) * (get_last_price(sym) or 0.0),
@@ -331,15 +356,17 @@ def place_reduce_by_size(symbol: str, size: float, side: str) -> Dict[str, Any]:
     )
 
 # ─────────────────────────────────────────────────────────
-# 포지션 조회 (v2: productType 다중 시도 + marginCoin 옵션, v1 파라미터 보강)
+# 포지션 조회: v2 all-position → (옵션) single-position → v1 폴백
 # ─────────────────────────────────────────────────────────
 def _parse_positions_v2(js: Dict[str, Any]) -> List[Dict[str, Any]]:
     data = js.get("data") or []
     out: List[Dict[str, Any]] = []
     for row in data:
         try:
+            if not row: 
+                continue
             sym = convert_symbol(row.get("symbol", ""))
-            side = (row.get("holdSide") or "").lower()     # long / short
+            side = (row.get("holdSide") or "").lower()  # long/short
             size = float(row.get("total", 0) or row.get("available", 0) or 0)
             entry = float(row.get("averageOpenPrice", 0) or 0)
             if size > 0 and side in ("long", "short"):
@@ -365,7 +392,7 @@ def _parse_positions_v1(js: Dict[str, Any]) -> List[Dict[str, Any]]:
     return out
 
 def get_open_positions() -> List[Dict[str, Any]]:
-    # v2 — productType 다중 시도 (+ marginCoin 함께 시도)
+    # v2 — productType 순차 시도(+ marginCoin 함께 시도), 에러본문 로깅
     if USE_V2:
         for product in _v2_product_types():
             for params in (
@@ -373,27 +400,48 @@ def get_open_positions() -> List[Dict[str, Any]]:
                 {"productType": product, "marginCoin": MARGIN_COIN},
             ):
                 try:
-                    js = _http_get(V2_POSITIONS_PATH, params, auth=True)
-                    out = _parse_positions_v2(js)
-                    return out
-                except requests.HTTPError as e:
-                    _log(f"positions v2 error: {e} url: {BASE_URL}{V2_POSITIONS_PATH}?{urlencode(params)}")
+                    res = _http_get_raw(V2_POSITIONS_PATH, params, auth=True)
+                    if res.status_code == 200:
+                        js = res.json()
+                        return _parse_positions_v2(js)
+                    else:
+                        _log(f"positions v2 {res.status_code} url: {BASE_URL}{V2_POSITIONS_PATH}?{urlencode(params)} body: {res.text}")
                 except Exception as e:
-                    _log(f"positions v2 error: {e}")
+                    _log(f"positions v2 error: {e} url: {BASE_URL}{V2_POSITIONS_PATH}?{urlencode(params)}")
 
-    # v1 폴백 — 문서/계정 설정에 따라 productType, marginCoin이 필요한 경우가 있어 함께 시도
+        # (옵션) single-position 폴백: 힌트 심볼 있을 때만
+        hint_syms = [s.strip().upper() for s in POSITION_SYMBOLS_HINT.split(",") if s.strip()]
+        if hint_syms:
+            collected: List[Dict[str, Any]] = []
+            for product in _v2_product_types():
+                for sym in hint_syms:
+                    try:
+                        res = _http_get_raw(V2_SINGLE_POSITION_PATH, {"productType": product, "symbol": convert_symbol(sym)}, auth=True)
+                        if res.status_code == 200:
+                            js = res.json()
+                            one = _parse_positions_v2({"data": [js.get("data", {})]})
+                            if one: collected.extend(one)
+                        else:
+                            _log(f"single-position v2 {res.status_code} url: {BASE_URL}{V2_SINGLE_POSITION_PATH}?productType={product}&symbol={convert_symbol(sym)} body: {res.text}")
+                    except Exception as e:
+                        _log(f"single-position v2 error: {e}")
+            if collected:
+                return collected
+
+    # v1 폴백 — productType/marginCoin 조합도 시도하며 본문 로깅
     for params in (
-        {},  # 일부 계정은 파라미터 없이도 동작
-        {"productType": "umcbl"},
+        {},
+        {"productType": "umcbl"},                       # 일부 계정에서 요구될 수 있음
         {"productType": "umcbl", "marginCoin": MARGIN_COIN},
     ):
         try:
-            js = _http_get(V1_POSITIONS_PATH, params, auth=True)
-            out = _parse_positions_v1(js)
-            return out
-        except requests.HTTPError as e:
-            _log(f"positions v1 error: {e} url: {BASE_URL}{V1_POSITIONS_PATH}?{urlencode(params)}")
+            res = _http_get_raw(V1_POSITIONS_PATH, params, auth=True)
+            if res.status_code == 200:
+                js = res.json()
+                return _parse_positions_v1(js)
+            else:
+                _log(f"positions v1 {res.status_code} url: {BASE_URL}{V1_POSITIONS_PATH}?{urlencode(params)} body: {res.text}")
         except Exception as e:
-            _log(f"positions v1 error: {e}")
+            _log(f"positions v1 error: {e} url: {BASE_URL}{V1_POSITIONS_PATH}?{urlencode(params)}")
 
     return []
