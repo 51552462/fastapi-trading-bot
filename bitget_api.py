@@ -2,219 +2,494 @@
 """
 Bitget REST API helper (USDT-M Perpetual)
 
-외부에서 사용하는 함수(트레이더와 호환):
+공용 인터페이스(트레이더/메인과 호환):
   - convert_symbol(symbol) -> str
   - get_last_price(symbol) -> Optional[float]
   - get_open_positions() -> List[Dict]
   - place_market_order(symbol, usdt_amount, side, leverage, reduce_only=False) -> Dict
-  - place_reduce_by_size(symbol, size, side) -> Dict
+  - place_reduce_by_size(symbol, size, side) -> Dict  # (필요 시 사용)
   - get_symbol_spec(symbol) -> Dict
   - round_down_step(value, step) -> float
 
-필요 ENV (필수 ★ / 권장 ◇):
-★ BITGET_API_KEY
-★ BITGET_API_SECRET
-★ BITGET_API_PASSPHRASE
-◇ BITGET_USE_V2=1 → v2 엔드포인트 사용 (권장)
-◇ BITGET_PRODUCT_TYPE=USDT-FUTURES  ← v2용 productType(공식 가이드)
+ENV (필수★ / 권장◇):
+★ BITGET_API_KEY, BITGET_API_SECRET, BITGET_API_PASSWORD
+◇ BITGET_BASE_URL=https://api.bitget.com
+◇ BITGET_USE_V2=1
+◇ BITGET_V2_PRODUCT_TYPE=USDT-FUTURES
+◇ BITGET_V2_PRODUCT_TYPE_ALTS="COIN-FUTURES,USDC-FUTURES"
+◇ BITGET_MARGIN_COIN=USDT
+◇ BITGET_V2_TICKER_PATH=/api/v2/mix/market/ticker
+◇ BITGET_V2_MARK_PATH=/api/v2/mix/market/mark-price
+◇ BITGET_V2_DEPTH_PATH=/api/v2/mix/market/orderbook
+◇ BITGET_V2_CANDLES_PATH=/api/v2/mix/market/candles
+◇ BITGET_V2_INDEX_CANDLES_PATH=/api/v2/mix/market/index-candles
+◇ BITGET_CANDLE_GRANULARITY=60
+◇ BITGET_V2_PLACE_ORDER_PATH=/api/v2/mix/order/place-order
+◇ BITGET_V2_POSITIONS_PATH=/api/v2/mix/position/get-all-position
+◇ BITGET_V1_TICKER_PATH=/api/mix/market/ticker
+◇ BITGET_V1_PLACE_ORDER_PATH=/api/mix/v1/order/placeOrder
+◇ BITGET_V1_POSITIONS_PATH=/api/mix/v1/position/allPosition
+◇ POSITION_SYMBOLS_HINT="BTCUSDT,ETHUSDT,..."
+◇ STRICT_TICKER=0, ALLOW_DEPTH_FALLBACK=1, TICKER_TTL=3
+◇ SYMBOL_ALIASES_JSON='{"KAITOUSDT":"KAITOUSDT"}'
+◇ TRACE_LOG=0
 """
 
-import os, time, hmac, hashlib, json, math, random
+from __future__ import annotations
+import os, time, math, json, hmac, hashlib, base64
 from typing import Any, Dict, Optional, Tuple, List
 from urllib.parse import urlencode
-
 import requests
 from urllib3.util.retry import Retry
 from requests.adapters import HTTPAdapter
 
-# ─────────────────────────────────────────────────────────
+# ────────────────────────────────────────────────────────
 # ENV
-# ─────────────────────────────────────────────────────────
+# ────────────────────────────────────────────────────────
 BASE_URL  = os.getenv("BITGET_BASE_URL", "https://api.bitget.com")
-
 API_KEY   = os.getenv("BITGET_API_KEY", "")
 API_SEC   = os.getenv("BITGET_API_SECRET", "")
-API_PASS  = os.getenv("BITGET_API_PASSPHRASE", "")
+API_PASS  = os.getenv("BITGET_API_PASSWORD", "")
 
-USE_V2    = os.getenv("BITGET_USE_V2", "1") == "1"
-PRODUCT_TYPE = os.getenv("BITGET_PRODUCT_TYPE", "USDT-FUTURES")  # v2 권장값
+USE_V2               = os.getenv("BITGET_USE_V2", "1") == "1"
+V2_TICKER_PATH       = os.getenv("BITGET_V2_TICKER_PATH", "/api/v2/mix/market/ticker")
+V2_MARK_PATH         = os.getenv("BITGET_V2_MARK_PATH", "/api/v2/mix/market/mark-price")
+V2_DEPTH_PATH        = os.getenv("BITGET_V2_DEPTH_PATH", "/api/v2/mix/market/orderbook")
+V2_CANDLES_PATH      = os.getenv("BITGET_V2_CANDLES_PATH", "/api/v2/mix/market/candles")
+V2_INDEX_CANDLES_PATH= os.getenv("BITGET_V2_INDEX_CANDLES_PATH", "/api/v2/mix/market/index-candles")
+CANDLE_GRANULARITY   = int(os.getenv("BITGET_CANDLE_GRANULARITY", "60"))
 
+V2_PLACE_ORDER_PATH  = os.getenv("BITGET_V2_PLACE_ORDER_PATH", "/api/v2/mix/order/place-order")
+# 최신 문서 기준
+V2_POSITIONS_PATH    = os.getenv("BITGET_V2_POSITIONS_PATH", "/api/v2/mix/position/get-all-position")
+# 구 문서/계정 호환 폴백
+V2_POSITIONS_PATH_FALLBACK = "/api/v2/mix/position/all-position"
+
+V1_TICKER_PATH       = os.getenv("BITGET_V1_TICKER_PATH", "/api/mix/market/ticker")
+V1_PLACE_ORDER_PATH  = os.getenv("BITGET_V1_PLACE_ORDER_PATH", "/api/mix/v1/order/placeOrder")
+V1_POSITIONS_PATH    = os.getenv("BITGET_V1_POSITIONS_PATH", "/api/mix/v1/position/allPosition")
+
+V2_PRODUCT_TYPE      = os.getenv("BITGET_V2_PRODUCT_TYPE", "USDT-FUTURES")  # USDT-FUTURES / COIN-FUTURES / USDC-FUTURES
+V2_PRODUCT_TYPE_ALTS = os.getenv("BITGET_V2_PRODUCT_TYPE_ALTS", "COIN-FUTURES,USDC-FUTURES")
+MARGIN_COIN          = os.getenv("BITGET_MARGIN_COIN", "USDT")
+
+STRICT_TICKER        = os.getenv("STRICT_TICKER", "0") == "1"
+ALLOW_DEPTH_FALLBACK = os.getenv("ALLOW_DEPTH_FALLBACK", "1") == "1"
+TICKER_TTL           = int(os.getenv("TICKER_TTL", "3"))
+
+# 심볼 alias
+try:
+    SYMBOL_ALIASES = json.loads(os.getenv("SYMBOL_ALIASES_JSON", "") or "{}")
+except Exception:
+    SYMBOL_ALIASES = {}
+
+TRACE = os.getenv("TRACE_LOG", "0") == "1"
+
+# 유지보수 에러코드
+MAINTENANCE_ERRORS = {"45001", "40725", "40808", "40015"}
+
+# ────────────────────────────────────────────────────────
+# HTTP 세션
+# ────────────────────────────────────────────────────────
 SESSION = requests.Session()
-RETRY   = Retry(total=3, backoff_factor=0.3, status_forcelist=(429, 500, 502, 503, 504))
-ADAPTER = HTTPAdapter(max_retries=RETRY, pool_connections=50, pool_maxsize=50)
-SESSION.mount("https://", ADAPTER)
-SESSION.mount("http://", ADAPTER)
-SESSION.headers.update({"Content-Type": "application/json"})
+_retry = Retry(
+    total=5, read=5, connect=5,
+    backoff_factor=0.5,
+    status_forcelist=[429, 500, 502, 503, 504],
+    allowed_methods={"GET","POST"},
+    raise_on_status=False,
+)
+_adapter = HTTPAdapter(max_retries=_retry, pool_connections=50, pool_maxsize=100)
+SESSION.mount("https://", _adapter)
+SESSION.mount("http://", _adapter)
+SESSION.headers.update({"User-Agent":"auto-trader/1.0","Connection":"keep-alive"})
+DEFAULT_TIMEOUT = 12
 
-def _ts_ms() -> str:
-    return str(int(time.time() * 1000))
+def _log(msg: str):
+    if TRACE: print(msg, flush=True)
 
-def _sign_v2(ts: str, method: str, path: str, query: str, body: str) -> str:
-    msg = f"{ts}{method.upper()}{path}{query}{body}"
-    return hmac.new(API_SEC.encode(), msg.encode(), hashlib.sha256).hexdigest()
+def _ts_ms() -> str: return str(int(time.time()*1000))
 
-def _auth_headers_v2(ts: str, sign: str) -> Dict[str, str]:
+def _sign(ts: str, method: str, path: str, query: str, body: str) -> str:
+    prehash = f"{ts}{method}{path}{query}{body}"
+    mac = hmac.new(API_SEC.encode(), prehash.encode(), hashlib.sha256).digest()
+    return base64.b64encode(mac).decode()
+
+def _headers(ts: str, sign: str) -> Dict[str,str]:
     return {
         "ACCESS-KEY": API_KEY,
         "ACCESS-SIGN": sign,
         "ACCESS-TIMESTAMP": ts,
         "ACCESS-PASSPHRASE": API_PASS,
         "Content-Type": "application/json",
+        "Locale":"en-US",
     }
 
-def convert_symbol(symbol: str) -> str:
-    s = (symbol or "").strip().upper()
-    if s.endswith("_UMCBL") or s.endswith("_UMCBL"):
-        s = s.replace("_UMCBL", "").replace("_UMCBL", "")
-    return s
-
-def round_down_step(value: float, step: float) -> float:
-    if step <= 0:
-        return value
-    return math.floor(value / step) * step
-
-def _request_json(method: str, path: str, params: Optional[Dict]=None, body: Optional[Dict]=None) -> Dict:
-    url = BASE_URL + path
-    params = params or {}
-    body   = body or {}
-    q = ""
-    if params:
-        q = "?" + urlencode(params)
-    ts = _ts_ms()
-    payload = json.dumps(body, separators=(",", ":")) if body else ""
-    sign = _sign_v2(ts, method, path, q, payload)
-    headers = _auth_headers_v2(ts, sign)
-    resp = SESSION.request(method.upper(), url + q, data=payload, headers=headers, timeout=10)
-    if resp.status_code >= 400:
-        return {"ok": False, "status": resp.status_code, "url": url+q, "body": resp.text}
+# ── 유지보수 백오프 래퍼 ───────────────────────────────
+def _is_maintenance(js_or_text) -> bool:
     try:
-        j = resp.json()
+        js = js_or_text if isinstance(js_or_text, dict) else json.loads(js_or_text)
+        code = str(js.get("code",""))
+        return code in MAINTENANCE_ERRORS
     except Exception:
-        return {"ok": False, "status": resp.status_code, "url": url+q, "body": resp.text}
-    return {"ok": True, "json": j, "url": url+q}
+        return False
 
-# ─────────────────────────────────────────────────────────
-# 시세/포지션
-# ─────────────────────────────────────────────────────────
-def get_last_price(symbol: str) -> Optional[float]:
-    s = convert_symbol(symbol)
-    # v2 ticker
-    r = _request_json("GET", "/api/v2/mix/market/ticker", params={"symbol": f"{s}_UMCBL"})
-    if not r.get("ok"):
-        return None
-    try:
-        data = r["json"]["data"]
-        # 일부 심볼은 last(또는 close)가 null일 수 있음 → bestBid/Ask로 보정
-        last = data.get("last") or data.get("close")
-        if last in (None, "", "null"):
-            bid = data.get("bestBid") or "0"
-            ask = data.get("bestAsk") or "0"
-            px = (float(bid) + float(ask)) / 2.0 if (bid and ask) else float(bid or ask or 0)
-            return px if px > 0 else None
-        return float(last)
-    except Exception:
-        return None
+def _with_retry_maintenance(callable_fn, *args, **kwargs):
+    max_try = 3
+    for i in range(max_try):
+        res = callable_fn(*args, **kwargs)
+        # Response 객체인 경우
+        if hasattr(res, "status_code"):
+            if res.status_code == 200: return res
+            if _is_maintenance(getattr(res,"text","") or "{}"):
+                time.sleep(3 + i*2); continue
+            return res
+        # dict(JSON)인 경우
+        if isinstance(res, dict) and _is_maintenance(res):
+            time.sleep(3 + i*2); continue
+        return res
+    return res
 
-def get_open_positions() -> List[Dict]:
-    if USE_V2:
-        r = _request_json("GET", "/api/v2/mix/position/all-position", params={"productType": PRODUCT_TYPE})
-        if not r.get("ok"):
-            return []
-        try:
-            arr = r["json"]["data"] or []
-            out = []
-            for row in arr:
-                sym = row.get("symbol", "")
-                side = row.get("holdSide", "").lower()
-                total = float(row.get("total", 0) or row.get("available", 0) or 0)
-                aop   = float(row.get("averageOpenPrice", 0) or 0)
-                out.append({"symbol": sym.replace("_UMCBL",""), "side": side, "total": total, "averageOpenPrice": aop})
-            return out
-        except Exception:
-            return []
-    # v1 fallback
-    r = _request_json("GET", "/api/mix/v1/position/allPosition", params={"productType": "umcbl"})
-    if not r.get("ok"):
-        return []
-    try:
-        arr = r["json"]["data"] or []
-        out = []
-        for row in arr:
-            sym = row.get("symbol", "")
-            side = row.get("holdSide", "").lower()
-            total = float(row.get("total", 0) or row.get("available", 0) or 0)
-            aop   = float(row.get("averageOpenPrice", 0) or 0)
-            out.append({"symbol": sym.replace("_UMCBL",""), "side": side, "total": total, "averageOpenPrice": aop})
-        return out
-    except Exception:
-        return []
-
-# ─────────────────────────────────────────────────────────
-# 주문
-# ─────────────────────────────────────────────────────────
-def get_symbol_spec(symbol: str) -> Dict:
-    # 최소 수량/스텝 조회(간단화; 필요 시 캐시)
-    s = convert_symbol(symbol)
-    r = _request_json("GET", "/api/v2/mix/market/contracts", params={"productType": PRODUCT_TYPE})
-    if r.get("ok"):
-        for it in (r["json"]["data"] or []):
-            if (it.get("symbol","") or "").upper().startswith(s+"_UMCBL"):
-                try:
-                    return {
-                        "sizeStep": float(it.get("sizeTick", 0.001) or 0.001),
-                        "priceStep": float(it.get("priceEndStep", 0.01) or 0.01),
-                        "minSz": float(it.get("minSz", 0.001) or 0.001),
-                    }
-                except Exception:
-                    pass
-    return {"sizeStep": 0.001, "priceStep": 0.01, "minSz": 0.001}
-
-def place_market_order(symbol: str, usdt_amount: float, side: str, leverage: float, reduce_only: bool=False) -> Tuple[bool, Dict]:
-    s = convert_symbol(symbol)
-    side = side.lower()
-    # 수량 계산 — 단순 시장가 추정
-    last = get_last_price(s) or 0.0
-    if last <= 0:
-        return (False, {"err": "no_ticker"})
-    spec = get_symbol_spec(s)
-    sz = float(usdt_amount) / float(last)
-    sz = max(round_down_step(sz, spec.get("sizeStep", 0.001)), spec.get("minSz", 0.001))
-    body = {
-        "symbol": f"{s}_UMCBL",
-        "marginCoin": "USDT",
-        "size": str(sz),
-        "side": "open_short" if side=="short" else "open_long",
-        "orderType": "market",
-        "force": "gtc",
-        "reduceOnly": reduce_only,
-        "leverage": str(int(leverage)),
-    }
-    r = _request_json("POST", "/api/v2/mix/order/place-order", body=body)
-    if not r.get("ok"):
-        return (False, r)
-    try:
-        code = r["json"].get("code")
-        if str(code) not in ("00000", "0"):
-            return (False, r["json"])
-        return (True, r["json"])
-    except Exception:
-        return (False, r)
-
-def place_reduce_by_size(symbol: str, size: float, side: str) -> Dict:
-    s = convert_symbol(symbol)
-    side = side.lower()
-    body = {
-        "symbol": f"{s}_UMCBL",
-        "marginCoin": "USDT",
-        "size": str(float(size)),
-        "side": "close_short" if side=="short" else "close_long",
-        "orderType": "market",
-        "force": "gtc",
-        "reduceOnly": True,
-    }
-    r = _request_json("POST", "/api/v2/mix/order/place-order", body=body)
+# ── HTTP 래퍼 ─────────────────────────────────────────
+def _http_get_raw(path: str, params: Dict[str,Any], need_auth: bool=False, timeout: float=DEFAULT_TIMEOUT):
+    url = f"{BASE_URL}{path}"
+    if params: url = f"{url}?{urlencode(params)}"
+    if need_auth:
+        ts = _ts_ms()
+        sign = _sign(ts, "GET", path, f"?{urlencode(params)}", "")
+        headers = _headers(ts, sign)
+        r = SESSION.get(url, headers=headers, timeout=timeout)
+    else:
+        r = SESSION.get(url, timeout=timeout)
     return r
 
-# ─────────────────────────────────────────────────────────
-# 기타
-# ─────────────────────────────────────────────────────────
+def _http_get(path: str, params: Dict[str,Any], need_auth: bool=False, timeout: float=DEFAULT_TIMEOUT) -> Dict[str,Any]:
+    r = _http_get_raw(path, params, need_auth, timeout)
+    r.raise_for_status()
+    return r.json()
+
+def _http_post(path: str, body: Dict[str,Any], need_auth: bool=True, timeout: float=DEFAULT_TIMEOUT) -> Dict[str,Any]:
+    url = f"{BASE_URL}{path}"
+    data = json.dumps(body, separators=(",",":"))
+    if need_auth:
+        ts = _ts_ms()
+        sign = _sign(ts, "POST", path, "", data)
+        headers = _headers(ts, sign)
+    else:
+        headers = {"Content-Type":"application/json"}
+    r = SESSION.post(url, data=data, headers=headers, timeout=timeout)
+    r.raise_for_status()
+    return r.json()
+
+# ────────────────────────────────────────────────────────
+# 심볼/스펙
+# ────────────────────────────────────────────────────────
+def convert_symbol(sym: str) -> str:
+    s = (sym or "").upper().strip()
+    s = SYMBOL_ALIASES.get(s, s)
+    for suf in ("_UMCBL","-UMCBL","UMCBL","_CMCBL","-CMCBL","CMCBL"):
+        if s.endswith(suf): s = s.replace(suf,"")
+    return s
+
+def _v2_product_types() -> List[str]:
+    out, seen = [], set()
+    for x in [V2_PRODUCT_TYPE] + [y.strip() for y in (V2_PRODUCT_TYPE_ALTS or "").split(",") if y.strip()]:
+        if x and x not in seen: seen.add(x); out.append(x)
+    return out or ["USDT-FUTURES"]
+
+_spec_cache: Dict[str,Dict[str,Any]] = {}
+def get_symbol_spec(symbol: str) -> Dict[str,Any]:
+    sym = convert_symbol(symbol)
+    sp = _spec_cache.get(sym)
+    if sp: return sp
+    sp = {"sizeStep":0.001, "priceStep":0.01}  # 필요시 거래소 메타 보강 가능
+    _spec_cache[sym] = sp
+    return sp
+
+def round_down_step(v: float, step: float) -> float:
+    if step <= 0: return v
+    return math.floor(float(v)/float(step)) * float(step)
+
+# ── 상장 심볼 캐시(옵션) ───────────────────────────────
+CONTRACTS_PATH = os.getenv("BITGET_V2_CONTRACTS_PATH", "/api/v2/mix/market/contracts")
+_contract_cache: Dict[str,set[str]] = {}
+_contract_cache_ts = 0
+
+def refresh_contracts_cache(ttl_sec: int = 600):
+    global _contract_cache_ts
+    now = time.time()
+    if (now - _contract_cache_ts) < ttl_sec: return
+    newmap: Dict[str,set[str]] = {}
+    for pt in _v2_product_types():
+        try:
+            js = _http_get(CONTRACTS_PATH, {"productType": pt}, False)
+            bag = {convert_symbol(row.get("symbol","")) for row in (js.get("data") or [])}
+            if bag: newmap[pt] = bag
+        except Exception as e:
+            _log(f"contracts fetch fail {pt}: {e}")
+    if newmap:
+        _contract_cache.clear(); _contract_cache.update(newmap); _contract_cache_ts = now
+
+def is_symbol_listed(symbol: str) -> bool:
+    refresh_contracts_cache()
+    s = convert_symbol(symbol)
+    for bag in _contract_cache.values():
+        if s in bag: return True
+    return False
+
+# ── Ticker Fallback 체인 ───────────────────────────────
+_ticker_cache: Dict[str, Tuple[float,float]] = {}
+
+def _cache_get(sym: str) -> Optional[float]:
+    row = _ticker_cache.get(sym); 
+    if not row: return None
+    ts, px = row
+    return px if (time.time() - ts) <= TICKER_TTL else None
+
+def _cache_set(sym: str, px: float):
+    _ticker_cache[sym] = (time.time(), float(px))
+
+def _parse_px(js: Dict[str,Any]) -> Optional[float]:
+    d = js.get("data") if isinstance(js, dict) else None
+    if isinstance(d, dict):
+        for k in ("last","close","price"):
+            v = d.get(k)
+            if v not in (None,"","null"):
+                try:
+                    px = float(v)
+                    if px > 0: return px
+                except Exception: pass
+        bid, ask = d.get("bestBid"), d.get("bestAsk")
+        try:
+            if bid not in (None,"") and ask not in (None,""):
+                b, a = float(bid), float(ask)
+                if b>0 and a>0: return (a+b)/2.0
+        except Exception: pass
+    return None
+
+def _get_ticker_v2(sym: str, product: str) -> Optional[float]:
+    try:
+        js = _with_retry_maintenance(_http_get, V2_TICKER_PATH, {"productType":product,"symbol":sym}, False)
+        return _parse_px(js)
+    except Exception as e:
+        _log(f"ticker v2 fail {sym}/{product}: {e}")
+        return None
+
+def _get_mark_v2(sym: str, product: str) -> Optional[float]:
+    try:
+        js = _with_retry_maintenance(_http_get, V2_MARK_PATH, {"productType":product,"symbol":sym}, False)
+        d = js.get("data") or {}
+        v = d.get("markPrice") or d.get("price")
+        if v not in (None,"","null"): return float(v)
+    except Exception as e:
+        _log(f"mark v2 fail {sym}/{product}: {e}")
+    return None
+
+def _get_depth_mid_v2(sym: str, product: str) -> Optional[float]:
+    try:
+        js = _with_retry_maintenance(_http_get, V2_DEPTH_PATH, {"productType":product,"symbol":sym}, False)
+        d = js.get("data") or {}
+        best_ask = d.get("bestAsk") or (d.get("asks") or [{}])[0].get("price")
+        best_bid = d.get("bestBid") or (d.get("bids") or [{}])[0].get("price")
+        if best_ask and best_bid:
+            return (float(best_ask)+float(best_bid))/2.0
+    except Exception as e:
+        _log(f"depth v2 fail {sym}/{product}: {e}")
+    return None
+
+def _get_candle_close_v2(sym: str, product: str) -> Optional[float]:
+    try:
+        js = _http_get(V2_CANDLES_PATH, {"symbol":sym,"granularity":CANDLE_GRANULARITY,"limit":2}, False)
+        data = js.get("data") or []
+        if not data: return None
+        row = data[-2] if len(data)>=2 else data[-1]
+        close = (row[4] if isinstance(row,(list,tuple)) and len(row)>=5 else (row.get("close") if isinstance(row,dict) else None))
+        if close not in (None,"","null"): return float(close)
+    except Exception as e:
+        _log(f"candles v2 fail {sym}/{product}: {e}")
+    return None
+
+def _get_index_candle_close_v2(sym: str, product: str) -> Optional[float]:
+    try:
+        js = _http_get(V2_INDEX_CANDLES_PATH, {"symbol":sym,"granularity":CANDLE_GRANULARITY,"limit":2}, False)
+        data = js.get("data") or []
+        if not data: return None
+        row = data[-2] if len(data)>=2 else data[-1]
+        close = (row[4] if isinstance(row,(list,tuple)) and len(row)>=5 else (row.get("close") if isinstance(row,dict) else None))
+        if close not in (None,"","null"): return float(close)
+    except Exception as e:
+        _log(f"index-candles v2 fail {sym}/{product}: {e}")
+    return None
+
+def _get_ticker_v1(sym: str) -> Optional[float]:
+    try:
+        js = _with_retry_maintenance(_http_get, V1_TICKER_PATH, {"symbol":sym,"productType":"umcbl"}, False)
+        return _parse_px(js)
+    except Exception as e:
+        _log(f"ticker v1 fail {sym}: {e}")
+        return None
+
+def get_last_price(symbol: str) -> Optional[float]:
+    symbol = convert_symbol(symbol)
+    if not is_symbol_listed(symbol):
+        _log(f"⚠️ {symbol} not in contracts cache (목록 캐시 기준)")
+
+    cached = _cache_get(symbol)
+    if cached: return cached
+
+    if USE_V2:
+        s = symbol
+        for product in _v2_product_types():
+            px = _get_ticker_v2(s, product)
+            if px: _cache_set(symbol, px); return px
+            px = _get_mark_v2(s, product)
+            if px: _cache_set(symbol, px); return px
+            if ALLOW_DEPTH_FALLBACK:
+                px = _get_depth_mid_v2(s, product)
+                if px: _cache_set(symbol, px); return px
+            px = _get_candle_close_v2(s, product)
+            if px: _cache_set(symbol, px); return px
+            px = _get_index_candle_close_v2(s, product)
+            if px: _cache_set(symbol, px); return px
+
+        if not STRICT_TICKER:
+            px = _get_ticker_v1(symbol)
+            if px: _cache_set(symbol, px); return px
+        _log(f"❌ Ticker 실패(최종): {symbol} v2=True"); return None
+
+    px = _get_ticker_v1(symbol)
+    if px: _cache_set(symbol, px); return px
+    _log(f"❌ Ticker 실패(최종): {symbol} v2=False"); return None
+
+# ── 주문/감축 ──────────────────────────────────────────
+def _api_side(side: str, reduce_only: bool) -> str:
+    s = (side or "").lower()
+    if s in ("buy","long"):  return "close_short" if reduce_only else "open_long"
+    else:                    return "close_long" if reduce_only else "open_short"
+
+def _order_size_from_usdt(symbol: str, usdt_amount: float) -> float:
+    last = get_last_price(symbol)
+    if not last or last<=0: return 0.0
+    step = float(get_symbol_spec(symbol).get("sizeStep",0.001))
+    size = float(usdt_amount) / float(last)
+    return round_down_step(size, step)
+
+def place_market_order(symbol: str, usdt_amount: float, side: str, leverage: float, reduce_only: bool=False) -> Dict[str,Any]:
+    sym  = convert_symbol(symbol)
+    size = _order_size_from_usdt(sym, float(usdt_amount))
+    if size <= 0: raise RuntimeError(f"size_calc_fail {sym} amt={usdt_amount}")
+
+    body = {
+        "symbol": sym,
+        "marginCoin": MARGIN_COIN,
+        "side": _api_side(side, reduce_only),
+        "orderType": "market",
+        "timeInForceValue": "normal",
+        "size": str(size),
+        "price": "",
+        "force": "gtc",
+        "reduceOnly": reduce_only,
+        "marginMode": "cross",
+        "leverage": str(leverage),
+    }
+    return _with_retry_maintenance(_http_post, V2_PLACE_ORDER_PATH, body, True)
+
+# (선택) 사이즈로 감축 주문
+def place_reduce_by_size(symbol: str, size: float, side: str) -> Dict[str,Any]:
+    sym = convert_symbol(symbol)
+    body = {
+        "symbol": sym,
+        "marginCoin": MARGIN_COIN,
+        "side": _api_side(side, True),
+        "orderType": "market",
+        "timeInForceValue": "normal",
+        "size": str(size),
+        "price": "",
+        "reduceOnly": True,
+        "marginMode": "cross",
+    }
+    return _with_retry_maintenance(_http_post, V2_PLACE_ORDER_PATH, body, True)
+
+# ── 포지션 조회 ────────────────────────────────────────
+def _parse_positions_v2(js: Dict[str,Any]) -> List[Dict[str,Any]]:
+    data = js.get("data") or []
+    out: List[Dict[str,Any]] = []
+    for row in data:
+        try:
+            sym  = convert_symbol(row.get("symbol",""))
+            side = (row.get("holdSide") or "").lower()
+            size = float(row.get("total",0) or 0)
+            entry= float(row.get("averageOpenPrice",0) or 0)
+            if size>0 and side in ("long","short"):
+                out.append({"symbol":sym,"side":side,"size":size,"entry_price":entry})
+        except Exception: pass
+    return out
+
+def _parse_positions_v1(js: Dict[str,Any]) -> List[Dict[str,Any]]:
+    data = js.get("data") or []
+    out: List[Dict[str,Any]] = []
+    for row in data:
+        try:
+            sym = convert_symbol(row.get("symbol",""))
+            for pos in row.get("positions") or []:
+                side = (pos.get("holdSide") or "").lower()
+                size = float(pos.get("total",0) or 0)
+                entry= float(pos.get("averageOpenPrice",0) or 0)
+                if size>0 and side in ("long","short"):
+                    out.append({"symbol":sym,"side":side,"size":size,"entry_price":entry})
+        except Exception: pass
+    return out
+
+def _get_positions_v2(params) -> Optional[Dict[str,Any]]:
+    # 1차: 최신 경로
+    res = _with_retry_maintenance(_http_get_raw, V2_POSITIONS_PATH, params, True)
+    if res.status_code == 200:
+        return res.json()
+    if res.status_code in (400,404,405):
+        # 2차: 구경로 폴백
+        res2 = _with_retry_maintenance(_http_get_raw, V2_POSITIONS_PATH_FALLBACK, params, True)
+        if res2.status_code == 200:
+            return res2.json()
+        _log(f"positions v2 fallback {res2.status_code} url: {BASE_URL}{V2_POSITIONS_PATH_FALLBACK}?{urlencode(params)} body: {res2.text}")
+    else:
+        _log(f"positions v2 {res.status_code} url: {BASE_URL}{V2_POSITIONS_PATH}?{urlencode(params)} body: {res.text}")
+    return None
+
+def get_open_positions() -> List[Dict[str,Any]]:
+    if USE_V2:
+        for product in _v2_product_types():
+            for params in ({"productType":product}, {"productType":product, "marginCoin":MARGIN_COIN}):
+                try:
+                    js = _get_positions_v2(params)
+                    if js: return _parse_positions_v2(js)
+                except Exception as e:
+                    _log(f"positions v2 error: {e} url: {BASE_URL}{V2_POSITIONS_PATH}?{urlencode(params)}")
+        # (옵션) 단일 심볼 폴백
+        hint = (os.getenv("POSITION_SYMBOLS_HINT") or "").strip()
+        if hint:
+            out: List[Dict[str,Any]] = []
+            symbols = [convert_symbol(x) for x in hint.split(",") if x.strip()]
+            for sym in symbols:
+                for product in _v2_product_types():
+                    try:
+                        js = _http_get("/api/v2/mix/position/single-position",
+                                       {"productType":product,"symbol":sym,"marginCoin":MARGIN_COIN}, True)
+                        d = js.get("data") or {}
+                        side = (d.get("holdSide") or "").lower()
+                        size = float(d.get("total",0) or 0)
+                        entry= float(d.get("averageOpenPrice",0) or 0)
+                        if size>0 and side in ("long","short"):
+                            out.append({"symbol":sym,"side":side,"size":size,"entry_price":entry})
+                    except Exception: pass
+            if out: return out
+
+    # v1 폴백
+    for params in ({"productType":"umcbl"}, {"productType":"umcbl","marginCoin":MARGIN_COIN}):
+        try:
+            res = _with_retry_maintenance(_http_get_raw, V1_POSITIONS_PATH, params, True)
+            if res.status_code == 200:
+                return _parse_positions_v1(res.json())
+            _log(f"positions v1 {res.status_code} url: {BASE_URL}{V1_POSITIONS_PATH}?{urlencode(params)} body: {res.text}")
+        except Exception as e:
+            _log(f"positions v1 error: {e}")
+    return []
