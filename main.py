@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-import os, time, json, hashlib, threading, queue, re
+import os, time, json, hashlib, threading, queue, re, traceback  # [PATCH] traceback 추가
 from collections import deque
 from typing import Dict, Any, Optional
 from fastapi import FastAPI, Request
@@ -174,7 +174,7 @@ def _unwrap_nested_json(d: Dict[str, Any]) -> Dict[str, Any]:
     return d
 
 # ─────────────────────────────────────────────────────────────
-# 리스트/기타 타입 보정 헬퍼
+# [PATCH] 리스트/기타 타입 보정 헬퍼 (끝까지 dict로 강제)
 def _coerce_to_dict(x: Any) -> Optional[Dict[str, Any]]:
     """
     - dict이면 그대로
@@ -211,7 +211,7 @@ async def _parse_any(req: Request) -> Dict[str, Any]:
     # 1) application/json
     try:
         d = await req.json()
-        dd = _coerce_to_dict(d)
+        dd = _coerce_to_dict(d)  # [PATCH]
         if dd is not None:
             return _unwrap_nested_json(dd)
     except Exception:
@@ -222,14 +222,14 @@ async def _parse_any(req: Request) -> Dict[str, Any]:
         if raw:
             try:
                 obj = json.loads(raw)
-                dd = _coerce_to_dict(obj)
+                dd = _coerce_to_dict(obj)  # [PATCH]
                 if dd is not None:
                     return _unwrap_nested_json(dd)
             except Exception:
                 fixed = raw.replace("'", '"')
                 try:
                     obj = json.loads(fixed)
-                    dd = _coerce_to_dict(obj)
+                    dd = _coerce_to_dict(obj)  # [PATCH]
                     if dd is not None:
                         return _unwrap_nested_json(dd)
                 except Exception:
@@ -245,7 +245,7 @@ async def _parse_any(req: Request) -> Dict[str, Any]:
         if payload:
             try:
                 obj = json.loads(payload)
-                dd = _coerce_to_dict(obj)
+                dd = _coerce_to_dict(obj)  # [PATCH]
                 if dd is not None:
                     return _unwrap_nested_json(dd)
             except Exception:
@@ -272,7 +272,7 @@ async def _parse_any(req: Request) -> Dict[str, Any]:
 # 시그널 라우터
 # ─────────────────────────────────────────────────────────────
 def _handle_signal(data: Any):
-    # 방어: dict로 보정, 실패 시 드롭
+    # [PATCH] 방어: dict로 보정, 실패 시 드롭
     if not isinstance(data, dict):
         dd = _coerce_to_dict(data)
         if dd is None:
@@ -280,7 +280,7 @@ def _handle_signal(data: Any):
             return
         data = dd
 
-    # type 키 fallback + 리스트 방어
+    # [PATCH] 일부 케이스에서 type이 리스트로 오는 것 방어
     if isinstance(data.get("type"), (list, tuple)):
         try:
             data["type"] = (data["type"][0] or "")
@@ -294,7 +294,7 @@ def _handle_signal(data: Any):
         or ""
     )
 
-    # 심볼/사이드 추출
+    # 심볼/사이드 추출(다양한 키 대응)
     symbol  = _pick_symbol(data)
     side    = _infer_side(data.get("side") or data.get("direction"), "long")
 
@@ -306,7 +306,7 @@ def _handle_signal(data: Any):
 
     t = _norm_type(typ_raw)
 
-    # 비즈니스 디듀프
+    # 비즈니스 디듀프(짧은 시간 동일액션 방지)
     now = time.time()
     bizkey = f"{t}:{symbol}:{side}"
     last = _BIZDEDUP.get(bizkey, 0.0)
@@ -346,22 +346,21 @@ def _worker_loop(idx: int):
     while True:
         try:
             data = _task_q.get()
-            if data is None: 
+            if data is None:
                 continue
+
+            # [PATCH] 큐에서 list/str 등이 바로 들어오는 경우 방어
             if isinstance(data, (str, bytes)):
                 try:
                     obj = json.loads(data)
-                    if isinstance(obj, dict):
-                        data = obj
-                    else:
-                        data = _loose_kv_to_dict(data) or {}
+                    data = obj if isinstance(obj, dict) else (_loose_kv_to_dict(data) or data)
                 except Exception:
-                    data = _loose_kv_to_dict(data) or {}
-            # 큐에서 리스트가 바로 들어오는 경우 방어
+                    data = _loose_kv_to_dict(data) or data
+
             if not isinstance(data, dict):
                 dd = _coerce_to_dict(data)
                 if dd is None:
-                    send_telegram(f"[worker-{idx}] drop: not a dict payload")
+                    send_telegram(f"[worker-{idx}] drop (not dict): {str(data)[:300]}")
                     continue
                 data = dd
 
@@ -370,8 +369,15 @@ def _worker_loop(idx: int):
                 continue
 
             _handle_signal(data)
+
         except Exception as e:
-            print(f"[worker-{idx}] error:", e)
+            # [PATCH] 어디서 터지는지 추적 위해 payload 타입/프리뷰 같이 로깅
+            try:
+                preview = str(data)
+            except Exception:
+                preview = "<unrepr>"
+            print(f"[worker-{idx}] error: {e} | type={type(data).__name__} | payload={preview[:500]}")
+            print(traceback.format_exc())
         finally:
             try: _task_q.task_done()
             except: pass
@@ -383,7 +389,7 @@ async def _ingest(req: Request):
     except Exception as e:
         return {"ok": False, "error": f"bad_payload: {e}"}
 
-    # 최종 보정
+    # [PATCH] 최종 보정: dict 아니면 드롭
     if not isinstance(data, dict):
         dd = _coerce_to_dict(data)
         if dd is None:
@@ -413,7 +419,7 @@ def root():
 async def signal(req: Request): 
     return await _ingest(req)
 
-# 테스트 편의: GET도 허용
+# 테스트 편의: GET도 허용 (예: /signal?type=entry&symbol=BTCUSDT&side=short&amount=100)
 @app.get("/signal")
 async def signal_get(req: Request):
     qp = dict(req.query_params)
@@ -426,7 +432,7 @@ async def signal_get(req: Request):
     _DEDUP[dk] = now
     INGRESS_LOG.append({"ts": now, "ip": (req.client.host if req and req.client else "?"), "data": qp})
     try:
-        _task_q.put_nowait(qp)
+        _task_q.put_nowait(qp)  # 쿼리는 dict라 그대로 큐잉
     except queue.Full:
         send_telegram("⚠️ queue full → drop signal: " + json.dumps(qp))
         return {"ok": False, "queued": False, "reason": "queue_full"}
