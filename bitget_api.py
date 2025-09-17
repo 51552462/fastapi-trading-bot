@@ -66,12 +66,12 @@ V2_POSITIONS_PATH    = os.getenv("BITGET_V2_POSITIONS_PATH", "/api/v2/mix/positi
 # 구 문서/계정 호환 폴백
 V2_POSITIONS_PATH_FALLBACK = "/api/v2/mix/position/all-position"
 
-# ⬇ v1 경로들(정확 경로로 보정) + 보조 경로/상수 추가
+# v1 경로들(정확 경로)
 V1_TICKER_PATH       = os.getenv("BITGET_V1_TICKER_PATH", "/api/mix/v1/market/ticker")
 V1_MARK_PATH         = os.getenv("BITGET_V1_MARK_PATH",   "/api/mix/v1/market/mark-price")
 V1_DEPTH_PATH        = os.getenv("BITGET_V1_DEPTH_PATH",  "/api/mix/v1/market/depth")
 V1_CANDLES_PATH      = os.getenv("BITGET_V1_CANDLES_PATH","/api/mix/v1/market/candles")
-# v2 mark 대체(목록형 반환)
+# [PATCH] v2 mark 대체(목록형 data)
 V2_MARK_PATH_ALT     = "/api/v2/mix/market/mark-prices"
 
 V1_PLACE_ORDER_PATH  = os.getenv("BITGET_V1_PLACE_ORDER_PATH", "/api/mix/v1/order/placeOrder")
@@ -260,7 +260,7 @@ def _cache_set(sym: str, px: float):
 def _parse_px(js: Dict[str,Any]) -> Optional[float]:
     d = js.get("data") if isinstance(js, dict) else None
     if isinstance(d, dict):
-        # ⬇ v2 단일 티커의 lastPr 키까지 파싱
+        # [PATCH] v2 단일 티커의 lastPr 키까지 파싱
         for k in ("lastPr", "last", "close", "price"):
             v = d.get(k)
             if v not in (None,"","null"):
@@ -278,6 +278,11 @@ def _parse_px(js: Dict[str,Any]) -> Optional[float]:
 
 def _get_ticker_v2(sym: str, product: str) -> Optional[float]:
     try:
+        # [PATCH] 일부 계정에서 productType을 붙이면 404 → ① symbol만 먼저
+        js = _with_retry_maintenance(_http_get, V2_TICKER_PATH, {"symbol":sym}, False)
+        px = _parse_px(js)
+        if px: return px
+        # ② 그래도 실패하면 productType 함께 시도
         js = _with_retry_maintenance(_http_get, V2_TICKER_PATH, {"productType":product,"symbol":sym}, False)
         return _parse_px(js)
     except Exception as e:
@@ -286,28 +291,31 @@ def _get_ticker_v2(sym: str, product: str) -> Optional[float]:
 
 def _get_mark_v2(sym: str, product: str) -> Optional[float]:
     try:
-        js = _with_retry_maintenance(_http_get, V2_MARK_PATH, {"productType":product,"symbol":sym}, False)
+        # [PATCH] ① symbol만
+        js = _with_retry_maintenance(_http_get, V2_MARK_PATH, {"symbol":sym}, False)
         d = js.get("data") or {}
         v = d.get("markPrice") or d.get("price")
         if v not in (None,"","null"): return float(v)
     except Exception as e:
         _log(f"mark v2 fail {sym}/{product}: {e}")
-    # alt endpoint (목록형 data)
+    # [PATCH] ② 대체 경로: 목록형, productType만 허용
     try:
-        js = _with_retry_maintenance(_http_get, V2_MARK_PATH_ALT, {"productType":product,"symbol":sym}, False)
+        js = _with_retry_maintenance(_http_get, V2_MARK_PATH_ALT, {"productType":product}, False)
         d = js.get("data") or []
         if isinstance(d, list) and d:
-            v = d[0].get("markPrice") or d[0].get("price")
-            if v not in (None,"","null"): return float(v)
+            for row in d:
+                if str(row.get("symbol","")).upper() == sym.upper():
+                    v = row.get("markPrice") or row.get("price")
+                    if v not in (None,"","null"): return float(v)
     except Exception as e:
         _log(f"mark v2 alt fail {sym}/{product}: {e}")
     return None
 
 def _get_depth_mid_v2(sym: str, product: str) -> Optional[float]:
     try:
-        js = _with_retry_maintenance(_http_get, V2_DEPTH_PATH, {"productType":product,"symbol":sym}, False)
+        # [PATCH] ① symbol만
+        js = _with_retry_maintenance(_http_get, V2_DEPTH_PATH, {"symbol":sym}, False)
         d = js.get("data") or {}
-        # data가 list로 오는 케이스 대응
         if isinstance(d, list) and d:
             d = d[0] if isinstance(d[0], dict) else {}
         if isinstance(d, dict):
@@ -322,6 +330,13 @@ def _get_depth_mid_v2(sym: str, product: str) -> Optional[float]:
                     best_bid = bids[0][0] if isinstance(bids[0], (list,tuple)) else bids[0].get("price")
             if best_ask and best_bid:
                 return (float(best_ask)+float(best_bid))/2.0
+        # ② productType 함께 시도
+        js = _with_retry_maintenance(_http_get, V2_DEPTH_PATH, {"productType":product,"symbol":sym}, False)
+        d = js.get("data") or {}
+        best_ask = d.get("bestAsk") or (d.get("asks") or [{}])[0].get("price")
+        best_bid = d.get("bestBid") or (d.get("bids") or [{}])[0].get("price")
+        if best_ask and best_bid:
+            return (float(best_ask)+float(best_bid))/2.0
     except Exception as e:
         _log(f"depth v2 fail {sym}/{product}: {e}")
     return None
@@ -352,13 +367,13 @@ def _get_index_candle_close_v2(sym: str, product: str) -> Optional[float]:
 
 def _get_ticker_v1(sym: str) -> Optional[float]:
     try:
-        js = _with_retry_maintenance(_http_get, V1_TICKER_PATH, {"symbol":f"{sym}_UMCBL"}, False)
+        js = _with_retry_maintenance(_http_get, V1_TICKER_PATH, {"symbol":f"{sym}_UMCBL"}, False)  # [PATCH] _UMCBL
         return _parse_px(js)
     except Exception as e:
         _log(f"ticker v1 fail {sym}: {e}")
         return None
 
-# ⬇ v1 폴백(마크/딥스/캔들) 추가
+# v1 폴백(마크/딥스/캔들)
 def _get_mark_v1(sym: str) -> Optional[float]:
     try:
         js = _with_retry_maintenance(_http_get, V1_MARK_PATH, {"symbol": f"{sym}_UMCBL"}, False)
@@ -451,7 +466,8 @@ def place_market_order(symbol: str, usdt_amount: float, side: str, leverage: flo
     size = _order_size_from_usdt(sym, float(usdt_amount))
     if size <= 0: raise RuntimeError(f"size_calc_fail {sym} amt={usdt_amount}")
 
-    body = {
+    # 기존 형태(네 로직 유지): side=open_long/open_short/close_long/close_short
+    body_v2_legacy = {
         "symbol": sym,
         "marginCoin": MARGIN_COIN,
         "side": _api_side(side, reduce_only),
@@ -464,7 +480,24 @@ def place_market_order(symbol: str, usdt_amount: float, side: str, leverage: flo
         "marginMode": "cross",
         "leverage": str(leverage),
     }
-    return _with_retry_maintenance(_http_post, V2_PLACE_ORDER_PATH, body, True)
+    try:
+        return _with_retry_maintenance(_http_post, V2_PLACE_ORDER_PATH, body_v2_legacy, True)
+    except Exception as e:
+        _log(f"place_order v2 legacy fail {sym}: {e}")
+
+    # [PATCH] 일부 계정은 v2 신규 스펙만 허용 → 보조 포맷으로 재시도
+    body_v2_new = {
+        "symbol": sym,
+        "marginCoin": MARGIN_COIN,
+        "size": str(size),
+        "side": ("buy" if str(side).lower() in ("buy","long") else "sell"),
+        "tradeSide": ("close" if reduce_only else "open"),
+        "orderType": "market",
+        "force": "gtc",
+        "marginMode": "cross",
+        "leverage": str(leverage),
+    }
+    return _with_retry_maintenance(_http_post, V2_PLACE_ORDER_PATH, body_v2_new, True)
 
 # (선택) 사이즈로 감축 주문
 def place_reduce_by_size(symbol: str, size: float, side: str) -> Dict[str,Any]:
