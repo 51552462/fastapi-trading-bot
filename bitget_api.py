@@ -24,9 +24,10 @@ ENV (필수★ / 권장◇):
 ◇ BITGET_V2_CANDLES_PATH=/api/v2/mix/market/candles
 ◇ BITGET_V2_INDEX_CANDLES_PATH=/api/v2/mix/market/index-candles
 ◇ BITGET_CANDLE_GRANULARITY=60
+
 ◇ BITGET_V2_PLACE_ORDER_PATH=/api/v2/mix/order/place-order
 ◇ BITGET_V2_POSITIONS_PATH=/api/v2/mix/position/get-all-position
-◇ BITGET_V1_TICKER_PATH=/api/mix/market/ticker
+◇ BITGET_V1_TICKER_PATH=/api/mix/v1/market/ticker
 ◇ BITGET_V1_PLACE_ORDER_PATH=/api/mix/v1/order/placeOrder
 ◇ BITGET_V1_POSITIONS_PATH=/api/mix/v1/position/allPosition
 ◇ POSITION_SYMBOLS_HINT="BTCUSDT,ETHUSDT,..."
@@ -65,7 +66,14 @@ V2_POSITIONS_PATH    = os.getenv("BITGET_V2_POSITIONS_PATH", "/api/v2/mix/positi
 # 구 문서/계정 호환 폴백
 V2_POSITIONS_PATH_FALLBACK = "/api/v2/mix/position/all-position"
 
-V1_TICKER_PATH       = os.getenv("BITGET_V1_TICKER_PATH", "/api/mix/market/ticker")
+# ⬇ v1 경로들(정확 경로로 보정) + 보조 경로/상수 추가
+V1_TICKER_PATH       = os.getenv("BITGET_V1_TICKER_PATH", "/api/mix/v1/market/ticker")
+V1_MARK_PATH         = os.getenv("BITGET_V1_MARK_PATH",   "/api/mix/v1/market/mark-price")
+V1_DEPTH_PATH        = os.getenv("BITGET_V1_DEPTH_PATH",  "/api/mix/v1/market/depth")
+V1_CANDLES_PATH      = os.getenv("BITGET_V1_CANDLES_PATH","/api/mix/v1/market/candles")
+# v2 mark 대체(목록형 반환)
+V2_MARK_PATH_ALT     = "/api/v2/mix/market/mark-prices"
+
 V1_PLACE_ORDER_PATH  = os.getenv("BITGET_V1_PLACE_ORDER_PATH", "/api/mix/v1/order/placeOrder")
 V1_POSITIONS_PATH    = os.getenv("BITGET_V1_POSITIONS_PATH", "/api/mix/v1/position/allPosition")
 
@@ -252,7 +260,7 @@ def _cache_set(sym: str, px: float):
 def _parse_px(js: Dict[str,Any]) -> Optional[float]:
     d = js.get("data") if isinstance(js, dict) else None
     if isinstance(d, dict):
-        # ⬇⬇⬇ 여기 "lastPr" 추가(유일 변경 사항) ⬇⬇⬇
+        # ⬇ v2 단일 티커의 lastPr 키까지 파싱
         for k in ("lastPr", "last", "close", "price"):
             v = d.get(k)
             if v not in (None,"","null"):
@@ -284,16 +292,36 @@ def _get_mark_v2(sym: str, product: str) -> Optional[float]:
         if v not in (None,"","null"): return float(v)
     except Exception as e:
         _log(f"mark v2 fail {sym}/{product}: {e}")
+    # alt endpoint (목록형 data)
+    try:
+        js = _with_retry_maintenance(_http_get, V2_MARK_PATH_ALT, {"productType":product,"symbol":sym}, False)
+        d = js.get("data") or []
+        if isinstance(d, list) and d:
+            v = d[0].get("markPrice") or d[0].get("price")
+            if v not in (None,"","null"): return float(v)
+    except Exception as e:
+        _log(f"mark v2 alt fail {sym}/{product}: {e}")
     return None
 
 def _get_depth_mid_v2(sym: str, product: str) -> Optional[float]:
     try:
         js = _with_retry_maintenance(_http_get, V2_DEPTH_PATH, {"productType":product,"symbol":sym}, False)
         d = js.get("data") or {}
-        best_ask = d.get("bestAsk") or (d.get("asks") or [{}])[0].get("price")
-        best_bid = d.get("bestBid") or (d.get("bids") or [{}])[0].get("price")
-        if best_ask and best_bid:
-            return (float(best_ask)+float(best_bid))/2.0
+        # data가 list로 오는 케이스 대응
+        if isinstance(d, list) and d:
+            d = d[0] if isinstance(d[0], dict) else {}
+        if isinstance(d, dict):
+            best_ask = d.get("bestAsk")
+            best_bid = d.get("bestBid")
+            if not best_ask or not best_bid:
+                asks = d.get("asks") or []
+                bids = d.get("bids") or []
+                if asks and isinstance(asks, list):
+                    best_ask = asks[0][0] if isinstance(asks[0], (list,tuple)) else asks[0].get("price")
+                if bids and isinstance(bids, list):
+                    best_bid = bids[0][0] if isinstance(bids[0], (list,tuple)) else bids[0].get("price")
+            if best_ask and best_bid:
+                return (float(best_ask)+float(best_bid))/2.0
     except Exception as e:
         _log(f"depth v2 fail {sym}/{product}: {e}")
     return None
@@ -301,7 +329,6 @@ def _get_depth_mid_v2(sym: str, product: str) -> Optional[float]:
 def _get_candle_close_v2(sym: str, product: str) -> Optional[float]:
     try:
         js = _http_get(V2_CANDLES_PATH, {"symbol":sym,"granularity":CANDLE_GRANULARITY,"limit":2}, False)
-    # ...
         data = js.get("data") or []
         if not data: return None
         row = data[-2] if len(data)>=2 else data[-1]
@@ -325,11 +352,47 @@ def _get_index_candle_close_v2(sym: str, product: str) -> Optional[float]:
 
 def _get_ticker_v1(sym: str) -> Optional[float]:
     try:
-        js = _with_retry_maintenance(_http_get, V1_TICKER_PATH, {"symbol":sym,"productType":"umcbl"}, False)
+        js = _with_retry_maintenance(_http_get, V1_TICKER_PATH, {"symbol":f"{sym}_UMCBL"}, False)
         return _parse_px(js)
     except Exception as e:
         _log(f"ticker v1 fail {sym}: {e}")
         return None
+
+# ⬇ v1 폴백(마크/딥스/캔들) 추가
+def _get_mark_v1(sym: str) -> Optional[float]:
+    try:
+        js = _with_retry_maintenance(_http_get, V1_MARK_PATH, {"symbol": f"{sym}_UMCBL"}, False)
+        d = js.get("data") or {}
+        v = d.get("markPrice") or d.get("price")
+        if v not in (None,"","null"): return float(v)
+    except Exception as e:
+        _log(f"mark v1 fail {sym}: {e}")
+    return None
+
+def _get_depth_mid_v1(sym: str) -> Optional[float]:
+    try:
+        js = _with_retry_maintenance(_http_get, V1_DEPTH_PATH, {"symbol": f"{sym}_UMCBL", "limit": 1}, False)
+        d = js.get("data") or {}
+        bids = d.get("bids") or []
+        asks = d.get("asks") or []
+        if bids and asks:
+            b = float(bids[0][0]); a = float(asks[0][0])
+            if b>0 and a>0: return (a+b)/2.0
+    except Exception as e:
+        _log(f"depth v1 fail {sym}: {e}")
+    return None
+
+def _get_candle_close_v1(sym: str, granularity: int) -> Optional[float]:
+    try:
+        js = _with_retry_maintenance(_http_get, V1_CANDLES_PATH, {"symbol": f"{sym}_UMCBL","granularity": str(granularity),"limit":"2"}, False)
+        data = js.get("data") or []
+        if not data: return None
+        row = data[-2] if len(data)>=2 else data[-1]
+        close = row[4] if isinstance(row,(list,tuple)) and len(row)>=5 else (row.get("close") if isinstance(row,dict) else None)
+        if close not in (None,"","null"): return float(close)
+    except Exception as e:
+        _log(f"candles v1 fail {sym}: {e}")
+    return None
 
 def get_last_price(symbol: str) -> Optional[float]:
     symbol = convert_symbol(symbol)
@@ -356,6 +419,13 @@ def get_last_price(symbol: str) -> Optional[float]:
 
         if not STRICT_TICKER:
             px = _get_ticker_v1(symbol)
+            if px: _cache_set(symbol, px); return px
+            px = _get_mark_v1(symbol)
+            if px: _cache_set(symbol, px); return px
+            if ALLOW_DEPTH_FALLBACK:
+                px = _get_depth_mid_v1(symbol)
+                if px: _cache_set(symbol, px); return px
+            px = _get_candle_close_v1(symbol, CANDLE_GRANULARITY)
             if px: _cache_set(symbol, px); return px
         _log(f"❌ Ticker 실패(최종): {symbol} v2=True"); return None
 
