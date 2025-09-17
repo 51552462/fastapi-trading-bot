@@ -155,7 +155,7 @@ def _loose_kv_to_dict(txt: str) -> Dict[str, Any]:
             out[k] = v
     return out
 
-# dict 내부에 message/alert/payload에 JSON 문자열이 있는 경우도 까서 dict로
+# dict/list/str 등 들어와도 dict로 보정 시도
 def _unwrap_nested_json(d: Dict[str, Any]) -> Dict[str, Any]:
     for k in ("message", "alert", "payload"):
         v = d.get(k)
@@ -166,7 +166,6 @@ def _unwrap_nested_json(d: Dict[str, Any]) -> Dict[str, Any]:
                 try:
                     inner = json.loads(s)
                     if isinstance(inner, dict):
-                        # 내부 JSON이 실제 시그널이면 병합(외부 키는 보존)
                         dd = dict(d)
                         dd.update(inner)
                         return dd
@@ -174,13 +173,48 @@ def _unwrap_nested_json(d: Dict[str, Any]) -> Dict[str, Any]:
                     pass
     return d
 
+# ─────────────────────────────────────────────────────────────
+# [PATCH] list/기타 타입 보정 헬퍼
+def _coerce_to_dict(x: Any) -> Optional[Dict[str, Any]]:
+    """
+    - dict이면 그대로
+    - list이면 첫 번째 dict 요소 사용 (TV가 [ {..} ] 형태로 쏘는 케이스 방어)
+    - str/bytes이면 느슨 파싱
+    - 그 외는 None 반환
+    """
+    if isinstance(x, dict):
+        return x
+    if isinstance(x, list):
+        for item in x:
+            if isinstance(item, dict):
+                return item
+        try:
+            return _loose_kv_to_dict(json.dumps(x)) or None
+        except Exception:
+            return None
+    if isinstance(x, (str, bytes)):
+        s = x.decode() if isinstance(x, bytes) else x
+        s = s.strip()
+        if s.startswith("{") and s.endswith("}"):
+            try:
+                obj = json.loads(s)
+                if isinstance(obj, dict):
+                    return obj
+            except Exception:
+                pass
+        return _loose_kv_to_dict(s) or None
+    return None
+# ─────────────────────────────────────────────────────────────
+
 # Payload 파서
 async def _parse_any(req: Request) -> Dict[str, Any]:
     # 1) application/json
     try:
         d = await req.json()
-        if isinstance(d, dict):
-            return _unwrap_nested_json(d)
+        # [PATCH] json이 list 여도 dict로 보정
+        dd = _coerce_to_dict(d)
+        if dd is not None:
+            return _unwrap_nested_json(dd)
     except Exception:
         pass
     # 2) 원시 바디 문자열
@@ -188,14 +222,20 @@ async def _parse_any(req: Request) -> Dict[str, Any]:
         raw = (await req.body()).decode(errors="ignore").strip()
         if raw:
             try:
-                return _unwrap_nested_json(json.loads(raw))
+                obj = json.loads(raw)
+                dd = _coerce_to_dict(obj)
+                if dd is not None:
+                    return _unwrap_nested_json(dd)
             except Exception:
                 fixed = raw.replace("'", '"')
                 try:
-                    return _unwrap_nested_json(json.loads(fixed))
+                    obj = json.loads(fixed)
+                    dd = _coerce_to_dict(obj)
+                    if dd is not None:
+                        return _unwrap_nested_json(dd)
                 except Exception:
                     kv = _loose_kv_to_dict(raw)
-                    if kv: 
+                    if kv:
                         return _unwrap_nested_json(kv)
     except Exception:
         pass
@@ -205,10 +245,13 @@ async def _parse_any(req: Request) -> Dict[str, Any]:
         payload = form.get("payload") or form.get("data") or form.get("message") or form.get("alert")
         if payload:
             try:
-                return _unwrap_nested_json(json.loads(payload))
+                obj = json.loads(payload)
+                dd = _coerce_to_dict(obj)
+                if dd is not None:
+                    return _unwrap_nested_json(dd)
             except Exception:
                 kv = _loose_kv_to_dict(str(payload))
-                if kv: 
+                if kv:
                     return _unwrap_nested_json(kv)
     except Exception:
         pass
@@ -220,7 +263,7 @@ async def _parse_any(req: Request) -> Dict[str, Any]:
             if ":" in part:
                 k, v = part.split(":", 1)
                 d[k.strip()] = v.strip()
-        if d: 
+        if d:
             return _unwrap_nested_json(d)
     except Exception:
         pass
@@ -229,8 +272,16 @@ async def _parse_any(req: Request) -> Dict[str, Any]:
 # ─────────────────────────────────────────────────────────────
 # 시그널 라우터
 # ─────────────────────────────────────────────────────────────
-def _handle_signal(data: Dict[str, Any]):
-    # type 키 fallback + 리스트 방어
+def _handle_signal(data: Any):
+    # [PATCH] 방어: dict로 보정, 실패 시 드롭
+    if not isinstance(data, dict):
+        dd = _coerce_to_dict(data)
+        if dd is None:
+            send_telegram("⚠️ bad signal (not dict): " + (str(data)[:500]))
+            return
+        data = dd
+
+    # type 키 fallback + 리스트 방어(일부 TV가 배열로 보낼 때)
     if isinstance(data.get("type"), (list, tuple)):
         try:
             data["type"] = (data["type"][0] or "")
@@ -307,9 +358,18 @@ def _worker_loop(idx: int):
                         data = _loose_kv_to_dict(data) or {}
                 except Exception:
                     data = _loose_kv_to_dict(data) or {}
-            if not isinstance(data, dict) or not data:
-                send_telegram(f"[worker-{idx}] drop: queue item is not a valid JSON/KV string")
+            # [PATCH] 큐에서 리스트가 바로 들어오는 경우 방어
+            if not isinstance(data, dict):
+                dd = _coerce_to_dict(data)
+                if dd is None:
+                    send_telegram(f"[worker-{idx}] drop: not a dict payload")
+                    continue
+                data = dd
+
+            if not data:
+                send_telegram(f"[worker-{idx}] drop: empty dict payload")
                 continue
+
             _handle_signal(data)
         except Exception as e:
             print(f"[worker-{idx}] error:", e)
@@ -323,6 +383,14 @@ async def _ingest(req: Request):
         data = await _parse_any(req)
     except Exception as e:
         return {"ok": False, "error": f"bad_payload: {e}"}
+
+    # [PATCH] 실수 방지: 여기서도 최종 보정
+    if not isinstance(data, dict):
+        dd = _coerce_to_dict(data)
+        if dd is None:
+            return {"ok": False, "error": "payload_not_dict"}
+        data = dd
+
     dk = _dedup_key(data)
     if dk in _DEDUP and now - _DEDUP[dk] < DEDUP_TTL:
         return {"ok": True, "dedup": True}
