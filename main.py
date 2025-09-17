@@ -174,13 +174,13 @@ def _unwrap_nested_json(d: Dict[str, Any]) -> Dict[str, Any]:
     return d
 
 # ─────────────────────────────────────────────────────────────
-# [PATCH] list/기타 타입 보정 헬퍼
+# 리스트/기타 타입 보정 헬퍼
 def _coerce_to_dict(x: Any) -> Optional[Dict[str, Any]]:
     """
     - dict이면 그대로
     - list이면 첫 번째 dict 요소 사용 (TV가 [ {..} ] 형태로 쏘는 케이스 방어)
     - str/bytes이면 느슨 파싱
-    - 그 외는 None 반환
+    - 그 외는 None
     """
     if isinstance(x, dict):
         return x
@@ -211,7 +211,6 @@ async def _parse_any(req: Request) -> Dict[str, Any]:
     # 1) application/json
     try:
         d = await req.json()
-        # [PATCH] json이 list 여도 dict로 보정
         dd = _coerce_to_dict(d)
         if dd is not None:
             return _unwrap_nested_json(dd)
@@ -273,7 +272,7 @@ async def _parse_any(req: Request) -> Dict[str, Any]:
 # 시그널 라우터
 # ─────────────────────────────────────────────────────────────
 def _handle_signal(data: Any):
-    # [PATCH] 방어: dict로 보정, 실패 시 드롭
+    # 방어: dict로 보정, 실패 시 드롭
     if not isinstance(data, dict):
         dd = _coerce_to_dict(data)
         if dd is None:
@@ -281,7 +280,7 @@ def _handle_signal(data: Any):
             return
         data = dd
 
-    # type 키 fallback + 리스트 방어(일부 TV가 배열로 보낼 때)
+    # type 키 fallback + 리스트 방어
     if isinstance(data.get("type"), (list, tuple)):
         try:
             data["type"] = (data["type"][0] or "")
@@ -295,7 +294,7 @@ def _handle_signal(data: Any):
         or ""
     )
 
-    # 심볼/사이드 추출(다양한 키 대응)
+    # 심볼/사이드 추출
     symbol  = _pick_symbol(data)
     side    = _infer_side(data.get("side") or data.get("direction"), "long")
 
@@ -307,7 +306,7 @@ def _handle_signal(data: Any):
 
     t = _norm_type(typ_raw)
 
-    # 비즈니스 디듀프(짧은 시간 동일액션 방지)
+    # 비즈니스 디듀프
     now = time.time()
     bizkey = f"{t}:{symbol}:{side}"
     last = _BIZDEDUP.get(bizkey, 0.0)
@@ -358,7 +357,7 @@ def _worker_loop(idx: int):
                         data = _loose_kv_to_dict(data) or {}
                 except Exception:
                     data = _loose_kv_to_dict(data) or {}
-            # [PATCH] 큐에서 리스트가 바로 들어오는 경우 방어
+            # 큐에서 리스트가 바로 들어오는 경우 방어
             if not isinstance(data, dict):
                 dd = _coerce_to_dict(data)
                 if dd is None:
@@ -384,7 +383,7 @@ async def _ingest(req: Request):
     except Exception as e:
         return {"ok": False, "error": f"bad_payload: {e}"}
 
-    # [PATCH] 실수 방지: 여기서도 최종 보정
+    # 최종 보정
     if not isinstance(data, dict):
         dd = _coerce_to_dict(data)
         if dd is None:
@@ -414,13 +413,12 @@ def root():
 async def signal(req: Request): 
     return await _ingest(req)
 
-# 테스트 편의: GET도 허용 (예: /signal?type=entry&symbol=BTCUSDT&side=short&amount=100)
+# 테스트 편의: GET도 허용
 @app.get("/signal")
 async def signal_get(req: Request):
     qp = dict(req.query_params)
     if not qp:
         return {"ok": False, "error": "no query params"}
-    # 쿼리를 바로 dict로 받아 큐에 넣는다
     now = time.time()
     dk = _dedup_key(qp)
     if dk in _DEDUP and now - _DEDUP[dk] < DEDUP_TTL:
