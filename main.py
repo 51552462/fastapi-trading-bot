@@ -1,172 +1,426 @@
 # -*- coding: utf-8 -*-
-"""
-main.py (TV/기타 → Bitget)
-- /ping, /health
-- /webhook, /signal  (둘 다 동일 동작)
-- /diag/last_price?symbol=BTCUSDT  (진단용)
-- 분할익절(30/40/30), 전체종료(sl/failCut/emaExit/liquidation/close)
-"""
-import os, json
-from typing import Optional, Dict, Any
-from fastapi import FastAPI, Request, Query
-from pydantic import BaseModel
-import uvicorn
+import os, time, json, hashlib, threading, queue, re
+from collections import deque
+from typing import Dict, Any, Optional
+from fastapi import FastAPI, Request
 
-from bitget_api import bitget_api convert_symbol, round_size
+from trader import (
+    enter_position, take_partial_profit, close_position, reduce_by_contracts,
+    start_watchdogs, start_reconciler, get_pending_snapshot, start_capacity_guard
+)
+from telegram_bot import send_telegram
+from bitget_api import convert_symbol, get_open_positions
 
-APP = FastAPI(title="TV→Bitget Bot", version="2.1")
+# ── 금액 관련 ENV (side별 기본값; ENV로 덮어쓰기 가능)
+DEFAULT_AMOUNT         = float(os.getenv("DEFAULT_AMOUNT", "15"))
+DEFAULT_AMOUNT_LONG    = float(os.getenv("DEFAULT_AMOUNT_LONG", "100"))  # 롱 기본 100
+DEFAULT_AMOUNT_SHORT   = float(os.getenv("DEFAULT_AMOUNT_SHORT", "40"))  # 숏 기본 40
+LEVERAGE               = float(os.getenv("LEVERAGE", "5"))
+DEDUP_TTL              = float(os.getenv("DEDUP_TTL", "15"))
+BIZDEDUP_TTL           = float(os.getenv("BIZDEDUP_TTL", "3"))
 
-DEFAULT_AMOUNT = float(os.getenv("DEFAULT_AMOUNT", "15"))
-FORCE_DEFAULT_AMOUNT = os.getenv("FORCE_DEFAULT_AMOUNT", "1") == "1"
-LEVERAGE = int(os.getenv("LEVERAGE", "5"))
-STRICT_TICKER = os.getenv("STRICT_TICKER", "0") == "1"
+WORKERS                = int(os.getenv("WORKERS", "6"))
+QUEUE_MAX              = int(os.getenv("QUEUE_MAX", "2000"))
+LOG_INGRESS            = os.getenv("LOG_INGRESS", "0") == "1"
 
-TG_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
-TG_CHAT  = os.getenv("TELEGRAM_CHAT_ID", "")
+FORCE_DEFAULT_AMOUNT   = os.getenv("FORCE_DEFAULT_AMOUNT", "0") == "1"
 
-def send_telegram(msg: str):
-    if not TG_TOKEN or not TG_CHAT:
-        return
+SYMBOL_AMOUNT_JSON = os.getenv("SYMBOL_AMOUNT_JSON", "")
+try:
+    SYMBOL_AMOUNT = json.loads(SYMBOL_AMOUNT_JSON) if SYMBOL_AMOUNT_JSON else {}
+except Exception:
+    SYMBOL_AMOUNT = {}
+
+app = FastAPI()
+
+INGRESS_LOG: deque = deque(maxlen=200)
+_DEDUP: Dict[str, float] = {}
+_BIZDEDUP: Dict[str, float] = {}
+_task_q: "queue.Queue[Dict[str, Any]]" = queue.Queue(maxsize=QUEUE_MAX)
+
+# ─────────────────────────────────────────────────────────────
+# 유틸
+# ─────────────────────────────────────────────────────────────
+def _dedup_key(d: Dict[str, Any]) -> str:
+    return hashlib.sha1(json.dumps(d, sort_keys=True).encode()).hexdigest()
+
+def _norm_symbol(sym: str) -> str:
+    return convert_symbol(sym)
+
+def _pick_symbol(d: Dict[str, Any]) -> str:
+    """
+    TradingView/테스트에서 symbol 키가 다르게 들어오는 케이스까지 흡수.
+    """
+    for k in ("symbol", "ticker", "pair", "contract", "sym", "symbolName"):
+        v = d.get(k)
+        if isinstance(v, str) and v.strip():
+            s = _norm_symbol(v.strip().upper())
+            if s:
+                return s
+    return ""
+
+def _infer_side(side: Optional[str], default: str = "long") -> str:
+    """
+    'buy'→long, 'sell'→short 포함. 기본은 long.
+    """
+    s = (side or "").strip().lower()
+    if s in ("long", "short"):
+        return s
+    if s == "buy":
+        return "long"
+    if s == "sell":
+        return "short"
+    return default
+
+def _norm_type(typ: str) -> str:
+    t = (typ or "").strip().lower()
+    t = re.sub(r"[\s_\-]+", "", t)
+    aliases = {
+        "tp_1": "tp1", "tp_2": "tp2", "tp_3": "tp3",
+        "takeprofit1": "tp1", "takeprofit2": "tp2", "takeprofit3": "tp3",
+        "sl_1": "sl1", "sl_2": "sl2",
+        "stopfull": "stoploss", "stopall": "stoploss", "stop": "stoploss",
+        "fullexit": "stoploss", "exitall": "stoploss",
+        "emaexit": "emaexit", "emaExit": "emaexit",
+        "failcut": "failcut",
+        "closeposition": "close", "closeall": "close",
+        "reducecontracts": "reducebycontracts",
+        "reduce_by_contracts": "reducebycontracts",
+        "panicclose": "close", "panic": "close",
+        "breakeven": "breakeven", "breakevenexit": "breakeven",
+    }
+    return aliases.get(t, t)
+
+def _safe_float(v: Any, fallback: float) -> float:
+    """
+    dict/list/None/문자열까지 안전 변환. 실패 시 fallback.
+    """
     try:
-        import requests
-        requests.post(
-            f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage",
-            json={"chat_id": TG_CHAT, "text": msg, "parse_mode": "HTML"},
-            timeout=5
-        )
+        if v is None:
+            return float(fallback)
+        if isinstance(v, (int, float)):
+            return float(v)
+        if isinstance(v, (dict, list, tuple)):
+            return float(fallback)
+        s = str(v).strip()
+        if s == "" or s.lower() == "null":
+            return float(fallback)
+        return float(s)
+    except Exception:
+        return float(fallback)
+
+def _resolve_amount(symbol: str, side: str, payload: Dict[str, Any]) -> float:
+    if not FORCE_DEFAULT_AMOUNT:
+        if "amount" in payload and str(payload["amount"]).strip() != "":
+            try:
+                return float(payload["amount"])
+            except Exception:
+                pass
+        if symbol in SYMBOL_AMOUNT and str(SYMBOL_AMOUNT[symbol]).strip() != "":
+            try:
+                return float(SYMBOL_AMOUNT[symbol])
+            except Exception:
+                pass
+    if side == "long":
+        return float(DEFAULT_AMOUNT_LONG)
+    if side == "short":
+        return float(DEFAULT_AMOUNT_SHORT)
+    return float(DEFAULT_AMOUNT)
+
+# 느슨한 문자열 파서
+def _loose_kv_to_dict(txt: str) -> Dict[str, Any]:
+    if not isinstance(txt, str):
+        return {}
+    s = txt.strip()
+    if not s:
+        return {}
+    try:
+        obj = json.loads(s)
+        if isinstance(obj, dict):
+            return obj
     except Exception:
         pass
+    out: Dict[str, Any] = {}
+    parts = re.split(r"[\n,;]+", s)
+    for part in parts:
+        if ":" in part:
+            k, v = part.split(":", 1)
+        elif "=" in part:
+            k, v = part.split("=", 1)
+        else:
+            continue
+        k = k.strip()
+        v = v.strip().strip('"').strip("'")
+        if k:
+            out[k] = v
+    return out
 
-try:
-    BG = Bitget()
-except Exception as e:
-    BG = None
-    send_telegram(f"❌ Bitget init failed: {e}")
+# dict 내부에 message/alert/payload에 JSON 문자열이 있는 경우도 까서 dict로
+def _unwrap_nested_json(d: Dict[str, Any]) -> Dict[str, Any]:
+    for k in ("message", "alert", "payload"):
+        v = d.get(k)
+        if isinstance(v, (str, bytes)):
+            s = v.decode() if isinstance(v, bytes) else v
+            s = s.strip()
+            if s.startswith("{") and s.endswith("}"):
+                try:
+                    inner = json.loads(s)
+                    if isinstance(inner, dict):
+                        # 내부 JSON이 실제 시그널이면 병합(외부 키는 보존)
+                        dd = dict(d)
+                        dd.update(inner)
+                        return dd
+                except Exception:
+                    pass
+    return d
 
-class Webhook(BaseModel):
-    type: Optional[str] = None
-    symbol: Optional[str] = None
-    ticker: Optional[str] = None
-    side: Optional[str] = None
-    direction: Optional[str] = None
-    amount: Optional[float] = None
-    note: Optional[str] = None
-    class Config:
-        extra = "allow"
+# Payload 파서
+async def _parse_any(req: Request) -> Dict[str, Any]:
+    # 1) application/json
+    try:
+        d = await req.json()
+        if isinstance(d, dict):
+            return _unwrap_nested_json(d)
+    except Exception:
+        pass
+    # 2) 원시 바디 문자열
+    try:
+        raw = (await req.body()).decode(errors="ignore").strip()
+        if raw:
+            try:
+                return _unwrap_nested_json(json.loads(raw))
+            except Exception:
+                fixed = raw.replace("'", '"')
+                try:
+                    return _unwrap_nested_json(json.loads(fixed))
+                except Exception:
+                    kv = _loose_kv_to_dict(raw)
+                    if kv: 
+                        return _unwrap_nested_json(kv)
+    except Exception:
+        pass
+    # 3) form-encoded
+    try:
+        form = await req.form()
+        payload = form.get("payload") or form.get("data") or form.get("message") or form.get("alert")
+        if payload:
+            try:
+                return _unwrap_nested_json(json.loads(payload))
+            except Exception:
+                kv = _loose_kv_to_dict(str(payload))
+                if kv: 
+                    return _unwrap_nested_json(kv)
+    except Exception:
+        pass
+    # 4) 최후의 문자열 파편 모음
+    try:
+        txt = (await req.body()).decode(errors="ignore")
+        d: Dict[str, Any] = {}
+        for part in re.split(r"[\n,]+", txt):
+            if ":" in part:
+                k, v = part.split(":", 1)
+                d[k.strip()] = v.strip()
+        if d: 
+            return _unwrap_nested_json(d)
+    except Exception:
+        pass
+    raise ValueError("cannot parse request")
 
-@APP.get("/ping")
-def ping(): return {"ok": True}
+# ─────────────────────────────────────────────────────────────
+# 시그널 라우터
+# ─────────────────────────────────────────────────────────────
+def _handle_signal(data: Dict[str, Any]):
+    # type 키 fallback + 리스트 방어
+    if isinstance(data.get("type"), (list, tuple)):
+        try:
+            data["type"] = (data["type"][0] or "")
+        except Exception:
+            data["type"] = ""
+    typ_raw = (
+        data.get("type")
+        or data.get("event")
+        or data.get("action")
+        or data.get("signalType")
+        or ""
+    )
 
-@APP.get("/health")
-def health(): return {"ok": BG is not None}
+    # 심볼/사이드 추출(다양한 키 대응)
+    symbol  = _pick_symbol(data)
+    side    = _infer_side(data.get("side") or data.get("direction"), "long")
 
-@APP.get("/diag/last_price")
-def diag_last_price(symbol: str = Query(...)):
-    sym = convert_symbol(symbol)
-    if BG is None:
-        return {"ok": False, "reason": "bitget_client_not_ready"}
-    px = BG.last_price(sym)
-    return {"ok": px is not None, "symbol": sym, "price": px}
+    if not symbol:
+        send_telegram("⚠️ symbol 없음: " + json.dumps(data)); return
 
-def _infer_side(raw: Optional[str], default_long: str="long") -> str:
-    s = (raw or "").lower()
-    if s in ("long","buy","b","l","open_long"): return "long"
-    if s in ("short","sell","s","sh","open_short"): return "short"
-    return default_long
+    amount   = _resolve_amount(symbol, side, data)
+    leverage = _safe_float(data.get("leverage"), LEVERAGE)
 
-def _base_side(side: str) -> str:
-    return "buy" if side == "long" else "sell"
+    t = _norm_type(typ_raw)
 
-def _malformed(sym: str) -> bool:
-    return (not sym) or (len(sym) < 6) or (not sym.endswith("USDT"))
+    # 비즈니스 디듀프(짧은 시간 동일액션 방지)
+    now = time.time()
+    bizkey = f"{t}:{symbol}:{side}"
+    last = _BIZDEDUP.get(bizkey, 0.0)
+    if now - last < BIZDEDUP_TTL: 
+        return
+    _BIZDEDUP[bizkey] = now
 
-def _calc_entry_qty(sym: str, px: float, payload_amount: Optional[float]) -> float:
-    amt = DEFAULT_AMOUNT if (FORCE_DEFAULT_AMOUNT or not payload_amount or float(payload_amount) <= 0) else float(payload_amount)
-    q = round_size(sym, amt / max(px, 1e-12))
-    return q
+    if LOG_INGRESS:
+        try: send_telegram(f"📥 {t} {symbol} {side} amt={amount}")
+        except: pass
 
-def _ensure_ready(sym: str):
-    try: BG.ensure_one_way()
-    except Exception: pass
-    try: BG.set_leverage(sym, leverage=LEVERAGE)
-    except Exception: pass
+    if t == "entry":
+        enter_position(symbol, amount, side=side, leverage=leverage); return
 
-def _close_all(sym: str):
-    ls, ss = BG.position_size(sym)
-    ok = True; res = {}
-    if ls > 0:
-        _ok, r = BG.place_market(sym, "sell", round_size(sym, ls), reduce_only=True); ok &= _ok; res["close_long"] = r
-    if ss > 0:
-        _ok, r = BG.place_market(sym, "buy", round_size(sym, ss), reduce_only=True); ok &= _ok; res["close_short"] = r
-    return ok, res
+    if t in ("tp1","tp2","tp3"):
+        pct = float(os.getenv("TP1_PCT","0.30")) if t=="tp1" else float(os.getenv("TP2_PCT","0.40")) if t=="tp2" else float(os.getenv("TP3_PCT","0.30"))
+        take_partial_profit(symbol, pct, side=side); return
 
-def _partial_close(sym: str, pct: float):
-    ls, ss = BG.position_size(sym)
-    ok = True; res = {}
-    if ls > 0:
-        take = round_size(sym, ls * pct)
-        if take > 0:
-            _ok, r = BG.place_market(sym, "sell", take, reduce_only=True); ok &= _ok; res["reduce_long"] = r
-    if ss > 0:
-        take = round_size(sym, ss * pct)
-        if take > 0:
-            _ok, r = BG.place_market(sym, "buy", take, reduce_only=True); ok &= _ok; res["reduce_short"] = r
-    return ok, res
+    CLOSE_KEYS = {"stoploss","emaexit","failcut","fullexit","close","exit","liquidation","sl1","sl2","breakeven"}
+    if t in CLOSE_KEYS:
+        close_position(symbol, side=side, reason=t); return
 
-async def _handle_payload(data: Dict[str, Any]):
-    symbol = convert_symbol(str(data.get("symbol") or data.get("ticker") or ""))
-    side   = _infer_side(data.get("side") or data.get("direction"))
-    typ    = (data.get("type") or "").lower().strip()
+    if t == "reducebycontracts":
+        contracts = _safe_float(data.get("contracts"), 0.0)
+        if contracts > 0: reduce_by_contracts(symbol, contracts, side=side)
+        return
 
-    if _malformed(symbol):
-        send_telegram("⚠️ malformed_symbol drop: " + json.dumps({"raw": data.get("symbol") or data.get("ticker"), "norm": symbol}, ensure_ascii=False))
-        return {"ok": False, "reason": "malformed_symbol", "symbol": symbol}
+    if t in ("tailtouch","info","debug"): 
+        return
 
-    if BG is None:
-        send_telegram("❌ Bitget client not ready")
-        return {"ok": False, "reason": "bitget_client_not_ready"}
+    send_telegram("❓ 알 수 없는 신호: " + json.dumps(data))
 
-    _ensure_ready(symbol)
+# ─────────────────────────────────────────────────────────────
+# 워커/엔드포인트/시작
+# ─────────────────────────────────────────────────────────────
+def _worker_loop(idx: int):
+    while True:
+        try:
+            data = _task_q.get()
+            if data is None: 
+                continue
+            if isinstance(data, (str, bytes)):
+                try:
+                    obj = json.loads(data)
+                    if isinstance(obj, dict):
+                        data = obj
+                    else:
+                        data = _loose_kv_to_dict(data) or {}
+                except Exception:
+                    data = _loose_kv_to_dict(data) or {}
+            if not isinstance(data, dict) or not data:
+                send_telegram(f"[worker-{idx}] drop: queue item is not a valid JSON/KV string")
+                continue
+            _handle_signal(data)
+        except Exception as e:
+            print(f"[worker-{idx}] error:", e)
+        finally:
+            try: _task_q.task_done()
+            except: pass
 
-    if typ in ("entry","open","open_entry"):
-        px = BG.last_price(symbol)
-        if not px or px <= 0:
-            send_telegram(f"❗ ticker_fail {symbol} trace=")
-            return {"ok": False, "reason": "ticker_fail", "symbol": symbol}
-        qty = _calc_entry_qty(symbol, px, data.get("amount"))
-        if qty <= 0:
-            return {"ok": False, "reason": "qty_le_0", "symbol": symbol, "price": px}
-        ok, res = BG.place_market(symbol, _base_side(side), qty, reduce_only=False)
-        if ok:
-            send_telegram(f"✅ ENTRY {symbol} {side} q={qty}")
-            return {"ok": True, "symbol": symbol, "qty": qty, "side": side, "price": px, "res": res}
-        send_telegram(f"❌ ENTRY_FAIL {symbol} {side} q={qty} :: {res}")
-        return {"ok": False, "reason": "order_fail", "res": res}
+async def _ingest(req: Request):
+    now = time.time()
+    try:
+        data = await _parse_any(req)
+    except Exception as e:
+        return {"ok": False, "error": f"bad_payload: {e}"}
+    dk = _dedup_key(data)
+    if dk in _DEDUP and now - _DEDUP[dk] < DEDUP_TTL:
+        return {"ok": True, "dedup": True}
+    _DEDUP[dk] = now
+    INGRESS_LOG.append({"ts": now, "ip": (req.client.host if req and req.client else "?"), "data": data})
+    try:
+        _task_q.put_nowait(data)
+    except queue.Full:
+        send_telegram("⚠️ queue full → drop signal: " + json.dumps(data))
+        return {"ok": False, "queued": False, "reason": "queue_full"}
+    return {"ok": True, "queued": True, "qsize": _task_q.qsize()}
 
-    if typ in ("tp1","take1","t1"):
-        ok, res = _partial_close(symbol, 0.30); send_telegram(("✅ TP1 " if ok else "❌ TP1_FAIL ")+symbol); return {"ok": ok, "action":"tp1","res":res}
-    if typ in ("tp2","take2","t2"):
-        ok, res = _partial_close(symbol, 0.40); send_telegram(("✅ TP2 " if ok else "❌ TP2_FAIL ")+symbol); return {"ok": ok, "action":"tp2","res":res}
-    if typ in ("tp3","take3","t3"):
-        ok, res = _partial_close(symbol, 0.30); send_telegram(("✅ TP3 " if ok else "❌ TP3_FAIL ")+symbol); return {"ok": ok, "action":"tp3","res":res}
+# FastAPI 라우팅
+app = FastAPI()
 
-    if typ in ("sl","stop","failcut","emaexit","liquidation","close","exit"):
-        ok, res = _close_all(symbol); send_telegram(("✅ EXIT_ALL " if ok else "❌ EXIT_ALL_FAIL ")+symbol); return {"ok": ok,"action":"close_all","res":res}
+@app.get("/")
+def root(): 
+    return {"ok": True}
 
-    send_telegram(f"ℹ️ ignored type: {typ} / {symbol}")
-    return {"ok": True, "ignored": True, "type": typ, "symbol": symbol}
+@app.post("/signal")
+async def signal(req: Request): 
+    return await _ingest(req)
 
-@APP.post("/webhook")
-async def webhook(req: Request):
-    try: data = await req.json()
-    except Exception: data = {}
-    return await _handle_payload(dict(data))
+# 테스트 편의: GET도 허용 (예: /signal?type=entry&symbol=BTCUSDT&side=short&amount=100)
+@app.get("/signal")
+async def signal_get(req: Request):
+    qp = dict(req.query_params)
+    if not qp:
+        return {"ok": False, "error": "no query params"}
+    # 쿼리를 바로 dict로 받아 큐에 넣는다
+    now = time.time()
+    dk = _dedup_key(qp)
+    if dk in _DEDUP and now - _DEDUP[dk] < DEDUP_TTL:
+        return {"ok": True, "dedup": True}
+    _DEDUP[dk] = now
+    INGRESS_LOG.append({"ts": now, "ip": (req.client.host if req and req.client else "?"), "data": qp})
+    try:
+        _task_q.put_nowait(qp)
+    except queue.Full:
+        send_telegram("⚠️ queue full → drop signal: " + json.dumps(qp))
+        return {"ok": False, "queued": False, "reason": "queue_full"}
+    return {"ok": True, "queued": True, "qsize": _task_q.qsize()}
 
-@APP.post("/signal")   # 트뷰가 /signal로 보내는 경우 호환
-async def signal(req: Request):
-    try: data = await req.json()
-    except Exception: data = {}
-    return await _handle_payload(dict(data))
+@app.post("/webhook")
+async def webhook(req: Request): 
+    return await _ingest(req)
 
-if __name__ == "__main__":
-    uvicorn.run(APP, host="0.0.0.0", port=int(os.getenv("PORT", "8000")))
+@app.post("/alert")
+async def alert(req: Request): 
+    return await _ingest(req)
+
+@app.get("/health")
+def health(): 
+    return {"ok": True, "ingress": len(INGRESS_LOG), "queue": _task_q.qsize(), "workers": WORKERS}
+
+@app.get("/ingress")
+def ingress(): 
+    return list(INGRESS_LOG)[-30:]
+
+@app.get("/positions")
+def positions(): 
+    return {"positions": get_open_positions()}
+
+@app.get("/queue")
+def queue_size(): 
+    return {"size": _task_q.qsize(), "max": QUEUE_MAX}
+
+@app.get("/config")
+def config():
+    return {
+        "DEFAULT_AMOUNT": DEFAULT_AMOUNT,
+        "DEFAULT_AMOUNT_LONG": DEFAULT_AMOUNT_LONG,
+        "DEFAULT_AMOUNT_SHORT": DEFAULT_AMOUNT_SHORT,
+        "FORCE_DEFAULT_AMOUNT": FORCE_DEFAULT_AMOUNT,
+        "LEVERAGE": LEVERAGE,
+        "DEDUP_TTL": DEDUP_TTL, "BIZDEDUP_TTL": BIZDEDUP_TTL,
+        "WORKERS": WORKERS, "QUEUE_MAX": QUEUE_MAX,
+        "LOG_INGRESS": LOG_INGRESS,
+        "SYMBOL_AMOUNT": SYMBOL_AMOUNT,
+    }
+
+@app.get("/pending")
+def pending(): 
+    return get_pending_snapshot()
+
+@app.on_event("startup")
+def on_startup():
+    for i in range(WORKERS):
+        t = threading.Thread(target=_worker_loop, args=(i,), daemon=True, name=f"signal-worker-{i}")
+        t.start()
+    start_capacity_guard()
+    start_watchdogs()
+    start_reconciler()
+    try:
+        threading.Thread(
+            target=send_telegram,
+            args=("✅ FastAPI up (workers + watchdog + reconciler + capacity-guard)",),
+            daemon=True
+        ).start()
+    except Exception:
+        pass
