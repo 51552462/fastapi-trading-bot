@@ -1,215 +1,382 @@
 # -*- coding: utf-8 -*-
 """
-Bitget REST API helper (USDT-M Futures, v2 우선)
+bitget.py  (USDT-M Perp 전용)
+- v2 우선, v1 폴백
+- 강력한 심볼 정규화
+- 티커 체인: v2 ticker(단일) → v2 tickers(목록) → v1 ticker → v2/v1 mark → depth mid → 1m candle
+- 원웨이 모드/레버리지/수량 반올림
+환경변수:
+  BITGET_API_KEY, BITGET_API_SECRET, BITGET_API_PASSWORD  (필수)
+  BITGET_USE_V2=1
+  BITGET_V2_PRODUCT_TYPE=USDT-FUTURES
+  STRICT_TICKER=0
+  ALLOW_DEPTH_FALLBACK=1
+  SYMBOL_ALIASES_JSON={"HUSDT":"HFTUSDT"}   # (선택)
+  TRACE_LOG=1
 """
-from __future__ import annotations
-import os, time, hmac, hashlib, base64, json, math
-from typing import Optional, Dict, Any, List
+import os, time, hmac, hashlib, base64, json, math, re, threading
+from typing import Dict, Any, Optional, Tuple
 import requests
-from urllib.parse import urlencode
 
-# ── ENV ──────────────────────────────────────────────────────────────────────
-BASE_URL       = os.getenv("BITGET_BASE_URL", "https://api.bitget.com")
-API_KEY        = os.getenv("BITGET_API_KEY", "")
-API_SECRET     = os.getenv("BITGET_API_SECRET", "")
-API_PASSPHRASE = os.getenv("BITGET_API_PASSPHRASE", "")
-PRODUCT_TYPE   = os.getenv("BITGET_PRODUCT_TYPE", "USDT-FUTURES")  # v2 권고
-MARGIN_COIN    = os.getenv("BITGET_MARGIN_COIN", "USDT")
-USE_V2         = os.getenv("BITGET_USE_V2", "1") == "1"
+BITGET_HOST = "https://api.bitget.com"
 
-TICKER_TTL     = float(os.getenv("TICKER_TTL", "2.5"))      # ← float
-HTTP_TIMEOUT   = float(os.getenv("HTTP_TIMEOUT", "5"))
-RETRY_TOTAL    = int(os.getenv("HTTP_RETRY_TOTAL", "3"))
-TRACE          = os.getenv("TRACE_LOG", "0") == "1"
+API_KEY     = os.getenv("BITGET_API_KEY", "")
+API_SECRET  = os.getenv("BITGET_API_SECRET", "")
+API_PASS    = os.getenv("BITGET_API_PASSWORD", "")
 
-# 별칭
-SYMBOL_ALIASES: Dict[str, str] = {}
+USE_V2      = os.getenv("BITGET_USE_V2", "1") == "1"
+PRODUCT_V2  = os.getenv("BITGET_V2_PRODUCT_TYPE", "USDT-FUTURES")
+STRICT_TICKER = os.getenv("STRICT_TICKER", "0") == "1"
+ALLOW_DEPTH_FALLBACK = os.getenv("ALLOW_DEPTH_FALLBACK", "1") == "1"
+TRACE_LOG   = os.getenv("TRACE_LOG", "0") == "1"
+
 try:
-    raw = os.getenv("SYMBOL_ALIASES_JSON", "") or os.getenv("SYMBOL_ALIASES_FILE", "")
-    if raw and raw.strip().startswith("{"):
-        SYMBOL_ALIASES = json.loads(raw)
-    elif raw and os.path.isfile(raw):
-        SYMBOL_ALIASES = json.loads(open(raw, "r", encoding="utf-8").read())
+    SYMBOL_ALIASES = json.loads(os.getenv("SYMBOL_ALIASES_JSON", "{}"))
+    if not isinstance(SYMBOL_ALIASES, dict):
+        SYMBOL_ALIASES = {}
 except Exception:
     SYMBOL_ALIASES = {}
 
-def _log(*a): 
-    if TRACE: print(*a, flush=True)
+_contract_lock = threading.Lock()
+_contract_cache: Dict[str, Dict[str, Any]] = {}
+_contract_ttl = 60 * 30
+_contract_last_ts = 0.0
 
-# ── HTTP ─────────────────────────────────────────────────────────────────────
-SESSION = requests.Session()
+def _ts() -> str:
+    return str(int(time.time() * 1000))
 
-def _http(method: str, path: str, *, params: dict | None=None, body: dict | None=None, auth=False):
-    url = BASE_URL + path
-    headers = {"Content-Type": "application/json"}
-    query = "?" + urlencode(params, doseq=True) if params else ""
-    data  = json.dumps(body, separators=(",", ":")) if body else ""
+def _log(*a):
+    if TRACE_LOG:
+        print("[bitget]", *a, flush=True)
 
-    if auth:
-        ts = str(int(time.time() * 1000))
-        prehash = ts + method.upper() + path + query + data
-        sign = base64.b64encode(hmac.new(API_SECRET.encode(), prehash.encode(), hashlib.sha256).digest()).decode()
-        headers.update({
-            "ACCESS-KEY": API_KEY,
-            "ACCESS-PASSPHRASE": API_PASSPHRASE,
-            "ACCESS-TIMESTAMP": ts,
-            "ACCESS-SIGN": sign,
-        })
-
-    _log(method, url+query, data if data else "")
-    return SESSION.request(method, url+query, data=data or None, headers=headers, timeout=HTTP_TIMEOUT)
-
-def _http_json(method: str, path: str, **kw) -> dict:
-    r = _http(method, path, **kw)
-    try:
-        j = r.json()
-    except Exception:
-        j = {"code": str(r.status_code), "msg": r.text}
-    if r.status_code >= 400 or j.get("code") not in (None, "00000", 0, "0"):
-        _log("HTTP ERR", r.status_code, j)
-    return j
-
-# ── 유틸 ─────────────────────────────────────────────────────────────────────
-def convert_symbol(symbol: str) -> str:
-    s = (symbol or "").upper().strip()
-    s = SYMBOL_ALIASES.get(s, s)
-    if s.endswith("_UMCBL"):  # v2는 접미사 없이
-        s = s[:-6]
+def convert_symbol(sym: str) -> str:
+    s = (sym or "").upper().strip()
+    if not s:
+        return s
+    if s in SYMBOL_ALIASES:
+        return SYMBOL_ALIASES[s].upper().strip()
+    s = re.sub(r'^(BINANCE|BITGET|BYBIT|OKX|HUOBI|KUCOIN|MEXC|GATE|DERIBIT|FTX)[:/._-]+', '', s)
+    s = re.sub(r'(_|-)?(U|C)MCBL$', '', s)
+    s = re.sub(r'(\.P|_PERP|-PERP|PERP|_SWAP|-SWAP|SWAP)$', '', s)
+    s = re.sub(r'[:/._-]+', '', s)
+    if s.endswith("USD"):
+        s = s + "T"
+    s = re.sub(r'USDT(P|PERP|PS)?$', 'USDT', s)
+    m = re.search(r'([A-Z0-9]{2,})USDT$', s)
+    if m:
+        return m.group(1) + "USDT"
+    if re.fullmatch(r'[A-Z0-9]{2,10}', s):
+        return s + "USDT"
     return s
 
-def round_down_step(v: float, step: float) -> float:
-    if step <= 0: return v
-    return math.floor(v / step) * step
+def _sign(ts: str, method: str, path: str, body: str = "") -> str:
+    pre = ts + method.upper() + path + body
+    mac = hmac.new(API_SECRET.encode(), pre.encode(), hashlib.sha256).digest()
+    return base64.b64encode(mac).decode()
 
-# 심볼 스펙 캐시
-_SPEC: dict[str, dict] = {}
-def get_symbol_spec(symbol: str) -> dict:
-    key = convert_symbol(symbol)
-    if key in _SPEC: return _SPEC[key]
-    js = _http_json("GET", "/api/v2/mix/market/get-all-symbols")
-    spec = {}
-    for it in (js.get("data") or []):
-        if (it.get("symbol") or "").upper() == key:
-            spec = {
-                "symbol": key,
-                "minSz": float(it.get("minSz", "0.001") or 0.001),
-                "sizePlace": int(it.get("sizePlace", "4") or 4),
-            }
-            break
-    _SPEC[key] = spec or {"symbol": key, "minSz": 0.001, "sizePlace": 4}
-    return _SPEC[key]
+def _q(params: Optional[dict]) -> str:
+    if not params: return ""
+    return "&".join(f"{k}={params[k]}" for k in sorted(params.keys()))
 
-# ── 시세: v2 ticker → mark → candles ─────────────────────────────────────────
-_cache: dict[str, tuple[float, float]] = {}
-def _cache_get(s: str) -> Optional[float]:
-    p = _cache.get(s)
-    if not p: return None
-    price, exp = p
-    return price if time.time() < exp else None
-
-def _cache_put(s: str, price: float):
-    _cache[s] = (price, time.time() + TICKER_TTL)
-
-def get_last_price(symbol: str) -> Optional[float]:
-    sym = convert_symbol(symbol)
-    c = _cache_get(sym)
-    if c is not None: return c
-
-    # 1) ticker
+def _req(method: str, path: str, params: Optional[dict]=None, body: Optional[dict]=None,
+         auth: bool=False, v2: bool=True, timeout: int=10):
+    url = BITGET_HOST + path
+    headers = {"Content-Type": "application/json"}
+    data = ""
+    if body: data = json.dumps(body, separators=(",", ":"))
+    if auth:
+        ts = _ts()
+        sig = _sign(ts, method, path + (("?" + _q(params)) if params else ""), data)
+        headers.update({
+            "ACCESS-KEY": API_KEY,
+            "ACCESS-SIGN": sig,
+            "ACCESS-TIMESTAMP": ts,
+            "ACCESS-PASSPHRASE": API_PASS
+        })
     try:
-        js = _http_json("GET", "/api/v2/mix/market/ticker", params={"symbol": sym})
-        d = js.get("data") or {}
-        v = d.get("last") or d.get("close")
-        if v is not None:
-            price = float(v); _cache_put(sym, price); return price
-    except Exception as e: _log("ticker v2 err", e)
-
-    # 2) mark price
-    try:
-        js = _http_json("GET", "/api/v2/mix/market/mark-price", params={"symbol": sym})
-        d = js.get("data") or {}
-        v = d.get("markPrice")
-        if v is not None:
-            price = float(v); _cache_put(sym, price); return price
-    except Exception as e: _log("mark err", e)
-
-    # 3) candles(마지막 종가)
-    try:
-        js = _http_json("GET", "/api/v2/mix/market/candles", params={"symbol": sym, "granularity": "60", "limit": 1})
-        arr = js.get("data") or []
-        if arr:
-            price = float(arr[0][4]); _cache_put(sym, price); return price
-    except Exception as e: _log("candles err", e)
-
-    return None
-
-# ── 포지션 ───────────────────────────────────────────────────────────────────
-def _parse_pos_v2(js: dict) -> List[Dict[str, Any]]:
-    out = []
-    for it in (js.get("data") or []):
+        if method.upper() == "GET":
+            r = requests.get(url, params=params, headers=headers, timeout=timeout)
+        else:
+            r = requests.post(url, params=params, data=data or None, headers=headers, timeout=timeout)
         try:
-            out.append({
-                "symbol": (it.get("symbol") or "").upper(),
-                "holdSide": (it.get("holdSide") or "").lower(),
-                "total": float(it.get("total") or 0),
-                "available": float(it.get("available") or 0),
-                "averageOpenPrice": float(it.get("averageOpenPrice") or 0),
-            })
+            return r.status_code, r.json()
+        except Exception:
+            return r.status_code, {"raw": r.text}
+    except requests.RequestException as e:
+        return 599, {"error": str(e)}
+
+def refresh_contracts_cache(force: bool=False):
+    global _contract_last_ts, _contract_cache
+    now = time.time()
+    with _contract_lock:
+        if not force and (now - _contract_last_ts) < _contract_ttl and _contract_cache:
+            return
+        if USE_V2:
+            sc, js = _req("GET", "/api/v2/mix/market/contracts",
+                          params={"productType": PRODUCT_V2}, v2=True)
+            if sc == 200 and js.get("code") == "00000":
+                bag = {}
+                for it in js.get("data", []):
+                    sym = it.get("symbol")
+                    if sym: bag[sym] = it
+                _contract_cache = {"UMCBL": bag}
+                _contract_last_ts = now
+                _log("contracts v2 cached:", len(bag))
+                return
+        sc, js = _req("GET", "/api/mix/v1/market/contracts",
+                      params={"productType": "UMCBL"}, v2=False)
+        if sc == 200 and js.get("code") == "00000":
+            bag = {}
+            for it in js.get("data", []):
+                full = it.get("symbol", "")
+                if full.endswith("_UMCBL"):
+                    bag[full.replace("_UMCBL", "")] = it
+            _contract_cache = {"UMCBL": bag}
+            _contract_last_ts = now
+            _log("contracts v1 cached:", len(bag))
+
+def _contract(sym: str) -> Optional[dict]:
+    if not _contract_cache:
+        refresh_contracts_cache()
+    return _contract_cache.get("UMCBL", {}).get(sym)
+
+def _size_tick(sym: str) -> float:
+    c = _contract(sym)
+    if not c: return 0.0001
+    tick = c.get("sizeTick")
+    if tick: 
+        try: return float(tick)
+        except: pass
+    if "sizePlace" in c:
+        return float(f"1e-{int(c['sizePlace'])}")
+    if "minTradeNum" in c:
+        try: return float(c["minTradeNum"])
+        except: pass
+    return 0.0001
+
+def _price_tick(sym: str) -> float:
+    c = _contract(sym)
+    if not c: return 0.01
+    tick = c.get("priceTick")
+    if tick:
+        try: return float(tick)
+        except: pass
+    if "pricePlace" in c:
+        return float(f"1e-{int(c['pricePlace'])}")
+    return 0.01
+
+def round_size(sym: str, qty: float) -> float:
+    tick = _size_tick(sym) or 0.0001
+    return math.floor(float(qty) / tick) * tick
+
+def round_price(sym: str, px: float) -> float:
+    tick = _price_tick(sym) or 0.01
+    return round(math.floor(float(px) / tick) * tick, 10)
+
+def _sym_v1(sym: str) -> str:
+    return f"{sym}_UMCBL"
+
+def _ok(js: Any) -> bool:
+    try: return js.get("code") == "00000"
+    except: return False
+
+class Bitget:
+    def __init__(self):
+        if not API_KEY or not API_SECRET or not API_PASS:
+            raise RuntimeError("Bitget API credentials missing")
+        refresh_contracts_cache(force=True)
+
+    # ---------- Market ----------
+    def last_price(self, sym: str) -> Optional[float]:
+        """티커 체인(강화판)"""
+        # v2 single ticker
+        if USE_V2 and not STRICT_TICKER:
+            sc, js = _req("GET", "/api/v2/mix/market/ticker",
+                          params={"symbol": sym}, v2=True)
+            if sc == 200 and _ok(js) and js.get("data"):
+                try:
+                    return float(js["data"]["lastPr"])
+                except Exception:
+                    pass
+            # 일부 환경에서는 productType을 요구
+            sc, js = _req("GET", "/api/v2/mix/market/ticker",
+                          params={"productType": PRODUCT_V2, "symbol": sym}, v2=True)
+            if sc == 200 and _ok(js) and js.get("data"):
+                try:
+                    return float(js["data"]["lastPr"])
+                except Exception:
+                    pass
+            # v2 tickers (목록) 폴백
+            sc, js = _req("GET", "/api/v2/mix/market/tickers",
+                          params={"productType": PRODUCT_V2}, v2=True)
+            if sc == 200 and _ok(js) and js.get("data"):
+                try:
+                    for row in js["data"]:
+                        if row.get("symbol") == sym:
+                            return float(row["lastPr"])
+                except Exception:
+                    pass
+
+        # v1 ticker
+        sc, js = _req("GET", "/api/mix/v1/market/ticker",
+                      params={"symbol": _sym_v1(sym)}, v2=False)
+        if sc == 200 and _ok(js) and js.get("data"):
+            try:
+                return float(js["data"]["last"])
+            except Exception:
+                pass
+
+        # v2/v1 mark price
+        if USE_V2:
+            sc, js = _req("GET", "/api/v2/mix/market/mark-price",
+                          params={"symbol": sym}, v2=True)
+            if sc == 200 and _ok(js) and js.get("data"):
+                try:
+                    return float(js["data"]["markPrice"])
+                except Exception:
+                    pass
+        sc, js = _req("GET", "/api/mix/v1/market/mark-price",
+                      params={"symbol": _sym_v1(sym)}, v2=False)
+        if sc == 200 and _ok(js) and js.get("data"):
+            try:
+                return float(js["data"]["markPrice"])
+            except Exception:
+                pass
+
+        # depth mid
+        if ALLOW_DEPTH_FALLBACK:
+            if USE_V2:
+                sc, js = _req("GET", "/api/v2/mix/market/merged-depth",
+                              params={"symbol": sym, "limit": 1}, v2=True)
+                if sc == 200 and _ok(js) and js.get("data"):
+                    try:
+                        b = float(js["data"]["bids"][0][0])
+                        a = float(js["data"]["asks"][0][0])
+                        return (b + a) / 2.0
+                    except Exception:
+                        pass
+            sc, js = _req("GET", "/api/mix/v1/market/depth",
+                          params={"symbol": _sym_v1(sym), "limit": 1}, v2=False)
+            if sc == 200 and _ok(js) and js.get("data"):
+                try:
+                    b = float(js["data"]["bids"][0][0]); a = float(js["data"]["asks"][0][0])
+                    return (b + a) / 2.0
+                except Exception:
+                    pass
+
+        # 1m candle close
+        if USE_V2:
+            sc, js = _req("GET", "/api/v2/mix/market/candles",
+                          params={"symbol": sym, "granularity": "60", "limit": "1"}, v2=True)
+            if sc == 200 and _ok(js) and js.get("data"):
+                try:
+                    return float(js["data"][0][4])
+                except Exception:
+                    pass
+        sc, js = _req("GET", "/api/mix/v1/market/candles",
+                      params={"symbol": _sym_v1(sym), "granularity": "60", "limit": "1"}, v2=False)
+        if sc == 200 and _ok(js) and js.get("data"):
+            try:
+                return float(js["data"][0][4])
+            except Exception:
+                pass
+        return None
+
+    # ---------- Account / Mode ----------
+    def ensure_one_way(self) -> bool:
+        try:
+            if USE_V2:
+                sc, js = _req("POST", "/api/v2/mix/account/set-position-mode",
+                              body={"productType": PRODUCT_V2, "positionMode": "one_way"},
+                              auth=True, v2=True)
+                if sc == 200 and _ok(js): return True
+            sc, js = _req("POST", "/api/mix/v1/account/setPositionMode",
+                          body={"productType": "UMCBL", "marginCoin": "USDT", "positionMode": "one_way"},
+                          auth=True, v2=False)
+            return sc == 200 and _ok(js)
+        except Exception as e:
+            _log("ensure_one_way err:", e)
+            return False
+
+    def set_leverage(self, sym: str, leverage: int = 5) -> bool:
+        ok = False
+        if USE_V2:
+            try:
+                for hold in ("long", "short"):
+                    sc, js = _req("POST", "/api/v2/mix/account/set-leverage",
+                                  body={"symbol": sym, "leverage": str(leverage), "holdSide": hold},
+                                  auth=True, v2=True)
+                    ok = ok or (sc == 200 and _ok(js))
+            except Exception:
+                pass
+        try:
+            for hold in ("long", "short"):
+                sc, js = _req("POST", "/api/mix/v1/account/setLeverage",
+                              body={"symbol": _sym_v1(sym), "marginCoin": "USDT",
+                                    "leverage": str(leverage), "holdSide": hold},
+                              auth=True, v2=False)
+                ok = ok or (sc == 200 and _ok(js))
         except Exception:
             pass
-    return out
+        return ok
 
-def get_open_positions() -> List[Dict[str, Any]]:
-    try:
-        js = _http_json("GET", "/api/v2/mix/position/all-position", params={"productType": PRODUCT_TYPE}, auth=True)
-        if js.get("data") is not None:
-            return _parse_pos_v2(js)
-    except Exception as e:
-        _log("positions v2 err", e)
-    return []
+    # ---------- Positions ----------
+    def position_size(self, sym: str) -> Tuple[float, float]:
+        if USE_V2:
+            sc, js = _req("GET", "/api/v2/mix/position/single-position",
+                          params={"symbol": sym}, auth=True, v2=True)
+            if sc == 200 and _ok(js) and js.get("data"):
+                try:
+                    d = js["data"]
+                    ls = float(d.get("total", {}).get("longQty", "0"))
+                    ss = float(d.get("total", {}).get("shortQty", "0"))
+                    return ls, ss
+                except Exception:
+                    pass
+        sc, js = _req("GET", "/api/mix/v1/position/singlePosition",
+                      params={"symbol": _sym_v1(sym), "marginCoin": "USDT"},
+                      auth=True, v2=False)
+        if sc == 200 and _ok(js) and js.get("data"):
+            try:
+                d = js["data"]
+                ls = float(d.get("long", {}).get("total", "0") or 0)
+                ss = float(d.get("short", {}).get("total", "0") or 0)
+                return ls, ss
+            except Exception:
+                pass
+        return 0.0, 0.0
 
-# ── 주문 ─────────────────────────────────────────────────────────────────────
-def place_market_order(symbol: str, usdt_amount: float, side: str, leverage: int, reduce_only: bool=False) -> dict:
-    sym = convert_symbol(symbol)
-    price = get_last_price(sym)
-    if not price or price <= 0:
-        return {"code": "ticker_fail", "msg": f"ticker_fail {sym}"}
-
-    spec = get_symbol_spec(sym)
-    size_dec = 10 ** -spec.get("sizePlace", 4)
-    size = round_down_step(usdt_amount / price * leverage, size_dec)
-    side = side.lower()
-
-    body = {
-        "symbol": sym,
-        "productType": PRODUCT_TYPE,
-        "marginCoin": MARGIN_COIN,
-        "size": f"{size:.{spec.get('sizePlace',4)}f}",
-        "price": "",
-        "side": "buy" if side == "long" else "sell",
-        "orderType": "market",
-        "force": "gtc",
-        "reduceOnly": reduce_only,
-        "leverage": str(leverage),
-        "clientOid": f"mkt-{int(time.time()*1000)}",
-    }
-    return _http_json("POST", "/api/v2/mix/order/place-order", body=body, auth=True)
-
-def place_reduce_by_size(symbol: str, size: float, side: str) -> dict:
-    sym = convert_symbol(symbol)
-    spec = get_symbol_spec(sym)
-    size_dec = 10 ** -spec.get("sizePlace", 4)
-    size = round_down_step(float(size), size_dec)
-    body = {
-        "symbol": sym,
-        "productType": PRODUCT_TYPE,
-        "marginCoin": MARGIN_COIN,
-        "size": f"{size:.{spec.get('sizePlace',4)}f}",
-        "price": "",
-        "side": "sell" if side.lower()=="long" else "buy",
-        "orderType": "market",
-        "force": "gtc",
-        "reduceOnly": True,
-        "clientOid": f"red-{int(time.time()*1000)}",
-    }
-    return _http_json("POST", "/api/v2/mix/order/place-order", body=body, auth=True)
+    # ---------- Orders ----------
+    def place_market(self, sym: str, side: str, size: float, reduce_only: bool=False):
+        size = float(size)
+        if size <= 0: return False, {"error": "size<=0"}
+        if USE_V2:
+            try:
+                trade_side = "open" if not reduce_only else "close"
+                order_side = "buy" if side.lower().startswith("b") else "sell"
+                body = {
+                    "symbol": sym,
+                    "marginCoin": "USDT",
+                    "size": str(size),
+                    "side": order_side,
+                    "tradeSide": trade_side,
+                    "orderType": "market",
+                    "force": "gtc"
+                }
+                sc, js = _req("POST", "/api/v2/mix/order/place-order",
+                              body=body, auth=True, v2=True)
+                if sc == 200 and _ok(js):
+                    return True, js
+            except Exception as e:
+                _log("place_market v2 err:", e)
+        body = {
+            "symbol": _sym_v1(sym),
+            "marginCoin": "USDT",
+            "size": str(size),
+            "side": "buy" if side.lower().startswith("b") else "sell",
+            "orderType": "market",
+            "timeInForceValue": "normal",
+            "reduceOnly": reduce_only
+        }
+        sc, js = _req("POST", "/api/mix/v1/order/placeOrder", body=body, auth=True, v2=False)
+        return (sc == 200 and _ok(js)), js
