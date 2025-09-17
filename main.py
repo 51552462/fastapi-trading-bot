@@ -12,7 +12,7 @@ from fastapi import FastAPI, Request, Query
 from pydantic import BaseModel
 import uvicorn
 
-from bitget import Bitget, convert_symbol, round_size
+from bitget_api import bitget_api convert_symbol, round_size
 
 APP = FastAPI(title="TV→Bitget Bot", version="2.1")
 
