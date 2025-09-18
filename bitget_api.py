@@ -1,6 +1,15 @@
 # -*- coding: utf-8 -*-
 """
 Bitget REST API helper (USDT-M Perpetual)
+
+공용 인터페이스(트레이더/메인과 호환):
+  - convert_symbol(symbol) -> str
+  - get_last_price(symbol) -> Optional[float]
+  - get_open_positions() -> List[Dict]
+  - place_market_order(symbol, usdt_amount, side, leverage, reduce_only=False) -> Dict
+  - place_reduce_by_size(symbol, size, side) -> Dict
+  - get_symbol_spec(symbol) -> Dict
+  - round_down_step(value, step) -> float
 """
 
 from __future__ import annotations
@@ -52,6 +61,9 @@ MARGIN_COIN          = os.getenv("BITGET_MARGIN_COIN", "USDT")
 STRICT_TICKER        = os.getenv("STRICT_TICKER", "0") == "1"
 ALLOW_DEPTH_FALLBACK = os.getenv("ALLOW_DEPTH_FALLBACK", "1") == "1"
 TICKER_TTL           = int(os.getenv("TICKER_TTL", "3"))
+
+# [PATCH] 주문 시 강제 productType 지정(없으면 심볼로 추정)
+ORDER_PRODUCT_TYPE   = os.getenv("BITGET_ORDER_PRODUCT_TYPE", "").strip().upper()
 
 try:
     SYMBOL_ALIASES = json.loads(os.getenv("SYMBOL_ALIASES_JSON", "") or "{}")
@@ -228,26 +240,20 @@ def _parse_px(js: Dict[str,Any]) -> Optional[float]:
         except Exception: pass
     return None
 
-# [PATCH] depth 응답에서 최고호가/최우선매수 추출 (dict/list 모두 지원)
+# [PATCH] depth 응답에서 최고/최우선 가격 추출 (dict/list 모두 지원)
 def _depth_best_prices(d: Any) -> Tuple[Optional[float], Optional[float]]:
-    """
-    반환: (best_bid, best_ask)
-    """
     def _first_price(row):
         if isinstance(row, (list, tuple)) and row:
             return row[0]
         if isinstance(row, dict):
             return row.get("price") or row.get("px")
         return None
-
     if isinstance(d, dict):
-        ask = d.get("bestAsk")
-        bid = d.get("bestBid")
+        ask = d.get("bestAsk"); bid = d.get("bestBid")
         if ask not in (None,"") and bid not in (None,""):
             try: return float(bid), float(ask)
             except: return None, None
-        asks = d.get("asks") or []
-        bids = d.get("bids") or []
+        asks = d.get("asks") or []; bids = d.get("bids") or []
         if asks and bids:
             ap = _first_price(asks[0]); bp = _first_price(bids[0])
             try:
@@ -256,10 +262,8 @@ def _depth_best_prices(d: Any) -> Tuple[Optional[float], Optional[float]]:
             except: pass
         return None, None
     if isinstance(d, list) and d:
-        # 리스트면 첫 요소로 재귀
         return _depth_best_prices(d[0])
     return None, None
-# /[PATCH]
 
 def _get_ticker_v2(sym: str, product: str) -> Optional[float]:
     sc, js, _ = _http_get_soft(V2_TICKER_PATH, {"symbol": sym}, False)
@@ -276,7 +280,6 @@ def _get_mark_v2(sym: str, product: str) -> Optional[float]:
         d = js.get("data") or {}
         v = d.get("markPrice") or d.get("price")
         if v not in (None,"","null"): return float(v)
-    # alt
     sc, js, _ = _http_get_soft(V2_MARK_PATH_ALT, {"productType": product}, False)
     if sc == 200 and isinstance(js, dict):
         d = js.get("data") or []
@@ -291,16 +294,13 @@ def _get_depth_mid_v2(sym: str, product: str) -> Optional[float]:
     sc, js, _ = _http_get_soft(V2_DEPTH_PATH, {"symbol": sym}, False)
     if sc == 200 and isinstance(js, dict):
         d = js.get("data") or {}
-        bid, ask = _depth_best_prices(d)             # [PATCH]
+        bid, ask = _depth_best_prices(d)
         if bid and ask: return (ask + bid) / 2.0
-
-    # productType 포함 재시도
     sc, js, _ = _http_get_soft(V2_DEPTH_PATH, {"productType": product, "symbol": sym}, False)
     if sc == 200 and isinstance(js, dict):
         d = js.get("data") or {}
-        bid, ask = _depth_best_prices(d)             # [PATCH]
+        bid, ask = _depth_best_prices(d)
         if bid and ask: return (ask + bid) / 2.0
-
     _log(f"depth v2 fail {sym}/{product}: {sc}"); return None
 
 def _get_candle_close_v2(sym: str, product: str) -> Optional[float]:
@@ -340,7 +340,7 @@ def _get_depth_mid_v1(sym: str) -> Optional[float]:
     sc, js, _ = _http_get_soft(V1_DEPTH_PATH, {"symbol": f"{sym}_UMCBL", "limit": 1}, False)
     if sc == 200 and isinstance(js, dict):
         d = js.get("data") or {}
-        bid, ask = _depth_best_prices(d)             # [PATCH] v1도 공통 파서 사용
+        bid, ask = _depth_best_prices(d)      # 공통 파서
         if bid and ask: return (ask + bid) / 2.0
     _log(f"depth v1 fail {sym}: {sc}"); return None
 
@@ -401,6 +401,17 @@ def _api_side(side: str, reduce_only: bool) -> str:
     if s in ("buy","long"):  return "close_short" if reduce_only else "open_long"
     else:                    return "close_long" if reduce_only else "open_short"
 
+# [PATCH] 심볼로 productType 추정 (ENV BITGET_ORDER_PRODUCT_TYPE가 있으면 우선)
+def _guess_product_type(symbol: str) -> str:
+    if ORDER_PRODUCT_TYPE:
+        return ORDER_PRODUCT_TYPE
+    s = symbol.upper()
+    if s.endswith("USDT"): return "USDT-FUTURES"
+    if s.endswith("USDC"): return "USDC-FUTURES"
+    if s.endswith("USD"):  return "COIN-FUTURES"
+    # 기본값
+    return V2_PRODUCT_TYPE or "USDT-FUTURES"
+
 def _order_size_from_usdt(symbol: str, usdt_amount: float) -> float:
     last = get_last_price(symbol)
     if not last or last<=0: return 0.0
@@ -413,45 +424,63 @@ def place_market_order(symbol: str, usdt_amount: float, side: str, leverage: flo
     size = _order_size_from_usdt(sym, float(usdt_amount))
     if size <= 0: raise RuntimeError(f"size_calc_fail {sym} amt={usdt_amount}")
 
+    # [PATCH] 여기서 productType을 확정
+    pt = _guess_product_type(sym)
+
+    # v2 (레거시 포맷)
     body_v2_legacy = {
-        "symbol": sym, "marginCoin": MARGIN_COIN,
+        "productType": pt,                 # [PATCH] 필수 추가
+        "symbol": sym,
+        "marginCoin": MARGIN_COIN,
         "side": _api_side(side, reduce_only),
-        "orderType": "market", "timeInForceValue": "normal",
-        "size": str(size), "price": "", "force": "gtc",
-        "reduceOnly": reduce_only, "marginMode": "cross", "leverage": str(leverage),
+        "orderType": "market",
+        "timeInForceValue": "normal",
+        "size": str(size),
+        "price": "",
+        "force": "gtc",
+        "reduceOnly": reduce_only,
+        "marginMode": "cross",
+        "leverage": str(leverage),
     }
     sc, js, txt = _http_post_soft(V2_PLACE_ORDER_PATH, body_v2_legacy, True)
     if sc == 200:
         if isinstance(js, dict):
             if (js.get("code") in ("00000","0",0,None)) or js.get("data"):
                 return js
-        elif isinstance(js, list):                    # [PATCH]
+        elif isinstance(js, list):
             return {"code":"00000","data": js}
-
     _log(f"place_order v2 legacy fail {sym}: {sc} {txt}")
 
+    # v2 (신규 포맷: side+tradeSide)
     body_v2_new = {
-        "symbol": sym, "marginCoin": MARGIN_COIN, "size": str(size),
+        "productType": pt,                 # [PATCH] 필수 추가
+        "symbol": sym,
+        "marginCoin": MARGIN_COIN,
+        "size": str(size),
         "side": ("buy" if str(side).lower() in ("buy","long") else "sell"),
         "tradeSide": ("close" if reduce_only else "open"),
-        "orderType": "market", "force": "gtc",
-        "marginMode": "cross", "leverage": str(leverage),
+        "orderType": "market",
+        "force": "gtc",
+        "marginMode": "cross",
+        "leverage": str(leverage),
     }
     sc, js, txt = _http_post_soft(V2_PLACE_ORDER_PATH, body_v2_new, True)
     if sc == 200:
         if isinstance(js, dict):
             if (js.get("code") in ("00000","0",0,None)) or js.get("data"):
                 return js
-        elif isinstance(js, list):                    # [PATCH]
+        elif isinstance(js, list):
             return {"code":"00000","data": js}
-
     _log(f"place_order v2 new fail {sym}: {sc} {txt}")
 
+    # v1 폴백
     body_v1 = {
-        "symbol": f"{sym}_UMCBL", "marginCoin": MARGIN_COIN,
+        "symbol": f"{sym}_UMCBL",
+        "marginCoin": MARGIN_COIN,
         "size": str(size),
         "side": ("buy" if str(side).lower() in ("buy","long") else "sell"),
-        "orderType": "market", "timeInForceValue": "normal",
+        "orderType": "market",
+        "timeInForceValue": "normal",
         "reduceOnly": reduce_only
     }
     sc, js, txt = _http_post_soft(V1_PLACE_ORDER_PATH, body_v1, True)
@@ -459,26 +488,32 @@ def place_market_order(symbol: str, usdt_amount: float, side: str, leverage: flo
         if isinstance(js, dict):
             if (js.get("code") in ("00000","0",0,None)) or js.get("data"):
                 return js
-        elif isinstance(js, list):                    # [PATCH]
+        elif isinstance(js, list):
             return {"code":"00000","data": js}
-
     _log(f"place_order v1 fail {sym}: {sc} {txt}")
     return {"code": str(sc), "msg": txt or "place_order_failed", "data": js}
 
 def place_reduce_by_size(symbol: str, size: float, side: str) -> Dict[str,Any]:
     sym = convert_symbol(symbol)
+    pt = _guess_product_type(sym)           # [PATCH]
     body = {
-        "symbol": sym, "marginCoin": MARGIN_COIN,
+        "productType": pt,                  # [PATCH]
+        "symbol": sym,
+        "marginCoin": MARGIN_COIN,
         "side": _api_side(side, True),
-        "orderType": "market", "timeInForceValue": "normal",
-        "size": str(size), "price": "", "reduceOnly": True, "marginMode": "cross",
+        "orderType": "market",
+        "timeInForceValue": "normal",
+        "size": str(size),
+        "price": "",
+        "reduceOnly": True,
+        "marginMode": "cross",
     }
     sc, js, txt = _http_post_soft(V2_PLACE_ORDER_PATH, body, True)
     if sc == 200:
         if isinstance(js, dict):
             if (js.get("code") in ("00000","0",0,None)) or js.get("data"):
                 return js
-        elif isinstance(js, list):                    # [PATCH]
+        elif isinstance(js, list):
             return {"code":"00000","data": js}
     _log(f"reduce_by_size v2 fail {sym}: {sc} {txt}")
     return js if isinstance(js, dict) else {"code": str(sc), "msg": txt, "data": js}
@@ -535,6 +570,7 @@ def get_open_positions() -> List[Dict[str,Any]]:
                     if js: return _parse_positions_v2(js)
                 except Exception as e:
                     _log(f"positions v2 error: {e} url: {BASE_URL}{V2_POSITIONS_PATH}?{urlencode(params)}")
+    # v1 폴백
         hint = (os.getenv("POSITION_SYMBOLS_HINT") or "").strip()
         if hint:
             out: List[Dict[str,Any]] = []
@@ -552,6 +588,7 @@ def get_open_positions() -> List[Dict[str,Any]]:
                             out.append({"symbol":sym,"side":side,"size":size,"entry_price":entry})
                     except Exception: pass
             if out: return out
+
     for params in ({"productType":"umcbl"}, {"productType":"umcbl","marginCoin":MARGIN_COIN}):
         try:
             res = _with_retry_maintenance(_http_get_raw, V1_POSITIONS_PATH, params, True)
