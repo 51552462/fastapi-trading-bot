@@ -30,7 +30,13 @@ API_PASS  = os.getenv("BITGET_API_PASSWORD", "")
 
 USE_V2               = os.getenv("BITGET_USE_V2", "1") == "1"
 V2_TICKER_PATH       = os.getenv("BITGET_V2_TICKER_PATH", "/api/v2/mix/market/ticker")
+# [PATCH] v2 권장 엔드포인트 추가 (지원팀 안내)
+V2_TICKER_PATH_ALT   = os.getenv("BITGET_V2_TICKER_PATH_ALT", "/api/v2/mix/market/get-ticker")
 V2_MARK_PATH         = os.getenv("BITGET_V2_MARK_PATH", "/api/v2/mix/market/mark-price")
+V2_MARK_PATH_ALT     = "/api/v2/mix/market/mark-prices"
+# [PATCH] Get-Symbol-Price 추가 (권장)
+V2_SYMBOL_PRICE_PATH = os.getenv("BITGET_V2_SYMBOL_PRICE_PATH", "/api/v2/mix/market/get-symbol-price")
+
 V2_DEPTH_PATH        = os.getenv("BITGET_V2_DEPTH_PATH", "/api/v2/mix/market/orderbook")
 V2_CANDLES_PATH      = os.getenv("BITGET_V2_CANDLES_PATH", "/api/v2/mix/market/candles")
 V2_INDEX_CANDLES_PATH= os.getenv("BITGET_V2_INDEX_CANDLES_PATH", "/api/v2/mix/market/index-candles")
@@ -50,7 +56,6 @@ V1_TICKER_PATH       = _ensure_v1_path(os.getenv("BITGET_V1_TICKER_PATH", "/api/
 V1_MARK_PATH         = _ensure_v1_path(os.getenv("BITGET_V1_MARK_PATH",   "/api/mix/v1/market/mark-price"))
 V1_DEPTH_PATH        = _ensure_v1_path(os.getenv("BITGET_V1_DEPTH_PATH",  "/api/mix/v1/market/depth"))
 V1_CANDLES_PATH      = _ensure_v1_path(os.getenv("BITGET_V1_CANDLES_PATH","/api/mix/v1/market/candles"))
-V2_MARK_PATH_ALT     = "/api/v2/mix/market/mark-prices"
 V1_PLACE_ORDER_PATH  = _ensure_v1_path(os.getenv("BITGET_V1_PLACE_ORDER_PATH", "/api/mix/v1/order/placeOrder"))
 V1_POSITIONS_PATH    = _ensure_v1_path(os.getenv("BITGET_V1_POSITIONS_PATH", "/api/mix/v1/position/allPosition"))
 
@@ -62,7 +67,7 @@ STRICT_TICKER        = os.getenv("STRICT_TICKER", "0") == "1"
 ALLOW_DEPTH_FALLBACK = os.getenv("ALLOW_DEPTH_FALLBACK", "1") == "1"
 TICKER_TTL           = int(os.getenv("TICKER_TTL", "3"))
 
-# [PATCH] 주문 시 강제 productType 지정(없으면 심볼로 추정)
+# [PATCH] 주문 productType 강제 지정 가능
 ORDER_PRODUCT_TYPE   = os.getenv("BITGET_ORDER_PRODUCT_TYPE", "").strip().upper()
 
 try:
@@ -214,7 +219,7 @@ def is_symbol_listed(symbol: str) -> bool:
 _ticker_cache: Dict[str, Tuple[float,float]] = {}
 
 def _cache_get(sym: str) -> Optional[float]:
-    row = _ticker_cache.get(sym); 
+    row = _ticker_cache.get(sym)
     if not row: return None
     ts, px = row
     return px if (time.time() - ts) <= TICKER_TTL else None
@@ -231,16 +236,18 @@ def _parse_px(js: Dict[str,Any]) -> Optional[float]:
                 try:
                     px = float(v)
                     if px>0: return px
-                except Exception: pass
+                except Exception:
+                    pass
         bid, ask = d.get("bestBid"), d.get("bestAsk")
         try:
             if bid not in (None,"") and ask not in (None,""):
                 b, a = float(bid), float(ask)
                 if b>0 and a>0: return (a+b)/2.0
-        except Exception: pass
+        except Exception:
+            pass
     return None
 
-# [PATCH] depth 응답에서 최고/최우선 가격 추출 (dict/list 모두 지원)
+# [PATCH] depth 응답 공통 파서(dict/list 모두)
 def _depth_best_prices(d: Any) -> Tuple[Optional[float], Optional[float]]:
     def _first_price(row):
         if isinstance(row, (list, tuple)) and row:
@@ -270,9 +277,28 @@ def _get_ticker_v2(sym: str, product: str) -> Optional[float]:
     if sc == 200:
         px = _parse_px(js)
         if px: return px
+    # [PATCH] get-ticker 도 시도
+    sc, js, _ = _http_get_soft(V2_TICKER_PATH_ALT, {"productType": product, "symbol": sym}, False)
+    if sc == 200:
+        px = _parse_px(js)
+        if px: return px
     sc, js, _ = _http_get_soft(V2_TICKER_PATH, {"productType": product, "symbol": sym}, False)
     if sc == 200: return _parse_px(js)
-    _log(f"ticker v2 fail {sym}/{product}: {sc}"); return None
+    return None
+
+def _get_symbol_price_v2(sym: str, product: str) -> Optional[float]:
+    # [PATCH] 지원팀 권장 엔드포인트
+    sc, js, _ = _http_get_soft(V2_SYMBOL_PRICE_PATH, {"productType": product, "symbol": sym}, False)
+    if sc == 200 and isinstance(js, dict):
+        d = js.get("data") or {}
+        v = d.get("price") or d.get("markPrice") or d.get("lastPr")
+        if v not in (None,"","null"):
+            try: 
+                px = float(v)
+                if px>0: return px
+            except: 
+                pass
+    return None
 
 def _get_mark_v2(sym: str, product: str) -> Optional[float]:
     sc, js, _ = _http_get_soft(V2_MARK_PATH, {"symbol": sym}, False)
@@ -288,7 +314,10 @@ def _get_mark_v2(sym: str, product: str) -> Optional[float]:
                 if str(row.get("symbol","")).upper() == sym.upper():
                     v = row.get("markPrice") or row.get("price")
                     if v not in (None,"","null"): return float(v)
-    _log(f"mark v2/alt fail {sym}/{product}: {sc}"); return None
+    # [PATCH] 마지막으로 get-symbol-price 사용
+    px = _get_symbol_price_v2(sym, product)
+    if px: return px
+    return None
 
 def _get_depth_mid_v2(sym: str, product: str) -> Optional[float]:
     sc, js, _ = _http_get_soft(V2_DEPTH_PATH, {"symbol": sym}, False)
@@ -301,7 +330,7 @@ def _get_depth_mid_v2(sym: str, product: str) -> Optional[float]:
         d = js.get("data") or {}
         bid, ask = _depth_best_prices(d)
         if bid and ask: return (ask + bid) / 2.0
-    _log(f"depth v2 fail {sym}/{product}: {sc}"); return None
+    return None
 
 def _get_candle_close_v2(sym: str, product: str) -> Optional[float]:
     sc, js, _ = _http_get_soft(V2_CANDLES_PATH, {"symbol": sym, "granularity": CANDLE_GRANULARITY, "limit": 2}, False)
@@ -311,7 +340,7 @@ def _get_candle_close_v2(sym: str, product: str) -> Optional[float]:
             row = data[-2] if len(data)>=2 else data[-1]
             close = (row[4] if isinstance(row,(list,tuple)) and len(row)>=5 else (row.get("close") if isinstance(row,dict) else None))
             if close not in (None,"","null"): return float(close)
-    _log(f"candles v2 fail {sym}/{product}: {sc}"); return None
+    return None
 
 def _get_index_candle_close_v2(sym: str, product: str) -> Optional[float]:
     sc, js, _ = _http_get_soft(V2_INDEX_CANDLES_PATH, {"symbol": sym, "granularity": CANDLE_GRANULARITY, "limit": 2}, False)
@@ -321,12 +350,12 @@ def _get_index_candle_close_v2(sym: str, product: str) -> Optional[float]:
             row = data[-2] if len(data)>=2 else data[-1]
             close = (row[4] if isinstance(row,(list,tuple)) and len(row)>=5 else (row.get("close") if isinstance(row,dict) else None))
             if close not in (None,"","null"): return float(close)
-    _log(f"index-candles v2 fail {sym}/{product}: {sc}"); return None
+    return None
 
 def _get_ticker_v1(sym: str) -> Optional[float]:
     sc, js, _ = _http_get_soft(V1_TICKER_PATH, {"symbol": f"{sym}_UMCBL"}, False)
     if sc == 200 and isinstance(js, dict): return _parse_px(js)
-    _log(f"ticker v1 fail {sym}: {sc}"); return None
+    return None
 
 def _get_mark_v1(sym: str) -> Optional[float]:
     sc, js, _ = _http_get_soft(V1_MARK_PATH, {"symbol": f"{sym}_UMCBL"}, False)
@@ -334,15 +363,15 @@ def _get_mark_v1(sym: str) -> Optional[float]:
         d = js.get("data") or {}
         v = d.get("markPrice") or d.get("price")
         if v not in (None,"","null"): return float(v)
-    _log(f"mark v1 fail {sym}: {sc}"); return None
+    return None
 
 def _get_depth_mid_v1(sym: str) -> Optional[float]:
     sc, js, _ = _http_get_soft(V1_DEPTH_PATH, {"symbol": f"{sym}_UMCBL", "limit": 1}, False)
     if sc == 200 and isinstance(js, dict):
         d = js.get("data") or {}
-        bid, ask = _depth_best_prices(d)      # 공통 파서
+        bid, ask = _depth_best_prices(d)
         if bid and ask: return (ask + bid) / 2.0
-    _log(f"depth v1 fail {sym}: {sc}"); return None
+    return None
 
 def _get_candle_close_v1(sym: str, granularity: int) -> Optional[float]:
     sc, js, _ = _http_get_soft(V1_CANDLES_PATH, {"symbol": f"{sym}_UMCBL","granularity": str(granularity),"limit":"2"}, False)
@@ -352,19 +381,16 @@ def _get_candle_close_v1(sym: str, granularity: int) -> Optional[float]:
             row = data[-2] if len(data)>=2 else data[-1]
             close = row[4] if isinstance(row,(list,tuple)) and len(row)>=5 else (row.get("close") if isinstance(row,dict) else None)
             if close not in (None,"","null"): return float(close)
-    _log(f"candles v1 fail {sym}: {sc}"); return None
+    return None
 
 def get_last_price(symbol: str) -> Optional[float]:
     symbol = convert_symbol(symbol)
-    if not is_symbol_listed(symbol):
-        _log(f"⚠️ {symbol} not in contracts cache (목록 캐시 기준)")
-
     cached = _cache_get(symbol)
     if cached: return cached
 
     if USE_V2:
         s = symbol
-        for product in _v2_product_types():
+        for product in [V2_PRODUCT_TYPE] + [y.strip() for y in (V2_PRODUCT_TYPE_ALTS or "").split(",") if y.strip()]:
             px = _get_ticker_v2(s, product)
             if px: _cache_set(symbol, px); return px
             px = _get_mark_v2(s, product)
@@ -377,6 +403,7 @@ def get_last_price(symbol: str) -> Optional[float]:
             px = _get_index_candle_close_v2(s, product)
             if px: _cache_set(symbol, px); return px
 
+        # v1 폴백 (선택)
         if not STRICT_TICKER:
             px = _get_ticker_v1(symbol)
             if px: _cache_set(symbol, px); return px
@@ -387,11 +414,11 @@ def get_last_price(symbol: str) -> Optional[float]:
                 if px: _cache_set(symbol, px); return px
             px = _get_candle_close_v1(symbol, CANDLE_GRANULARITY)
             if px: _cache_set(symbol, px); return px
-        _log(f"❌ Ticker 실패(최종): {symbol} v2=True"); return None
+        return None
 
     px = _get_ticker_v1(symbol)
     if px: _cache_set(symbol, px); return px
-    _log(f"❌ Ticker 실패(최종): {symbol} v2=False"); return None
+    return None
 
 # ────────────────────────────────────────────────────────
 # 주문/감축
@@ -409,7 +436,6 @@ def _guess_product_type(symbol: str) -> str:
     if s.endswith("USDT"): return "USDT-FUTURES"
     if s.endswith("USDC"): return "USDC-FUTURES"
     if s.endswith("USD"):  return "COIN-FUTURES"
-    # 기본값
     return V2_PRODUCT_TYPE or "USDT-FUTURES"
 
 def _order_size_from_usdt(symbol: str, usdt_amount: float) -> float:
@@ -424,12 +450,11 @@ def place_market_order(symbol: str, usdt_amount: float, side: str, leverage: flo
     size = _order_size_from_usdt(sym, float(usdt_amount))
     if size <= 0: raise RuntimeError(f"size_calc_fail {sym} amt={usdt_amount}")
 
-    # [PATCH] 여기서 productType을 확정
     pt = _guess_product_type(sym)
 
-    # v2 (레거시 포맷)
+    # v2 (레거시 side=open_long/close_short)
     body_v2_legacy = {
-        "productType": pt,                 # [PATCH] 필수 추가
+        "productType": pt,
         "symbol": sym,
         "marginCoin": MARGIN_COIN,
         "side": _api_side(side, reduce_only),
@@ -439,39 +464,33 @@ def place_market_order(symbol: str, usdt_amount: float, side: str, leverage: flo
         "price": "",
         "force": "gtc",
         "reduceOnly": reduce_only,
-        "marginMode": "cross",
+        "marginMode": "crossed",   # [PATCH] cross -> crossed
         "leverage": str(leverage),
     }
     sc, js, txt = _http_post_soft(V2_PLACE_ORDER_PATH, body_v2_legacy, True)
-    if sc == 200:
-        if isinstance(js, dict):
-            if (js.get("code") in ("00000","0",0,None)) or js.get("data"):
-                return js
-        elif isinstance(js, list):
-            return {"code":"00000","data": js}
-    _log(f"place_order v2 legacy fail {sym}: {sc} {txt}")
+    if sc == 200 and isinstance(js, dict) and ((js.get("code") in ("00000","0",0,None)) or js.get("data")):
+        return js
+    if sc == 200 and isinstance(js, list):
+        return {"code":"00000","data":js}
 
-    # v2 (신규 포맷: side+tradeSide)
+    # v2 (신규 side=buy/sell)
     body_v2_new = {
-        "productType": pt,                 # [PATCH] 필수 추가
+        "productType": pt,
         "symbol": sym,
         "marginCoin": MARGIN_COIN,
         "size": str(size),
         "side": ("buy" if str(side).lower() in ("buy","long") else "sell"),
-        "tradeSide": ("close" if reduce_only else "open"),
+        # tradeSide 없이도 동작 (원웨이 기준). 필요시 "open"/"close" 추가 가능.
         "orderType": "market",
         "force": "gtc",
-        "marginMode": "cross",
+        "marginMode": "crossed",   # [PATCH]
         "leverage": str(leverage),
     }
     sc, js, txt = _http_post_soft(V2_PLACE_ORDER_PATH, body_v2_new, True)
-    if sc == 200:
-        if isinstance(js, dict):
-            if (js.get("code") in ("00000","0",0,None)) or js.get("data"):
-                return js
-        elif isinstance(js, list):
-            return {"code":"00000","data": js}
-    _log(f"place_order v2 new fail {sym}: {sc} {txt}")
+    if sc == 200 and isinstance(js, dict) and ((js.get("code") in ("00000","0",0,None)) or js.get("data")):
+        return js
+    if sc == 200 and isinstance(js, list):
+        return {"code":"00000","data":js}
 
     # v1 폴백
     body_v1 = {
@@ -484,20 +503,19 @@ def place_market_order(symbol: str, usdt_amount: float, side: str, leverage: flo
         "reduceOnly": reduce_only
     }
     sc, js, txt = _http_post_soft(V1_PLACE_ORDER_PATH, body_v1, True)
-    if sc == 200:
-        if isinstance(js, dict):
-            if (js.get("code") in ("00000","0",0,None)) or js.get("data"):
-                return js
-        elif isinstance(js, list):
-            return {"code":"00000","data": js}
-    _log(f"place_order v1 fail {sym}: {sc} {txt}")
+    if sc == 200 and isinstance(js, dict) and ((js.get("code") in ("00000","0",0,None)) or js.get("data")):
+        return js
+    if sc == 200 and isinstance(js, list):
+        return {"code":"00000","data":js}
+
+    _log(f"place_order v2/v1 fail {sym}: {sc} {txt}")
     return {"code": str(sc), "msg": txt or "place_order_failed", "data": js}
 
 def place_reduce_by_size(symbol: str, size: float, side: str) -> Dict[str,Any]:
     sym = convert_symbol(symbol)
-    pt = _guess_product_type(sym)           # [PATCH]
+    pt  = _guess_product_type(sym)
     body = {
-        "productType": pt,                  # [PATCH]
+        "productType": pt,
         "symbol": sym,
         "marginCoin": MARGIN_COIN,
         "side": _api_side(side, True),
@@ -506,16 +524,13 @@ def place_reduce_by_size(symbol: str, size: float, side: str) -> Dict[str,Any]:
         "size": str(size),
         "price": "",
         "reduceOnly": True,
-        "marginMode": "cross",
+        "marginMode": "crossed",   # [PATCH]
     }
     sc, js, txt = _http_post_soft(V2_PLACE_ORDER_PATH, body, True)
-    if sc == 200:
-        if isinstance(js, dict):
-            if (js.get("code") in ("00000","0",0,None)) or js.get("data"):
-                return js
-        elif isinstance(js, list):
-            return {"code":"00000","data": js}
-    _log(f"reduce_by_size v2 fail {sym}: {sc} {txt}")
+    if sc == 200 and isinstance(js, dict) and ((js.get("code") in ("00000","0",0,None)) or js.get("data")):
+        return js
+    if sc == 200 and isinstance(js, list):
+        return {"code":"00000","data":js}
     return js if isinstance(js, dict) else {"code": str(sc), "msg": txt, "data": js}
 
 # ────────────────────────────────────────────────────────
@@ -532,7 +547,8 @@ def _parse_positions_v2(js: Dict[str,Any]) -> List[Dict[str,Any]]:
             entry= float(row.get("averageOpenPrice",0) or 0)
             if size>0 and side in ("long","short"):
                 out.append({"symbol":sym,"side":side,"size":size,"entry_price":entry})
-        except Exception: pass
+        except Exception:
+            pass
     return out
 
 def _parse_positions_v1(js: Dict[str,Any]) -> List[Dict[str,Any]]:
@@ -547,7 +563,8 @@ def _parse_positions_v1(js: Dict[str,Any]) -> List[Dict[str,Any]]:
                 entry= float(pos.get("averageOpenPrice",0) or 0)
                 if size>0 and side in ("long","short"):
                     out.append({"symbol":sym,"side":side,"size":size,"entry_price":entry})
-        except Exception: pass
+        except Exception:
+            pass
     return out
 
 def _get_positions_v2(params) -> Optional[Dict[str,Any]]:
@@ -563,37 +580,19 @@ def _get_positions_v2(params) -> Optional[Dict[str,Any]]:
 
 def get_open_positions() -> List[Dict[str,Any]]:
     if USE_V2:
-        for product in _v2_product_types():
+        for product in [V2_PRODUCT_TYPE] + [y.strip() for y in (V2_PRODUCT_TYPE_ALTS or "").split(",") if y.strip()]:
             for params in ({"productType":product}, {"productType":product, "marginCoin":MARGIN_COIN}):
                 try:
                     js = _get_positions_v2(params)
                     if js: return _parse_positions_v2(js)
                 except Exception as e:
                     _log(f"positions v2 error: {e} url: {BASE_URL}{V2_POSITIONS_PATH}?{urlencode(params)}")
+        # 단일 포지션 조회 힌트 사용시 여기에 추가 가능
     # v1 폴백
-        hint = (os.getenv("POSITION_SYMBOLS_HINT") or "").strip()
-        if hint:
-            out: List[Dict[str,Any]] = []
-            symbols = [convert_symbol(x) for x in hint.split(",") if x.strip()]
-            for sym in symbols:
-                for product in _v2_product_types():
-                    try:
-                        js = _http_get("/api/v2/mix/position/single-position",
-                                       {"productType":product,"symbol":sym,"marginCoin":MARGIN_COIN}, True)
-                        d = js.get("data") or {}
-                        side = (d.get("holdSide") or "").lower()
-                        size = float(d.get("total",0) or 0)
-                        entry= float(d.get("averageOpenPrice",0) or 0)
-                        if size>0 and side in ("long","short"):
-                            out.append({"symbol":sym,"side":side,"size":size,"entry_price":entry})
-                    except Exception: pass
-            if out: return out
-
     for params in ({"productType":"umcbl"}, {"productType":"umcbl","marginCoin":MARGIN_COIN}):
         try:
             res = _with_retry_maintenance(_http_get_raw, V1_POSITIONS_PATH, params, True)
             if res.status_code == 200: return _parse_positions_v1(res.json())
-            _log(f"positions v1 {res.status_code} url: {BASE_URL}{V1_POSITIONS_PATH}?{urlencode(params)} body: {res.text}")
-        except Exception as e:
-            _log(f"positions v1 error: {e}")
+        except Exception:
+            pass
     return []
