@@ -1,8 +1,8 @@
 # -*- coding: utf-8 -*-
 """
 Bitget REST API helper (USDT-M Perpetual)
-[중략 없는 전체 파일 / 인터페이스 그대로 유지]
 """
+
 from __future__ import annotations
 import os, time, math, json, hmac, hashlib, base64
 from typing import Any, Dict, Optional, Tuple, List
@@ -228,6 +228,39 @@ def _parse_px(js: Dict[str,Any]) -> Optional[float]:
         except Exception: pass
     return None
 
+# [PATCH] depth 응답에서 최고호가/최우선매수 추출 (dict/list 모두 지원)
+def _depth_best_prices(d: Any) -> Tuple[Optional[float], Optional[float]]:
+    """
+    반환: (best_bid, best_ask)
+    """
+    def _first_price(row):
+        if isinstance(row, (list, tuple)) and row:
+            return row[0]
+        if isinstance(row, dict):
+            return row.get("price") or row.get("px")
+        return None
+
+    if isinstance(d, dict):
+        ask = d.get("bestAsk")
+        bid = d.get("bestBid")
+        if ask not in (None,"") and bid not in (None,""):
+            try: return float(bid), float(ask)
+            except: return None, None
+        asks = d.get("asks") or []
+        bids = d.get("bids") or []
+        if asks and bids:
+            ap = _first_price(asks[0]); bp = _first_price(bids[0])
+            try:
+                if ap not in (None,"") and bp not in (None,""):
+                    return float(bp), float(ap)
+            except: pass
+        return None, None
+    if isinstance(d, list) and d:
+        # 리스트면 첫 요소로 재귀
+        return _depth_best_prices(d[0])
+    return None, None
+# /[PATCH]
+
 def _get_ticker_v2(sym: str, product: str) -> Optional[float]:
     sc, js, _ = _http_get_soft(V2_TICKER_PATH, {"symbol": sym}, False)
     if sc == 200:
@@ -258,28 +291,16 @@ def _get_depth_mid_v2(sym: str, product: str) -> Optional[float]:
     sc, js, _ = _http_get_soft(V2_DEPTH_PATH, {"symbol": sym}, False)
     if sc == 200 and isinstance(js, dict):
         d = js.get("data") or {}
-        if isinstance(d, list) and d:
-            d = d[0] if isinstance(d[0], dict) else {}
-        if isinstance(d, dict):
-            best_ask = d.get("bestAsk")
-            best_bid = d.get("bestBid")
-            if not best_ask or not best_bid:
-                asks = d.get("asks") or []; bids = d.get("bids") or []
-                if asks and isinstance(asks, list):
-                    best_ask = asks[0][0] if isinstance(asks[0], (list,tuple)) else asks[0].get("price")
-                if bids and isinstance(bids, list):
-                    best_bid = bids[0][0] if isinstance(bids[0], (list,tuple)) else bids[0].get("price")
-            if best_ask and best_bid:
-                try: return (float(best_ask)+float(best_bid))/2.0
-                except Exception: pass
+        bid, ask = _depth_best_prices(d)             # [PATCH]
+        if bid and ask: return (ask + bid) / 2.0
+
+    # productType 포함 재시도
     sc, js, _ = _http_get_soft(V2_DEPTH_PATH, {"productType": product, "symbol": sym}, False)
     if sc == 200 and isinstance(js, dict):
         d = js.get("data") or {}
-        best_ask = d.get("bestAsk") or (d.get("asks") or [{}])[0].get("price")
-        best_bid = d.get("bestBid") or (d.get("bids") or [{}])[0].get("price")
-        if best_ask and best_bid:
-            try: return (float(best_ask)+float(best_bid))/2.0
-            except Exception: pass
+        bid, ask = _depth_best_prices(d)             # [PATCH]
+        if bid and ask: return (ask + bid) / 2.0
+
     _log(f"depth v2 fail {sym}/{product}: {sc}"); return None
 
 def _get_candle_close_v2(sym: str, product: str) -> Optional[float]:
@@ -318,12 +339,9 @@ def _get_mark_v1(sym: str) -> Optional[float]:
 def _get_depth_mid_v1(sym: str) -> Optional[float]:
     sc, js, _ = _http_get_soft(V1_DEPTH_PATH, {"symbol": f"{sym}_UMCBL", "limit": 1}, False)
     if sc == 200 and isinstance(js, dict):
-        d = js.get("data") or {}; bids = d.get("bids") or []; asks = d.get("asks") or []
-        if bids and asks:
-            try:
-                b = float(bids[0][0]); a = float(asks[0][0])
-                if b>0 and a>0: return (a+b)/2.0
-            except Exception: pass
+        d = js.get("data") or {}
+        bid, ask = _depth_best_prices(d)             # [PATCH] v1도 공통 파서 사용
+        if bid and ask: return (ask + bid) / 2.0
     _log(f"depth v1 fail {sym}: {sc}"); return None
 
 def _get_candle_close_v1(sym: str, granularity: int) -> Optional[float]:
@@ -402,14 +420,13 @@ def place_market_order(symbol: str, usdt_amount: float, side: str, leverage: flo
         "size": str(size), "price": "", "force": "gtc",
         "reduceOnly": reduce_only, "marginMode": "cross", "leverage": str(leverage),
     }
-    # [PATCH] 응답이 dict가 아닐 때도 안전 처리
     sc, js, txt = _http_post_soft(V2_PLACE_ORDER_PATH, body_v2_legacy, True)
     if sc == 200:
         if isinstance(js, dict):
             if (js.get("code") in ("00000","0",0,None)) or js.get("data"):
                 return js
-        elif isinstance(js, list):
-            return {"code":"00000","data": js}  # 리스트 응답 호환
+        elif isinstance(js, list):                    # [PATCH]
+            return {"code":"00000","data": js}
 
     _log(f"place_order v2 legacy fail {sym}: {sc} {txt}")
 
@@ -425,7 +442,7 @@ def place_market_order(symbol: str, usdt_amount: float, side: str, leverage: flo
         if isinstance(js, dict):
             if (js.get("code") in ("00000","0",0,None)) or js.get("data"):
                 return js
-        elif isinstance(js, list):
+        elif isinstance(js, list):                    # [PATCH]
             return {"code":"00000","data": js}
 
     _log(f"place_order v2 new fail {sym}: {sc} {txt}")
@@ -442,7 +459,7 @@ def place_market_order(symbol: str, usdt_amount: float, side: str, leverage: flo
         if isinstance(js, dict):
             if (js.get("code") in ("00000","0",0,None)) or js.get("data"):
                 return js
-        elif isinstance(js, list):
+        elif isinstance(js, list):                    # [PATCH]
             return {"code":"00000","data": js}
 
     _log(f"place_order v1 fail {sym}: {sc} {txt}")
@@ -456,13 +473,12 @@ def place_reduce_by_size(symbol: str, size: float, side: str) -> Dict[str,Any]:
         "orderType": "market", "timeInForceValue": "normal",
         "size": str(size), "price": "", "reduceOnly": True, "marginMode": "cross",
     }
-    # [PATCH] 리스트/딕트 응답 모두 수용
     sc, js, txt = _http_post_soft(V2_PLACE_ORDER_PATH, body, True)
     if sc == 200:
         if isinstance(js, dict):
             if (js.get("code") in ("00000","0",0,None)) or js.get("data"):
                 return js
-        elif isinstance(js, list):
+        elif isinstance(js, list):                    # [PATCH]
             return {"code":"00000","data": js}
     _log(f"reduce_by_size v2 fail {sym}: {sc} {txt}")
     return js if isinstance(js, dict) else {"code": str(sc), "msg": txt, "data": js}
