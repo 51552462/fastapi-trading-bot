@@ -24,6 +24,8 @@ QUEUE_MAX              = int(os.getenv("QUEUE_MAX", "2000"))
 LOG_INGRESS            = os.getenv("LOG_INGRESS", "0") == "1"
 
 FORCE_DEFAULT_AMOUNT   = os.getenv("FORCE_DEFAULT_AMOUNT", "0") == "1"
+# [PATCH] Pine amount보다 ENV(롱/숏) 금액을 우선 적용할지 선택 (기본 1=ENV 우선)
+PREFER_ENV_AMOUNT      = os.getenv("PREFER_ENV_AMOUNT", "1") == "1"
 
 SYMBOL_AMOUNT_JSON = os.getenv("SYMBOL_AMOUNT_JSON", "")
 try:
@@ -110,6 +112,15 @@ def _safe_float(v: Any, fallback: float) -> float:
         return float(fallback)
 
 def _resolve_amount(symbol: str, side: str, payload: Dict[str, Any]) -> float:
+    # [PATCH] ENV 우선 적용(기본): Pine amount보다 DEFAULT_AMOUNT_* 를 먼저 적용
+    if PREFER_ENV_AMOUNT or FORCE_DEFAULT_AMOUNT:
+        if side == "long":
+            return float(DEFAULT_AMOUNT_LONG)
+        if side == "short":
+            return float(DEFAULT_AMOUNT_SHORT)
+        return float(DEFAULT_AMOUNT)
+
+    # 기존 동작: payload → SYMBOL_AMOUNT → ENV 기본값
     if not FORCE_DEFAULT_AMOUNT:
         if "amount" in payload and str(payload["amount"]).strip() != "":
             try:
@@ -469,6 +480,7 @@ def config():
         "DEFAULT_AMOUNT_LONG": DEFAULT_AMOUNT_LONG,
         "DEFAULT_AMOUNT_SHORT": DEFAULT_AMOUNT_SHORT,
         "FORCE_DEFAULT_AMOUNT": FORCE_DEFAULT_AMOUNT,
+        "PREFER_ENV_AMOUNT": PREFER_ENV_AMOUNT,  # [PATCH] 노출
         "LEVERAGE": LEVERAGE,
         "DEDUP_TTL": DEDUP_TTL, "BIZDEDUP_TTL": BIZDEDUP_TTL,
         "WORKERS": WORKERS, "QUEUE_MAX": QUEUE_MAX,
