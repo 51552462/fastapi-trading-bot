@@ -24,7 +24,7 @@ QUEUE_MAX              = int(os.getenv("QUEUE_MAX", "2000"))
 LOG_INGRESS            = os.getenv("LOG_INGRESS", "0") == "1"
 
 FORCE_DEFAULT_AMOUNT   = os.getenv("FORCE_DEFAULT_AMOUNT", "0") == "1"
-# [PATCH] Pine amount보다 ENV(롱/숏) 금액을 우선 적용할지 선택 (기본 1=ENV 우선)
+# [PATCH] Pine amount보다 ENV(롱/숏) 금액을 우선 적용(기본 1)
 PREFER_ENV_AMOUNT      = os.getenv("PREFER_ENV_AMOUNT", "1") == "1"
 
 SYMBOL_AMOUNT_JSON = os.getenv("SYMBOL_AMOUNT_JSON", "")
@@ -47,12 +47,13 @@ def _dedup_key(d: Dict[str, Any]) -> str:
     return hashlib.sha1(json.dumps(d, sort_keys=True).encode()).hexdigest()
 
 def _norm_symbol(sym: str) -> str:
-    return convert_symbol(sym)
+    try:
+        return convert_symbol(sym)
+    except Exception:
+        return (sym or "").upper()
 
 def _pick_symbol(d: Dict[str, Any]) -> str:
-    """
-    TradingView/테스트에서 symbol 키가 다르게 들어오는 케이스까지 흡수.
-    """
+    """TradingView/테스트에서 symbol 키가 다르게 들어오는 케이스까지 흡수."""
     for k in ("symbol", "ticker", "pair", "contract", "sym", "symbolName"):
         v = d.get(k)
         if isinstance(v, str) and v.strip():
@@ -62,9 +63,6 @@ def _pick_symbol(d: Dict[str, Any]) -> str:
     return ""
 
 def _infer_side(side: Optional[str], default: str = "long") -> str:
-    """
-    'buy'→long, 'sell'→short 포함. 기본은 long.
-    """
     s = (side or "").strip().lower()
     if s in ("long", "short"):
         return s
@@ -89,30 +87,23 @@ def _norm_type(typ: str) -> str:
         "reducecontracts": "reducebycontracts",
         "reduce_by_contracts": "reducebycontracts",
         "panicclose": "close", "panic": "close",
-        "breakeven": "breakeven", "breakevenexit": "breakeven",
+        "breakeven": "breakeven", "entrysignal": "entry"
     }
     return aliases.get(t, t)
 
 def _safe_float(v: Any, fallback: float) -> float:
-    """
-    dict/list/None/문자열까지 안전 변환. 실패 시 fallback.
-    """
     try:
-        if v is None:
-            return float(fallback)
-        if isinstance(v, (int, float)):
-            return float(v)
-        if isinstance(v, (dict, list, tuple)):
-            return float(fallback)
+        if v is None: return float(fallback)
+        if isinstance(v, (int, float)): return float(v)
+        if isinstance(v, (dict, list, tuple)): return float(fallback)
         s = str(v).strip()
-        if s == "" or s.lower() == "null":
-            return float(fallback)
+        if s == "" or s.lower() == "null": return float(fallback)
         return float(s)
     except Exception:
         return float(fallback)
 
 def _resolve_amount(symbol: str, side: str, payload: Dict[str, Any]) -> float:
-    # [PATCH] ENV 우선 적용(기본): Pine amount보다 DEFAULT_AMOUNT_* 를 먼저 적용
+    # [PATCH] ENV 우선 적용(기본): Pine amount보다 DEFAULT_AMOUNT_* 먼저 사용
     if PREFER_ENV_AMOUNT or FORCE_DEFAULT_AMOUNT:
         if side == "long":
             return float(DEFAULT_AMOUNT_LONG)
@@ -123,19 +114,13 @@ def _resolve_amount(symbol: str, side: str, payload: Dict[str, Any]) -> float:
     # 기존 동작: payload → SYMBOL_AMOUNT → ENV 기본값
     if not FORCE_DEFAULT_AMOUNT:
         if "amount" in payload and str(payload["amount"]).strip() != "":
-            try:
-                return float(payload["amount"])
-            except Exception:
-                pass
+            try: return float(payload["amount"])
+            except Exception: pass
         if symbol in SYMBOL_AMOUNT and str(SYMBOL_AMOUNT[symbol]).strip() != "":
-            try:
-                return float(SYMBOL_AMOUNT[symbol])
-            except Exception:
-                pass
-    if side == "long":
-        return float(DEFAULT_AMOUNT_LONG)
-    if side == "short":
-        return float(DEFAULT_AMOUNT_SHORT)
+            try: return float(SYMBOL_AMOUNT[symbol])
+            except Exception: pass
+    if side == "long": return float(DEFAULT_AMOUNT_LONG)
+    if side == "short": return float(DEFAULT_AMOUNT_SHORT)
     return float(DEFAULT_AMOUNT)
 
 # 느슨한 문자열 파서
@@ -165,24 +150,6 @@ def _loose_kv_to_dict(txt: str) -> Dict[str, Any]:
         if k:
             out[k] = v
     return out
-
-# dict/list/str 등 들어와도 dict로 보정 시도
-def _unwrap_nested_json(d: Dict[str, Any]) -> Dict[str, Any]:
-    for k in ("message", "alert", "payload"):
-        v = d.get(k)
-        if isinstance(v, (str, bytes)):
-            s = v.decode() if isinstance(v, bytes) else v
-            s = s.strip()
-            if s.startswith("{") and s.endswith("}"):
-                try:
-                    inner = json.loads(s)
-                    if isinstance(inner, dict):
-                        dd = dict(d)
-                        dd.update(inner)
-                        return dd
-                except Exception:
-                    pass
-    return d
 
 # ─────────────────────────────────────────────────────────────
 # [PATCH] 리스트/기타 타입 보정 헬퍼 (끝까지 dict로 강제)
@@ -216,6 +183,24 @@ def _coerce_to_dict(x: Any) -> Optional[Dict[str, Any]]:
         return _loose_kv_to_dict(s) or None
     return None
 # ─────────────────────────────────────────────────────────────
+
+# dict/list/str 등 들어와도 dict로 보정 시도 (message/alert/payload 안쪽도 풀어줌)
+def _unwrap_nested_json(d: Dict[str, Any]) -> Dict[str, Any]:
+    for k in ("message", "alert", "payload"):
+        v = d.get(k)
+        if isinstance(v, (str, bytes)):
+            s = v.decode() if isinstance(v, bytes) else v
+            s = s.strip()
+            if s.startswith("{") and s.endswith("}"):
+                try:
+                    inner = json.loads(s)
+                    if isinstance(inner, dict):
+                        dd = dict(d); dd.update(inner); return dd
+                except Exception:
+                    pass
+        elif isinstance(v, dict):
+            dd = dict(d); dd.update(v); return dd
+    return d
 
 # Payload 파서
 async def _parse_any(req: Request) -> Dict[str, Any]:
@@ -263,6 +248,11 @@ async def _parse_any(req: Request) -> Dict[str, Any]:
                 kv = _loose_kv_to_dict(str(payload))
                 if kv:
                     return _unwrap_nested_json(kv)
+        else:
+            # 키-값 전체를 dict로 변환
+            as_dict = {k: (form.get(k) or "") for k in form.keys()}
+            if as_dict:
+                return _unwrap_nested_json(as_dict)
     except Exception:
         pass
     # 4) 최후의 문자열 파편 모음
@@ -293,35 +283,28 @@ def _handle_signal(data: Any):
 
     # [PATCH] 일부 케이스에서 type이 리스트로 오는 것 방어
     if isinstance(data.get("type"), (list, tuple)):
-        try:
-            data["type"] = (data["type"][0] or "")
-        except Exception:
-            data["type"] = ""
+        try: data["type"] = (data["type"][0] or "")
+        except Exception: data["type"] = ""
+
     typ_raw = (
-        data.get("type")
-        or data.get("event")
-        or data.get("action")
-        or data.get("signalType")
-        or ""
+        data.get("type") or data.get("event") or data.get("action") or
+        data.get("signalType") or data.get("cmd") or ""
     )
 
-    # 심볼/사이드 추출(다양한 키 대응)
     symbol  = _pick_symbol(data)
     side    = _infer_side(data.get("side") or data.get("direction"), "long")
-
     if not symbol:
         send_telegram("⚠️ symbol 없음: " + json.dumps(data)); return
 
     amount   = _resolve_amount(symbol, side, data)
     leverage = _safe_float(data.get("leverage"), LEVERAGE)
-
     t = _norm_type(typ_raw)
 
     # 비즈니스 디듀프(짧은 시간 동일액션 방지)
     now = time.time()
     bizkey = f"{t}:{symbol}:{side}"
     last = _BIZDEDUP.get(bizkey, 0.0)
-    if now - last < BIZDEDUP_TTL: 
+    if now - last < BIZDEDUP_TTL:
         return
     _BIZDEDUP[bizkey] = now
 
@@ -329,11 +312,12 @@ def _handle_signal(data: Any):
         try: send_telegram(f"📥 {t} {symbol} {side} amt={amount}")
         except: pass
 
+    # ----------------- 액션 분기 -----------------
     if t == "entry":
         enter_position(symbol, amount, side=side, leverage=leverage); return
 
     if t in ("tp1","tp2","tp3"):
-        pct = float(os.getenv("TP1_PCT","0.30")) if t=="tp1" else float(os.getenv("TP2_PCT","0.40")) if t=="tp2" else float(os.getenv("TP3_PCT","0.30"))
+        pct = float(os.getenv("TP1_PCT","0.30")) if t=="tp1" else float(os.getenv("TP2_PCT","0.5714286")) if t=="tp2" else float(os.getenv("TP3_PCT","1.0"))
         take_partial_profit(symbol, pct, side=side); return
 
     CLOSE_KEYS = {"stoploss","emaexit","failcut","fullexit","close","exit","liquidation","sl1","sl2","breakeven"}
@@ -345,7 +329,7 @@ def _handle_signal(data: Any):
         if contracts > 0: reduce_by_contracts(symbol, contracts, side=side)
         return
 
-    if t in ("tailtouch","info","debug"): 
+    if t in ("tailtouch","info","debug"):
         return
 
     send_telegram("❓ 알 수 없는 신호: " + json.dumps(data))
@@ -382,11 +366,8 @@ def _worker_loop(idx: int):
             _handle_signal(data)
 
         except Exception as e:
-            # [PATCH] 어디서 터지는지 추적 위해 payload 타입/프리뷰 같이 로깅
-            try:
-                preview = str(data)
-            except Exception:
-                preview = "<unrepr>"
+            try: preview = str(data)
+            except Exception: preview = "<unrepr>"
             print(f"[worker-{idx}] error: {e} | type={type(data).__name__} | payload={preview[:500]}")
             print(traceback.format_exc())
         finally:
