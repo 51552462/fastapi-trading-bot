@@ -30,11 +30,11 @@ API_PASS  = os.getenv("BITGET_API_PASSWORD", "")
 
 USE_V2               = os.getenv("BITGET_USE_V2", "1") == "1"
 V2_TICKER_PATH       = os.getenv("BITGET_V2_TICKER_PATH", "/api/v2/mix/market/ticker")
-# [PATCH] v2 권장 엔드포인트 추가 (지원팀 안내)
+# v2 권장 엔드포인트(지원팀 가이드)
 V2_TICKER_PATH_ALT   = os.getenv("BITGET_V2_TICKER_PATH_ALT", "/api/v2/mix/market/get-ticker")
 V2_MARK_PATH         = os.getenv("BITGET_V2_MARK_PATH", "/api/v2/mix/market/mark-price")
 V2_MARK_PATH_ALT     = "/api/v2/mix/market/mark-prices"
-# [PATCH] Get-Symbol-Price 추가 (권장)
+# 권장: Get-Symbol-Price
 V2_SYMBOL_PRICE_PATH = os.getenv("BITGET_V2_SYMBOL_PRICE_PATH", "/api/v2/mix/market/get-symbol-price")
 
 V2_DEPTH_PATH        = os.getenv("BITGET_V2_DEPTH_PATH", "/api/v2/mix/market/orderbook")
@@ -67,7 +67,7 @@ STRICT_TICKER        = os.getenv("STRICT_TICKER", "0") == "1"
 ALLOW_DEPTH_FALLBACK = os.getenv("ALLOW_DEPTH_FALLBACK", "1") == "1"
 TICKER_TTL           = int(os.getenv("TICKER_TTL", "3"))
 
-# [PATCH] 주문 productType 강제 지정 가능
+# 주문 productType 강제 지정(선택)
 ORDER_PRODUCT_TYPE   = os.getenv("BITGET_ORDER_PRODUCT_TYPE", "").strip().upper()
 
 try:
@@ -96,6 +96,7 @@ def _log(msg: str):
 def _ts_ms() -> str: return str(int(time.time()*1000))
 
 def _sign(ts: str, method: str, path: str, query: str, body: str) -> str:
+    # v2: base64(HMAC_SHA256(accessSecret, timestamp+method+requestPath+queryString+body))
     prehash = f"{ts}{method}{path}{query}{body}"
     mac = hmac.new(API_SEC.encode(), prehash.encode(), hashlib.sha256).digest()
     return base64.b64encode(mac).decode()
@@ -247,7 +248,6 @@ def _parse_px(js: Dict[str,Any]) -> Optional[float]:
             pass
     return None
 
-# [PATCH] depth 응답 공통 파서(dict/list 모두)
 def _depth_best_prices(d: Any) -> Tuple[Optional[float], Optional[float]]:
     def _first_price(row):
         if isinstance(row, (list, tuple)) and row:
@@ -419,10 +419,21 @@ def get_last_price(symbol: str) -> Optional[float]:
 # ────────────────────────────────────────────────────────
 # 주문/감축
 # ────────────────────────────────────────────────────────
-def _api_side(side: str, reduce_only: bool) -> str:
+def _api_side_legacy(side: str, reduce_only: bool) -> str:
+    """레거시 표현(open_long/close_short 등) — 폴백용"""
     s = (side or "").lower()
     if s in ("buy","long"):  return "close_short" if reduce_only else "open_long"
     else:                    return "close_long"  if reduce_only else "open_short"
+
+def _api_side_v2_bs(side: str, reduce_only: bool) -> str:
+    """[FIX] v2 표준 표현: buy/sell + reduceOnly"""
+    s = (side or "").lower()
+    if reduce_only:
+        # 보유 long → sell, 보유 short → buy
+        return "sell" if s in ("buy","long","open_long") else "buy"
+    else:
+        # 신규 진입 long → buy, short → sell
+        return "buy" if s in ("buy","long","open_long") else "sell"
 
 def _guess_product_type(symbol: str) -> str:
     if ORDER_PRODUCT_TYPE:
@@ -438,7 +449,7 @@ def _order_size_from_usdt(symbol: str, usdt_amount: float) -> float:
     if not last or last<=0: return 0.0
     step = float(get_symbol_spec(symbol).get("sizeStep",0.001))
     size = float(usdt_amount) / float(last)
-    return round_down_step(size, step)
+    return max(step, round_down_step(size, step))
 
 def place_market_order(symbol: str, usdt_amount: float, side: str, leverage: float, reduce_only: bool=False) -> Dict[str,Any]:
     sym  = convert_symbol(symbol)
@@ -447,40 +458,41 @@ def place_market_order(symbol: str, usdt_amount: float, side: str, leverage: flo
 
     pt = _guess_product_type(sym)
 
-    # v2 (레거시 side=open_long/close_short)
-    body_v2_legacy = {
-        "productType": pt,
-        "symbol": sym,
-        "marginCoin": MARGIN_COIN,
-        "side": _api_side(side, reduce_only),
-        "orderType": "market",
-        "timeInForceValue": "normal",
-        "size": str(size),
-        "price": "",
-        "force": "gtc",
-        "reduceOnly": reduce_only,
-        "marginMode": "crossed",
-        "leverage": str(leverage),
-    }
-    sc, js, txt = _http_post_soft(V2_PLACE_ORDER_PATH, body_v2_legacy, True)
-    if sc == 200 and isinstance(js, dict) and ((js.get("code") in ("00000","0",0,None)) or js.get("data")):
-        return js
-    if sc == 200 and isinstance(js, list):
-        return {"code":"00000","data":js}
-
-    # v2 (신규 side=buy/sell)
+    # [FIX] v2-표준 (buy/sell + reduceOnly)
     body_v2_new = {
         "productType": pt,
         "symbol": sym,
         "marginCoin": MARGIN_COIN,
         "size": str(size),
-        "side": ("buy" if str(side).lower() in ("buy","long") else "sell"),
+        "side": _api_side_v2_bs(side, reduce_only),  # ← buy/sell
         "orderType": "market",
         "force": "gtc",
+        "reduceOnly": bool(reduce_only),
         "marginMode": "crossed",
         "leverage": str(leverage),
     }
     sc, js, txt = _http_post_soft(V2_PLACE_ORDER_PATH, body_v2_new, True)
+    if sc == 200 and isinstance(js, dict) and ((js.get("code") in ("00000","0",0,None)) or js.get("data")):
+        return js
+    if sc == 200 and isinstance(js, list):
+        return {"code":"00000","data":js}
+
+    # 레거시(side=open_long/close_short) 폴백
+    body_v2_legacy = {
+        "productType": pt,
+        "symbol": sym,
+        "marginCoin": MARGIN_COIN,
+        "side": _api_side_legacy(side, reduce_only),
+        "orderType": "market",
+        "timeInForceValue": "normal",
+        "size": str(size),
+        "price": "",
+        "force": "gtc",
+        "reduceOnly": bool(reduce_only),
+        "marginMode": "crossed",
+        "leverage": str(leverage),
+    }
+    sc, js, txt = _http_post_soft(V2_PLACE_ORDER_PATH, body_v2_legacy, True)
     if sc == 200 and isinstance(js, dict) and ((js.get("code") in ("00000","0",0,None)) or js.get("data")):
         return js
     if sc == 200 and isinstance(js, list):
@@ -494,7 +506,7 @@ def place_market_order(symbol: str, usdt_amount: float, side: str, leverage: flo
         "side": ("buy" if str(side).lower() in ("buy","long") else "sell"),
         "orderType": "market",
         "timeInForceValue": "normal",
-        "reduceOnly": reduce_only
+        "reduceOnly": bool(reduce_only)
     }
     sc, js, txt = _http_post_soft(V1_PLACE_ORDER_PATH, body_v1, True)
     if sc == 200 and isinstance(js, dict) and ((js.get("code") in ("00000","0",0,None)) or js.get("data")):
@@ -502,19 +514,18 @@ def place_market_order(symbol: str, usdt_amount: float, side: str, leverage: flo
     if sc == 200 and isinstance(js, list):
         return {"code":"00000","data":js}
 
-    _log(f"place_order v2/v1 fail {sym}: {sc} {txt}")
+    _log(f"place_order fail {sym}: {sc} {txt}")
     return {"code": str(sc), "msg": txt or "place_order_failed", "data": js}
 
 def place_reduce_by_size(symbol: str, size: float, side: str) -> Dict[str,Any]:
     """
-    size: 계약 수량, side: 보유 포지션의 방향(long/short).
-    v2 신규 포맷(side=buy/sell + reduceOnly) 우선 → 실패 시 레거시로 폴백.
+    size: 포지션 계약 수량, side: 보유 포지션의 방향(long/short).
     """
     sym = convert_symbol(symbol)
     pt  = _guess_product_type(sym)
 
-    # v2 신규 (권장): 보유 long → sell, 보유 short → buy
-    close_side_bs = "sell" if str(side).lower() in ("long","buy","open_long") else "buy"
+    # [FIX] v2-표준: close(long)->sell, close(short)->buy + reduceOnly=true
+    close_side_bs = _api_side_v2_bs(side, True)
     body_v2_new = {
         "productType": pt,
         "symbol": sym,
@@ -532,12 +543,12 @@ def place_reduce_by_size(symbol: str, size: float, side: str) -> Dict[str,Any]:
     if sc == 200 and isinstance(js, list):
         return {"code":"00000","data":js}
 
-    # v2 레거시 (open_long/close_short 등)
+    # 레거시 폴백
     body_v2_legacy = {
         "productType": pt,
         "symbol": sym,
         "marginCoin": MARGIN_COIN,
-        "side": _api_side(side, True),
+        "side": _api_side_legacy(side, True),
         "orderType": "market",
         "timeInForceValue": "normal",
         "size": str(size),
@@ -551,7 +562,6 @@ def place_reduce_by_size(symbol: str, size: float, side: str) -> Dict[str,Any]:
     if sc == 200 and isinstance(js, list):
         return {"code":"00000","data":js}
 
-    # v1 폴백은 필요시 추가 가능
     return js if isinstance(js, dict) else {"code": str(sc), "msg": txt, "data": js}
 
 # ────────────────────────────────────────────────────────
