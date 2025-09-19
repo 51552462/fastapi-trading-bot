@@ -277,7 +277,6 @@ def _get_ticker_v2(sym: str, product: str) -> Optional[float]:
     if sc == 200:
         px = _parse_px(js)
         if px: return px
-    # [PATCH] get-ticker 도 시도
     sc, js, _ = _http_get_soft(V2_TICKER_PATH_ALT, {"productType": product, "symbol": sym}, False)
     if sc == 200:
         px = _parse_px(js)
@@ -287,16 +286,15 @@ def _get_ticker_v2(sym: str, product: str) -> Optional[float]:
     return None
 
 def _get_symbol_price_v2(sym: str, product: str) -> Optional[float]:
-    # [PATCH] 지원팀 권장 엔드포인트
     sc, js, _ = _http_get_soft(V2_SYMBOL_PRICE_PATH, {"productType": product, "symbol": sym}, False)
     if sc == 200 and isinstance(js, dict):
         d = js.get("data") or {}
         v = d.get("price") or d.get("markPrice") or d.get("lastPr")
         if v not in (None,"","null"):
-            try: 
+            try:
                 px = float(v)
                 if px>0: return px
-            except: 
+            except:
                 pass
     return None
 
@@ -314,7 +312,6 @@ def _get_mark_v2(sym: str, product: str) -> Optional[float]:
                 if str(row.get("symbol","")).upper() == sym.upper():
                     v = row.get("markPrice") or row.get("price")
                     if v not in (None,"","null"): return float(v)
-    # [PATCH] 마지막으로 get-symbol-price 사용
     px = _get_symbol_price_v2(sym, product)
     if px: return px
     return None
@@ -403,7 +400,6 @@ def get_last_price(symbol: str) -> Optional[float]:
             px = _get_index_candle_close_v2(s, product)
             if px: _cache_set(symbol, px); return px
 
-        # v1 폴백 (선택)
         if not STRICT_TICKER:
             px = _get_ticker_v1(symbol)
             if px: _cache_set(symbol, px); return px
@@ -426,9 +422,8 @@ def get_last_price(symbol: str) -> Optional[float]:
 def _api_side(side: str, reduce_only: bool) -> str:
     s = (side or "").lower()
     if s in ("buy","long"):  return "close_short" if reduce_only else "open_long"
-    else:                    return "close_long" if reduce_only else "open_short"
+    else:                    return "close_long"  if reduce_only else "open_short"
 
-# [PATCH] 심볼로 productType 추정 (ENV BITGET_ORDER_PRODUCT_TYPE가 있으면 우선)
 def _guess_product_type(symbol: str) -> str:
     if ORDER_PRODUCT_TYPE:
         return ORDER_PRODUCT_TYPE
@@ -464,7 +459,7 @@ def place_market_order(symbol: str, usdt_amount: float, side: str, leverage: flo
         "price": "",
         "force": "gtc",
         "reduceOnly": reduce_only,
-        "marginMode": "crossed",   # [PATCH] cross -> crossed
+        "marginMode": "crossed",
         "leverage": str(leverage),
     }
     sc, js, txt = _http_post_soft(V2_PLACE_ORDER_PATH, body_v2_legacy, True)
@@ -480,10 +475,9 @@ def place_market_order(symbol: str, usdt_amount: float, side: str, leverage: flo
         "marginCoin": MARGIN_COIN,
         "size": str(size),
         "side": ("buy" if str(side).lower() in ("buy","long") else "sell"),
-        # tradeSide 없이도 동작 (원웨이 기준). 필요시 "open"/"close" 추가 가능.
         "orderType": "market",
         "force": "gtc",
-        "marginMode": "crossed",   # [PATCH]
+        "marginMode": "crossed",
         "leverage": str(leverage),
     }
     sc, js, txt = _http_post_soft(V2_PLACE_ORDER_PATH, body_v2_new, True)
@@ -512,9 +506,34 @@ def place_market_order(symbol: str, usdt_amount: float, side: str, leverage: flo
     return {"code": str(sc), "msg": txt or "place_order_failed", "data": js}
 
 def place_reduce_by_size(symbol: str, size: float, side: str) -> Dict[str,Any]:
+    """
+    size: 계약 수량, side: 보유 포지션의 방향(long/short).
+    v2 신규 포맷(side=buy/sell + reduceOnly) 우선 → 실패 시 레거시로 폴백.
+    """
     sym = convert_symbol(symbol)
     pt  = _guess_product_type(sym)
-    body = {
+
+    # v2 신규 (권장): 보유 long → sell, 보유 short → buy
+    close_side_bs = "sell" if str(side).lower() in ("long","buy","open_long") else "buy"
+    body_v2_new = {
+        "productType": pt,
+        "symbol": sym,
+        "marginCoin": MARGIN_COIN,
+        "size": str(size),
+        "side": close_side_bs,
+        "orderType": "market",
+        "force": "gtc",
+        "reduceOnly": True,
+        "marginMode": "crossed",
+    }
+    sc, js, txt = _http_post_soft(V2_PLACE_ORDER_PATH, body_v2_new, True)
+    if sc == 200 and isinstance(js, dict) and ((js.get("code") in ("00000","0",0,None)) or js.get("data")):
+        return js
+    if sc == 200 and isinstance(js, list):
+        return {"code":"00000","data":js}
+
+    # v2 레거시 (open_long/close_short 등)
+    body_v2_legacy = {
         "productType": pt,
         "symbol": sym,
         "marginCoin": MARGIN_COIN,
@@ -524,13 +543,15 @@ def place_reduce_by_size(symbol: str, size: float, side: str) -> Dict[str,Any]:
         "size": str(size),
         "price": "",
         "reduceOnly": True,
-        "marginMode": "crossed",   # [PATCH]
+        "marginMode": "crossed",
     }
-    sc, js, txt = _http_post_soft(V2_PLACE_ORDER_PATH, body, True)
+    sc, js, txt = _http_post_soft(V2_PLACE_ORDER_PATH, body_v2_legacy, True)
     if sc == 200 and isinstance(js, dict) and ((js.get("code") in ("00000","0",0,None)) or js.get("data")):
         return js
     if sc == 200 and isinstance(js, list):
         return {"code":"00000","data":js}
+
+    # v1 폴백은 필요시 추가 가능
     return js if isinstance(js, dict) else {"code": str(sc), "msg": txt, "data": js}
 
 # ────────────────────────────────────────────────────────
@@ -587,7 +608,6 @@ def get_open_positions() -> List[Dict[str,Any]]:
                     if js: return _parse_positions_v2(js)
                 except Exception as e:
                     _log(f"positions v2 error: {e} url: {BASE_URL}{V2_POSITIONS_PATH}?{urlencode(params)}")
-        # 단일 포지션 조회 힌트 사용시 여기에 추가 가능
     # v1 폴백
     for params in ({"productType":"umcbl"}, {"productType":"umcbl","marginCoin":MARGIN_COIN}):
         try:
