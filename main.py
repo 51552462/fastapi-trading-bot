@@ -23,7 +23,8 @@ WORKERS                = int(os.getenv("WORKERS", "6"))
 QUEUE_MAX              = int(os.getenv("QUEUE_MAX", "2000"))
 LOG_INGRESS            = os.getenv("LOG_INGRESS", "0") == "1"
 
-FORCE_DEFAULT_AMOUNT   = os.getenv("FORCE_DEFAULT_AMOUNT", "0") == "1"
+# [CHANGE] 기본값을 1로 변경 → 환경변수 금액 강제 사용(트뷰 amount/SYMBOL_AMOUNT 무시)
+FORCE_DEFAULT_AMOUNT   = os.getenv("FORCE_DEFAULT_AMOUNT", "1") == "1"
 
 SYMBOL_AMOUNT_JSON = os.getenv("SYMBOL_AMOUNT_JSON", "")
 try:
@@ -110,17 +111,29 @@ def _safe_float(v: Any, fallback: float) -> float:
         return float(fallback)
 
 def _resolve_amount(symbol: str, side: str, payload: Dict[str, Any]) -> float:
-    if not FORCE_DEFAULT_AMOUNT:
-        if "amount" in payload and str(payload["amount"]).strip() != "":
-            try:
-                return float(payload["amount"])
-            except Exception:
-                pass
-        if symbol in SYMBOL_AMOUNT and str(SYMBOL_AMOUNT[symbol]).strip() != "":
-            try:
-                return float(SYMBOL_AMOUNT[symbol])
-            except Exception:
-                pass
+    """
+    진입 금액 결정:
+      - FORCE_DEFAULT_AMOUNT=1 이면 무조건 DEFAULT_AMOUNT_LONG/SHORT 사용
+      - OFF 이면 payload.amount → SYMBOL_AMOUNT → DEFAULT_* 순
+    """
+    if FORCE_DEFAULT_AMOUNT:
+        if side == "long":
+            return float(DEFAULT_AMOUNT_LONG)
+        if side == "short":
+            return float(DEFAULT_AMOUNT_SHORT)
+        return float(DEFAULT_AMOUNT)
+
+    # 강제 모드가 아니면 느슨한 우선순위 적용
+    if "amount" in payload and str(payload["amount"]).strip() != "":
+        try:
+            return float(payload["amount"])
+        except Exception:
+            pass
+    if symbol in SYMBOL_AMOUNT and str(SYMBOL_AMOUNT[symbol]).strip() != "":
+        try:
+            return float(SYMBOL_AMOUNT[symbol])
+        except Exception:
+            pass
     if side == "long":
         return float(DEFAULT_AMOUNT_LONG)
     if side == "short":
