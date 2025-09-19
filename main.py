@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-import os, time, json, hashlib, threading, queue, re, traceback  # [PATCH] traceback 추가
+import os, time, json, hashlib, threading, queue, re, traceback
 from collections import deque
 from typing import Dict, Any, Optional
 from fastapi import FastAPI, Request
@@ -11,10 +11,10 @@ from trader import (
 from telegram_bot import send_telegram
 from bitget_api import convert_symbol, get_open_positions
 
-# ── 금액 관련 ENV (side별 기본값; ENV로 덮어쓰기 가능)
+# ── 금액/일반 ENV
 DEFAULT_AMOUNT         = float(os.getenv("DEFAULT_AMOUNT", "15"))
-DEFAULT_AMOUNT_LONG    = float(os.getenv("DEFAULT_AMOUNT_LONG", "100"))  # 롱 기본 100
-DEFAULT_AMOUNT_SHORT   = float(os.getenv("DEFAULT_AMOUNT_SHORT", "40"))  # 숏 기본 40
+DEFAULT_AMOUNT_LONG    = float(os.getenv("DEFAULT_AMOUNT_LONG", "100"))
+DEFAULT_AMOUNT_SHORT   = float(os.getenv("DEFAULT_AMOUNT_SHORT", "40"))
 LEVERAGE               = float(os.getenv("LEVERAGE", "5"))
 DEDUP_TTL              = float(os.getenv("DEDUP_TTL", "15"))
 BIZDEDUP_TTL           = float(os.getenv("BIZDEDUP_TTL", "3"))
@@ -23,8 +23,13 @@ WORKERS                = int(os.getenv("WORKERS", "6"))
 QUEUE_MAX              = int(os.getenv("QUEUE_MAX", "2000"))
 LOG_INGRESS            = os.getenv("LOG_INGRESS", "0") == "1"
 
-# [CHANGE] 기본값을 1로 변경 → 환경변수 금액 강제 사용(트뷰 amount/SYMBOL_AMOUNT 무시)
+# ENV 금액 강제 사용 (트뷰 amount/SYMBOL_AMOUNT 무시)
 FORCE_DEFAULT_AMOUNT   = os.getenv("FORCE_DEFAULT_AMOUNT", "1") == "1"
+
+# [NEW] 진입 전 반대 포지션 정리 여부/대기시간
+ENTRY_PRECLEAR         = os.getenv("ENTRY_PRECLEAR", "1") == "1"
+ENTRY_PRECLEAR_WAIT    = float(os.getenv("ENTRY_PRECLEAR_WAIT", "0.8"))   # 1회 대기
+ENTRY_PRECLEAR_RETRY   = int(os.getenv("ENTRY_PRECLEAR_RETRY", "6"))      # 최대 N회(총 ~5초)
 
 SYMBOL_AMOUNT_JSON = os.getenv("SYMBOL_AMOUNT_JSON", "")
 try:
@@ -49,9 +54,6 @@ def _norm_symbol(sym: str) -> str:
     return convert_symbol(sym)
 
 def _pick_symbol(d: Dict[str, Any]) -> str:
-    """
-    TradingView/테스트에서 symbol 키가 다르게 들어오는 케이스까지 흡수.
-    """
     for k in ("symbol", "ticker", "pair", "contract", "sym", "symbolName"):
         v = d.get(k)
         if isinstance(v, str) and v.strip():
@@ -61,41 +63,29 @@ def _pick_symbol(d: Dict[str, Any]) -> str:
     return ""
 
 def _infer_side(side: Optional[str], default: str = "long") -> str:
-    """
-    'buy'→long, 'sell'→short 포함. 기본은 long.
-    """
     s = (side or "").strip().lower()
     if s in ("long", "short"):
         return s
-    if s == "buy":
-        return "long"
-    if s == "sell":
-        return "short"
+    if s == "buy":  return "long"
+    if s == "sell": return "short"
     return default
 
 def _norm_type(typ: str) -> str:
     t = (typ or "").strip().lower()
     t = re.sub(r"[\s_\-]+", "", t)
     aliases = {
-        "tp_1": "tp1", "tp_2": "tp2", "tp_3": "tp3",
-        "takeprofit1": "tp1", "takeprofit2": "tp2", "takeprofit3": "tp3",
-        "sl_1": "sl1", "sl_2": "sl2",
-        "stopfull": "stoploss", "stopall": "stoploss", "stop": "stoploss",
-        "fullexit": "stoploss", "exitall": "stoploss",
-        "emaexit": "emaexit", "emaExit": "emaexit",
-        "failcut": "failcut",
-        "closeposition": "close", "closeall": "close",
-        "reducecontracts": "reducebycontracts",
-        "reduce_by_contracts": "reducebycontracts",
-        "panicclose": "close", "panic": "close",
-        "breakeven": "breakeven", "breakevenexit": "breakeven",
+        "tp_1":"tp1","tp_2":"tp2","tp_3":"tp3",
+        "takeprofit1":"tp1","takeprofit2":"tp2","takeprofit3":"tp3",
+        "sl_1":"sl1","sl_2":"sl2","stopfull":"stoploss","stopall":"stoploss",
+        "stop":"stoploss","fullexit":"stoploss","exitall":"stoploss",
+        "emaexit":"emaexit","emaExit":"emaexit","failcut":"failcut",
+        "closeposition":"close","closeall":"close",
+        "reducecontracts":"reducebycontracts","reduce_by_contracts":"reducebycontracts",
+        "panicclose":"close","panic":"close","breakeven":"breakeven",
     }
     return aliases.get(t, t)
 
 def _safe_float(v: Any, fallback: float) -> float:
-    """
-    dict/list/None/문자열까지 안전 변환. 실패 시 fallback.
-    """
     try:
         if v is None:
             return float(fallback)
@@ -111,19 +101,10 @@ def _safe_float(v: Any, fallback: float) -> float:
         return float(fallback)
 
 def _resolve_amount(symbol: str, side: str, payload: Dict[str, Any]) -> float:
-    """
-    진입 금액 결정:
-      - FORCE_DEFAULT_AMOUNT=1 이면 무조건 DEFAULT_AMOUNT_LONG/SHORT 사용
-      - OFF 이면 payload.amount → SYMBOL_AMOUNT → DEFAULT_* 순
-    """
     if FORCE_DEFAULT_AMOUNT:
-        if side == "long":
-            return float(DEFAULT_AMOUNT_LONG)
-        if side == "short":
-            return float(DEFAULT_AMOUNT_SHORT)
+        if side == "long":  return float(DEFAULT_AMOUNT_LONG)
+        if side == "short": return float(DEFAULT_AMOUNT_SHORT)
         return float(DEFAULT_AMOUNT)
-
-    # 강제 모드가 아니면 느슨한 우선순위 적용
     if "amount" in payload and str(payload["amount"]).strip() != "":
         try:
             return float(payload["amount"])
@@ -134,41 +115,29 @@ def _resolve_amount(symbol: str, side: str, payload: Dict[str, Any]) -> float:
             return float(SYMBOL_AMOUNT[symbol])
         except Exception:
             pass
-    if side == "long":
-        return float(DEFAULT_AMOUNT_LONG)
-    if side == "short":
-        return float(DEFAULT_AMOUNT_SHORT)
+    if side == "long":  return float(DEFAULT_AMOUNT_LONG)
+    if side == "short": return float(DEFAULT_AMOUNT_SHORT)
     return float(DEFAULT_AMOUNT)
 
-# 느슨한 문자열 파서
 def _loose_kv_to_dict(txt: str) -> Dict[str, Any]:
-    if not isinstance(txt, str):
-        return {}
+    if not isinstance(txt, str): return {}
     s = txt.strip()
-    if not s:
-        return {}
+    if not s: return {}
     try:
         obj = json.loads(s)
-        if isinstance(obj, dict):
-            return obj
+        if isinstance(obj, dict): return obj
     except Exception:
         pass
     out: Dict[str, Any] = {}
     parts = re.split(r"[\n,;]+", s)
     for part in parts:
-        if ":" in part:
-            k, v = part.split(":", 1)
-        elif "=" in part:
-            k, v = part.split("=", 1)
-        else:
-            continue
-        k = k.strip()
-        v = v.strip().strip('"').strip("'")
-        if k:
-            out[k] = v
+        if ":" in part:   k, v = part.split(":", 1)
+        elif "=" in part: k, v = part.split("=", 1)
+        else:             continue
+        k = k.strip(); v = v.strip().strip('"').strip("'")
+        if k: out[k] = v
     return out
 
-# dict/list/str 등 들어와도 dict로 보정 시도
 def _unwrap_nested_json(d: Dict[str, Any]) -> Dict[str, Any]:
     for k in ("message", "alert", "payload"):
         v = d.get(k)
@@ -186,21 +155,11 @@ def _unwrap_nested_json(d: Dict[str, Any]) -> Dict[str, Any]:
                     pass
     return d
 
-# ─────────────────────────────────────────────────────────────
-# [PATCH] 리스트/기타 타입 보정 헬퍼 (끝까지 dict로 강제)
 def _coerce_to_dict(x: Any) -> Optional[Dict[str, Any]]:
-    """
-    - dict이면 그대로
-    - list이면 첫 번째 dict 요소 사용 (TV가 [ {..} ] 형태로 쏘는 케이스 방어)
-    - str/bytes이면 느슨 파싱
-    - 그 외는 None
-    """
-    if isinstance(x, dict):
-        return x
+    if isinstance(x, dict): return x
     if isinstance(x, list):
         for item in x:
-            if isinstance(item, dict):
-                return item
+            if isinstance(item, dict): return item
         try:
             return _loose_kv_to_dict(json.dumps(x)) or None
         except Exception:
@@ -211,38 +170,88 @@ def _coerce_to_dict(x: Any) -> Optional[Dict[str, Any]]:
         if s.startswith("{") and s.endswith("}"):
             try:
                 obj = json.loads(s)
-                if isinstance(obj, dict):
-                    return obj
+                if isinstance(obj, dict): return obj
             except Exception:
                 pass
         return _loose_kv_to_dict(s) or None
     return None
-# ─────────────────────────────────────────────────────────────
 
+# ─────────────────────────────────────────────────────────────
+# [NEW] 진입 전 반대 포지션 정리(preclear)
+# ─────────────────────────────────────────────────────────────
+def _opposite(side: str) -> str:
+    return "short" if side == "long" else "long"
+
+def _preclear_opposite_if_needed(symbol: str, desired_side: str):
+    """
+    반대 포지션 보유 시 → reduceOnly 시장가로 즉시 정리 후 진입.
+    (Bitget 원웨이/체결타이밍에서 발생하는 side mismatch 방지)
+    """
+    if not ENTRY_PRECLEAR:
+        return
+    try:
+        sym = convert_symbol(symbol)
+        desired = desired_side.lower()
+        opp = _opposite(desired)
+
+        positions = get_open_positions()
+        # 심볼/반대방향 보유 체크
+        opp_pos = None
+        for p in positions:
+            if p.get("symbol") == sym and (p.get("side") or "").lower() == opp:
+                if float(p.get("size", 0) or 0) > 0:
+                    opp_pos = p
+                    break
+
+        if not opp_pos:
+            return  # 반대 포지션 없음 → 바로 진입 가능
+
+        send_telegram(f"🔧 preclear {sym} {opp} size={opp_pos.get('size')}")
+
+        # trader.close_position 는 reduceOnly 시장가 청산 호출
+        close_position(sym, side=opp, reason="preclear")
+
+        # 반대 포지션이 사라질 때까지 짧게 폴링
+        for _ in range(max(1, ENTRY_PRECLEAR_RETRY)):
+            time.sleep(max(0.1, ENTRY_PRECLEAR_WAIT))
+            positions = get_open_positions()
+            still = False
+            for p in positions:
+                if p.get("symbol") == sym and (p.get("side") or "").lower() == opp:
+                    if float(p.get("size",0) or 0) > 0:
+                        still = True
+                        break
+            if not still:
+                break
+
+    except Exception as e:
+        # preclear 실패해도 진입은 시도(거래소가 이미 정리했거나, 소량 잔존 등)
+        send_telegram(f"⚠️ preclear error {symbol} {desired_side}: {e}")
+
+# ─────────────────────────────────────────────────────────────
 # Payload 파서
+# ─────────────────────────────────────────────────────────────
 async def _parse_any(req: Request) -> Dict[str, Any]:
-    # 1) application/json
     try:
         d = await req.json()
-        dd = _coerce_to_dict(d)  # [PATCH]
+        dd = _coerce_to_dict(d)
         if dd is not None:
             return _unwrap_nested_json(dd)
     except Exception:
         pass
-    # 2) 원시 바디 문자열
     try:
         raw = (await req.body()).decode(errors="ignore").strip()
         if raw:
             try:
                 obj = json.loads(raw)
-                dd = _coerce_to_dict(obj)  # [PATCH]
+                dd = _coerce_to_dict(obj)
                 if dd is not None:
                     return _unwrap_nested_json(dd)
             except Exception:
                 fixed = raw.replace("'", '"')
                 try:
                     obj = json.loads(fixed)
-                    dd = _coerce_to_dict(obj)  # [PATCH]
+                    dd = _coerce_to_dict(obj)
                     if dd is not None:
                         return _unwrap_nested_json(dd)
                 except Exception:
@@ -251,14 +260,13 @@ async def _parse_any(req: Request) -> Dict[str, Any]:
                         return _unwrap_nested_json(kv)
     except Exception:
         pass
-    # 3) form-encoded
     try:
         form = await req.form()
         payload = form.get("payload") or form.get("data") or form.get("message") or form.get("alert")
         if payload:
             try:
                 obj = json.loads(payload)
-                dd = _coerce_to_dict(obj)  # [PATCH]
+                dd = _coerce_to_dict(obj)
                 if dd is not None:
                     return _unwrap_nested_json(dd)
             except Exception:
@@ -267,7 +275,6 @@ async def _parse_any(req: Request) -> Dict[str, Any]:
                     return _unwrap_nested_json(kv)
     except Exception:
         pass
-    # 4) 최후의 문자열 파편 모음
     try:
         txt = (await req.body()).decode(errors="ignore")
         d: Dict[str, Any] = {}
@@ -282,10 +289,9 @@ async def _parse_any(req: Request) -> Dict[str, Any]:
     raise ValueError("cannot parse request")
 
 # ─────────────────────────────────────────────────────────────
-# 시그널 라우터
+# 시그널 처리
 # ─────────────────────────────────────────────────────────────
 def _handle_signal(data: Any):
-    # [PATCH] 방어: dict로 보정, 실패 시 드롭
     if not isinstance(data, dict):
         dd = _coerce_to_dict(data)
         if dd is None:
@@ -293,7 +299,6 @@ def _handle_signal(data: Any):
             return
         data = dd
 
-    # [PATCH] 일부 케이스에서 type이 리스트로 오는 것 방어
     if isinstance(data.get("type"), (list, tuple)):
         try:
             data["type"] = (data["type"][0] or "")
@@ -307,7 +312,6 @@ def _handle_signal(data: Any):
         or ""
     )
 
-    # 심볼/사이드 추출(다양한 키 대응)
     symbol  = _pick_symbol(data)
     side    = _infer_side(data.get("side") or data.get("direction"), "long")
 
@@ -319,11 +323,10 @@ def _handle_signal(data: Any):
 
     t = _norm_type(typ_raw)
 
-    # 비즈니스 디듀프(짧은 시간 동일액션 방지)
     now = time.time()
     bizkey = f"{t}:{symbol}:{side}"
     last = _BIZDEDUP.get(bizkey, 0.0)
-    if now - last < BIZDEDUP_TTL: 
+    if now - last < BIZDEDUP_TTL:
         return
     _BIZDEDUP[bizkey] = now
 
@@ -332,6 +335,8 @@ def _handle_signal(data: Any):
         except: pass
 
     if t == "entry":
+        # [NEW] 반대 포지션 자동 정리 후 진입
+        _preclear_opposite_if_needed(symbol, side)
         enter_position(symbol, amount, side=side, leverage=leverage); return
 
     if t in ("tp1","tp2","tp3"):
@@ -347,7 +352,7 @@ def _handle_signal(data: Any):
         if contracts > 0: reduce_by_contracts(symbol, contracts, side=side)
         return
 
-    if t in ("tailtouch","info","debug"): 
+    if t in ("tailtouch","info","debug"):
         return
 
     send_telegram("❓ 알 수 없는 신호: " + json.dumps(data))
@@ -362,7 +367,6 @@ def _worker_loop(idx: int):
             if data is None:
                 continue
 
-            # [PATCH] 큐에서 list/str 등이 바로 들어오는 경우 방어
             if isinstance(data, (str, bytes)):
                 try:
                     obj = json.loads(data)
@@ -384,7 +388,6 @@ def _worker_loop(idx: int):
             _handle_signal(data)
 
         except Exception as e:
-            # [PATCH] 어디서 터지는지 추적 위해 payload 타입/프리뷰 같이 로깅
             try:
                 preview = str(data)
             except Exception:
@@ -402,7 +405,6 @@ async def _ingest(req: Request):
     except Exception as e:
         return {"ok": False, "error": f"bad_payload: {e}"}
 
-    # [PATCH] 최종 보정: dict 아니면 드롭
     if not isinstance(data, dict):
         dd = _coerce_to_dict(data)
         if dd is None:
@@ -421,18 +423,16 @@ async def _ingest(req: Request):
         return {"ok": False, "queued": False, "reason": "queue_full"}
     return {"ok": True, "queued": True, "qsize": _task_q.qsize()}
 
-# FastAPI 라우팅
 app = FastAPI()
 
 @app.get("/")
-def root(): 
+def root():
     return {"ok": True}
 
 @app.post("/signal")
-async def signal(req: Request): 
+async def signal(req: Request):
     return await _ingest(req)
 
-# 테스트 편의: GET도 허용 (예: /signal?type=entry&symbol=BTCUSDT&side=short&amount=100)
 @app.get("/signal")
 async def signal_get(req: Request):
     qp = dict(req.query_params)
@@ -445,34 +445,34 @@ async def signal_get(req: Request):
     _DEDUP[dk] = now
     INGRESS_LOG.append({"ts": now, "ip": (req.client.host if req and req.client else "?"), "data": qp})
     try:
-        _task_q.put_nowait(qp)  # 쿼리는 dict라 그대로 큐잉
+        _task_q.put_nowait(qp)
     except queue.Full:
         send_telegram("⚠️ queue full → drop signal: " + json.dumps(qp))
         return {"ok": False, "queued": False, "reason": "queue_full"}
     return {"ok": True, "queued": True, "qsize": _task_q.qsize()}
 
 @app.post("/webhook")
-async def webhook(req: Request): 
+async def webhook(req: Request):
     return await _ingest(req)
 
 @app.post("/alert")
-async def alert(req: Request): 
+async def alert(req: Request):
     return await _ingest(req)
 
 @app.get("/health")
-def health(): 
+def health():
     return {"ok": True, "ingress": len(INGRESS_LOG), "queue": _task_q.qsize(), "workers": WORKERS}
 
 @app.get("/ingress")
-def ingress(): 
+def ingress():
     return list(INGRESS_LOG)[-30:]
 
 @app.get("/positions")
-def positions(): 
+def positions():
     return {"positions": get_open_positions()}
 
 @app.get("/queue")
-def queue_size(): 
+def queue_size():
     return {"size": _task_q.qsize(), "max": QUEUE_MAX}
 
 @app.get("/config")
@@ -487,10 +487,13 @@ def config():
         "WORKERS": WORKERS, "QUEUE_MAX": QUEUE_MAX,
         "LOG_INGRESS": LOG_INGRESS,
         "SYMBOL_AMOUNT": SYMBOL_AMOUNT,
+        "ENTRY_PRECLEAR": ENTRY_PRECLEAR,
+        "ENTRY_PRECLEAR_WAIT": ENTRY_PRECLEAR_WAIT,
+        "ENTRY_PRECLEAR_RETRY": ENTRY_PRECLEAR_RETRY,
     }
 
 @app.get("/pending")
-def pending(): 
+def pending():
     return get_pending_snapshot()
 
 @app.on_event("startup")
