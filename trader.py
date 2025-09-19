@@ -55,7 +55,7 @@ BE_ENABLE        = os.getenv("BE_ENABLE", "1") == "1"
 BE_AFTER_STAGE   = int(os.getenv("BE_AFTER_STAGE", "1"))
 BE_EPSILON_RATIO = float(os.getenv("BE_EPSILON_RATIO", "0.0005"))
 
-# [추가] 즉시 종료 스위치 (기본 ON)
+# 즉시 종료 스위치 (기본 ON)
 CLOSE_IMMEDIATE     = os.getenv("CLOSE_IMMEDIATE", "1") == "1"
 TP3_CLOSE_IMMEDIATE = os.getenv("TP3_CLOSE_IMMEDIATE", "1") == "1"
 
@@ -371,7 +371,7 @@ def take_partial_profit(symbol: str, pct: float, side: str = "long"):
     key    = _key(symbol, side)
 
     with _lock_for(key):
-        p = _get_remote(symbol, side)
+        p = _get_remote(symbol, side)  # ← 요청된 side 우선
         if not p or _to_float(p.get("size")) <= 0:
             send_telegram(f"⚠️ TP 스킵: 원격 포지션 없음 {_key(symbol, side)}")
             return
@@ -406,8 +406,8 @@ def take_partial_profit(symbol: str, pct: float, side: str = "long"):
 
 def close_position(symbol: str, side: str = "long", reason: str = "manual"):
     """
-    [수정] 실제 보유 방향을 우선 조회하여 해당 방향 기준으로 reduceOnly 시장가 종료
-    (신호 side와 달라도 side mismatch가 나지 않도록 보완)
+    [중요 수정] 요청된 side의 원격 포지션을 **먼저 조회**하고,
+    없을 때만 any-side 로 폴백. (헷지에서 반대쪽을 잡아오는 문제 방지)
     """
     symbol = convert_symbol(symbol)
     req_side = (side or "long").lower()
@@ -423,8 +423,8 @@ def close_position(symbol: str, side: str = "long", reason: str = "manual"):
         send_telegram(f"📌 pending add [close] {pkey}")
 
     if CLOSE_IMMEDIATE:
-        # 실제 보유 포지션(any side) 우선
-        p = _get_remote_any_side(symbol) or _get_remote(symbol, req_side)
+        # (수정) 요청된 side 우선, 없을 때만 any-side 폴백
+        p = _get_remote(symbol, req_side) or _get_remote_any_side(symbol)
         if not p or _to_float(p.get("size")) <= 0:
             with _POS_LOCK:
                 position_data.pop(key_req, None)
@@ -636,7 +636,8 @@ def _reconciler_loop():
             for pkey, item in close_items:
                 sym, side = item["symbol"], item["side"]
                 key = _key(sym, side)
-                p = _get_remote(sym, side)
+                # (수정) 요청된 side 우선
+                p = _get_remote(sym, side) or _get_remote_any_side(sym)
                 if not p or _to_float(p.get("size")) <= 0:
                     _mark_done("close", pkey, "(no-remote)")
                     with _POS_LOCK:
@@ -651,16 +652,17 @@ def _reconciler_loop():
                         send_telegram(f"🔁 retry [close] {pkey}")
 
                     size = _to_float(p.get("size"))
-                    resp = place_reduce_by_size(sym, size, side)
+                    side_real = (p.get("side") or "").lower()
+                    resp = place_reduce_by_size(sym, size, side_real)
                     item["last_try"] = now
                     item["attempts"] = item.get("attempts", 0) + 1
                     if str(resp.get("code", "")) == "00000":
-                        ok = _sweep_full_close(sym, side, "reconcile")
+                        ok = _sweep_full_close(sym, side_real, "reconcile")
                         if ok:
                             _mark_done("close", pkey)
                             with _POS_LOCK:
-                                position_data.pop(key, None)
-                            send_telegram(f"🔁 CLOSE 재시도 성공 {side.upper()} {sym}")
+                                position_data.pop(_key(sym, side_real), None)
+                            send_telegram(f"🔁 CLOSE 재시도 성공 {side_real.upper()} {sym}")
 
             # TP3 재시도(달성 보장)
             with _PENDING_LOCK:
