@@ -364,50 +364,52 @@ def enter_position(symbol: str, usdt_amount: float, side: str = "long", leverage
 def take_partial_profit(symbol: str, pct: float, side: str = "long"):
     """
     TP1/TP2/TP3 분할 종료.
+    - [수정] 실제 보유 포지션을 우선 조회하여 그 방향으로 reduceOnly 감축
     - TP3(누적 100%)일 때는 즉시 잔량 전부 종료(ENV로 ON/OFF)
     """
     symbol = convert_symbol(symbol)
-    side   = (side or "long").lower()
-    key    = _key(symbol, side)
+
+    # 실제 보유 포지션 우선
+    p = _get_remote_any_side(symbol)
+    if not p or _to_float(p.get("size")) <= 0:
+        send_telegram(f"⚠️ TP 스킵: 원격 포지션 없음 {symbol}")
+        return
+
+    real_side = (p.get("side") or "").lower()
+    key       = _key(symbol, real_side)
 
     with _lock_for(key):
-        p = _get_remote(symbol, side)  # ← 요청된 side 우선
-        if not p or _to_float(p.get("size")) <= 0:
-            send_telegram(f"⚠️ TP 스킵: 원격 포지션 없음 {_key(symbol, side)}")
-            return
-
         size_step = _to_float(get_symbol_spec(symbol).get("sizeStep", 0.001))
         cur_size  = _to_float(p.get("size"))
         pct       = max(0.0, min(1.0, float(pct)))
         cut_size  = round_down_step(cur_size * pct, size_step)
         if cut_size <= 0:
-            send_telegram(f"⚠️ TP 스킵: 계산된 사이즈=0 ({_key(symbol, side)})")
+            send_telegram(f"⚠️ TP 스킵: 계산된 사이즈=0 ({symbol})")
             return
 
         if abs(pct - 1.0) < 1e-9 and TP3_CLOSE_IMMEDIATE:
-            resp = place_reduce_by_size(symbol, cur_size, side)
+            resp = place_reduce_by_size(symbol, cur_size, real_side)
             if str(resp.get("code", "")) == "00000":
                 exit_price = _to_float(get_last_price(symbol)) or _to_float(p.get("entry_price"))
                 entry = _to_float(p.get("entry_price"))
-                realized = _pnl_usdt(entry, exit_price, entry * cur_size, side)
+                realized = _pnl_usdt(entry, exit_price, entry * cur_size, real_side)
                 send_telegram(
-                    f"🤑 TP3 FULL CLOSE {side.upper()} {symbol}\n"
+                    f"🤑 TP3 FULL CLOSE {real_side.upper()} {symbol}\n"
                     f"• Exit: {exit_price}\n• Size: {cur_size}\n• Realized≈ {realized:+.2f} USDT"
                 )
             else:
-                send_telegram(f"❌ TP3 즉시 종료 실패 {symbol} {side} → {resp}")
+                send_telegram(f"❌ TP3 즉시 종료 실패 {symbol} {real_side} → {resp}")
             return
 
-        resp = place_reduce_by_size(symbol, cut_size, side)
+        resp = place_reduce_by_size(symbol, cut_size, real_side)
         if str(resp.get("code", "")) == "00000":
-            send_telegram(f"🤑 TP {int(pct*100)}% {side.upper()} {symbol} cut={cut_size}")
+            send_telegram(f"🤑 TP {int(pct*100)}% {real_side.upper()} {symbol} cut={cut_size}")
         else:
-            send_telegram(f"❌ TP 실패 {symbol} {side} → {resp}")
+            send_telegram(f"❌ TP 실패 {symbol} {real_side} → {resp}")
 
 def close_position(symbol: str, side: str = "long", reason: str = "manual"):
     """
-    [중요 수정] 요청된 side의 원격 포지션을 **먼저 조회**하고,
-    없을 때만 any-side 로 폴백. (헷지에서 반대쪽을 잡아오는 문제 방지)
+    [중요] 요청된 side가 틀려도 실제 보유방향으로 전량 청산 (reduceOnly market)
     """
     symbol = convert_symbol(symbol)
     req_side = (side or "long").lower()
@@ -423,7 +425,7 @@ def close_position(symbol: str, side: str = "long", reason: str = "manual"):
         send_telegram(f"📌 pending add [close] {pkey}")
 
     if CLOSE_IMMEDIATE:
-        # (수정) 요청된 side 우선, 없을 때만 any-side 폴백
+        # 실제 보유 포지션 우선
         p = _get_remote(symbol, req_side) or _get_remote_any_side(symbol)
         if not p or _to_float(p.get("size")) <= 0:
             with _POS_LOCK:
@@ -432,42 +434,53 @@ def close_position(symbol: str, side: str = "long", reason: str = "manual"):
             send_telegram(f"⚠️ CLOSE 스킵: 원격 포지션 없음 {key_req} ({reason})")
             return
 
-        pos_side = (p.get("side") or "").lower()
-        key_real = _key(symbol, pos_side)
+        real_side = (p.get("side") or "").lower()
+        key_real  = _key(symbol, real_side)
         with _lock_for(key_real):
             size = _to_float(p.get("size"))
-            resp = place_reduce_by_size(symbol, size, pos_side)
+            resp = place_reduce_by_size(symbol, size, real_side)
             exit_price = _to_float(get_last_price(symbol)) or _to_float(p.get("entry_price"))
             success = str(resp.get("code", "")) == "00000"
             if success:
                 entry = _to_float(p.get("entry_price"))
-                realized = _pnl_usdt(entry, exit_price, entry * size, pos_side)
+                realized = _pnl_usdt(entry, exit_price, entry * size, real_side)
                 with _POS_LOCK:
                     position_data.pop(key_real, None)
                 _mark_done("close", pkey)
                 _mark_recent_ok(key_real)
                 send_telegram(
-                    f"✅ CLOSE {pos_side.upper()} {symbol} ({reason})\n"
+                    f"✅ CLOSE {real_side.upper()} {symbol} ({reason})\n"
                     f"• Exit: {exit_price}\n• Size: {size}\n• Realized≈ {realized:+.2f} USDT"
                 )
             else:
-                send_telegram(f"❌ CLOSE 실패 {symbol} {pos_side} → {resp}")
+                send_telegram(f"❌ CLOSE 실패 {symbol} {real_side} → {resp}")
 
 def reduce_by_contracts(symbol: str, contracts: float, side: str = "long"):
+    """
+    [수정] 계약 수량 감축도 실제 보유방향으로 자동 보정
+    """
     symbol = convert_symbol(symbol)
-    side   = (side or "long").lower()
-    key    = _key(symbol, side)
+
+    p = _get_remote_any_side(symbol)
+    if not p or _to_float(p.get("size")) <= 0:
+        send_telegram(f"⚠️ reduceByContracts 스킵: 원격 포지션 없음 {symbol}")
+        return
+
+    real_side = (p.get("side") or "").lower()
+    key       = _key(symbol, real_side)
+
     with _lock_for(key):
         step = _to_float(get_symbol_spec(symbol).get("sizeStep", 0.001))
         qty  = round_down_step(_to_float(contracts), step)
         if qty <= 0:
-            send_telegram(f"⚠️ reduceByContracts 스킵: step 미달 {key}")
+            send_telegram(f"⚠️ reduceByContracts 스킵: step 미달 {symbol}")
             return
-        resp = place_reduce_by_size(symbol, qty, side)
+        qty = min(qty, round_down_step(_to_float(p.get("size")), step))
+        resp = place_reduce_by_size(symbol, qty, real_side)
         if str(resp.get("code", "")) == "00000":
-            send_telegram(f"🔻 Reduce {qty} {side.upper()} {symbol}")
+            send_telegram(f"🔻 Reduce {qty} {real_side.upper()} {symbol}")
         else:
-            send_telegram(f"❌ Reduce 실패 {key} → {resp}")
+            send_telegram(f"❌ Reduce 실패 {symbol} {real_side} → {resp}")
 
 # ============================================================================
 # 보조 루틴
@@ -636,7 +649,7 @@ def _reconciler_loop():
             for pkey, item in close_items:
                 sym, side = item["symbol"], item["side"]
                 key = _key(sym, side)
-                # (수정) 요청된 side 우선
+                # 요청 side 우선, 없으면 any-side
                 p = _get_remote(sym, side) or _get_remote_any_side(sym)
                 if not p or _to_float(p.get("size")) <= 0:
                     _mark_done("close", pkey, "(no-remote)")
