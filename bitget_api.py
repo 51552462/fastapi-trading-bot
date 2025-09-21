@@ -70,7 +70,7 @@ TICKER_TTL           = int(os.getenv("TICKER_TTL", "3"))
 # 주문 productType 강제 지정(선택)
 ORDER_PRODUCT_TYPE   = os.getenv("BITGET_ORDER_PRODUCT_TYPE", "").strip().upper()
 
-# [NEW] 헤지/원웨이 상관없이 v2 주문에 holdSide 항상 포함(기본 ON)
+# 헤지/원웨이 상관없이 v2 주문에 holdSide 포함 여부(기본 ON 권장)
 SEND_HOLDSIDE_ALWAYS = os.getenv("BITGET_SEND_HOLDSIDE", "1") == "1"
 
 try:
@@ -450,11 +450,10 @@ def _order_size_from_usdt(symbol: str, usdt_amount: float) -> float:
     return max(step, round_down_step(size, step))
 
 def _hold_side_for(side_bs: str) -> str:
-    """buy/sell 기준에서 포지션 holdSide 계산"""
     s = (side_bs or "buy").lower()
     return "long" if s == "buy" else "short"
 
-# ---- 추가: 성공/사이드미스 판정 + 트레이스 도우미 ----
+# ---- 성공/사이드미스 판정 + 트레이스 도우미 ----
 def _is_ok(sc: int, js: Optional[dict]) -> bool:
     if sc != 200 or not isinstance(js, dict):
         return False
@@ -488,7 +487,7 @@ def place_market_order(symbol: str, usdt_amount: float, side: str, leverage: flo
     side_bs = _api_side_v2_bs(side, reduce_only)
     hold_sd = _hold_side_for(side_bs)  # long/short
 
-    # v2-표준 (try1)
+    # v2-표준 (try1)  ── ※ 진입일 때 reduceOnly 필드 **미포함**
     body_v2_new = {
         "productType": pt,
         "symbol": sym,
@@ -497,10 +496,11 @@ def place_market_order(symbol: str, usdt_amount: float, side: str, leverage: flo
         "side": side_bs,                 # buy / sell
         "orderType": "market",
         "force": "gtc",
-        "reduceOnly": bool(reduce_only),
         "marginMode": "crossed",
         "leverage": str(leverage),
     }
+    if reduce_only:                      # 청산 주문일 때만 포함
+        body_v2_new["reduceOnly"] = True
     if SEND_HOLDSIDE_ALWAYS:
         body_v2_new["holdSide"] = hold_sd
 
@@ -519,7 +519,7 @@ def place_market_order(symbol: str, usdt_amount: float, side: str, leverage: flo
     else:
         sc2 = None; js2 = None
 
-    # 레거시 (try3)
+    # 레거시 (try3)  ── 진입일 때 reduceOnly **미포함**
     body_v2_legacy = {
         "productType": pt,
         "symbol": sym,
@@ -530,10 +530,11 @@ def place_market_order(symbol: str, usdt_amount: float, side: str, leverage: flo
         "size": str(size),
         "price": "",
         "force": "gtc",
-        "reduceOnly": bool(reduce_only),
         "marginMode": "crossed",
         "leverage": str(leverage),
     }
+    if reduce_only:
+        body_v2_legacy["reduceOnly"] = True
     if SEND_HOLDSIDE_ALWAYS:
         body_v2_legacy["holdSide"] = hold_sd
 
@@ -542,7 +543,7 @@ def place_market_order(symbol: str, usdt_amount: float, side: str, leverage: flo
         return js3
     _maybe_trace("place_order v2#3 legacy fail", sym, sc3, js3, body_v2_legacy)
 
-    # v1 폴백 (try4)
+    # v1 폴백 (try4)  ── 진입일 때 reduceOnly **미포함**
     body_v1 = {
         "symbol": f"{sym}_UMCBL",
         "marginCoin": MARGIN_COIN,
@@ -551,8 +552,10 @@ def place_market_order(symbol: str, usdt_amount: float, side: str, leverage: flo
                 else ("sell" if str(side).lower() in ("buy","long") else "buy"),
         "orderType": "market",
         "timeInForceValue": "normal",
-        "reduceOnly": bool(reduce_only)
     }
+    if reduce_only:
+        body_v1["reduceOnly"] = True
+
     sc4, js4, txt4 = _http_post_soft(V1_PLACE_ORDER_PATH, body_v1, True)
     if _is_ok(sc4, js4):
         return js4
@@ -576,11 +579,12 @@ def place_reduce_by_size(symbol: str, size: float, side: str) -> Dict[str,Any]:
     """
     sym = convert_symbol(symbol)
     pt  = _guess_product_type(sym)
+    size = max(float(get_symbol_spec(sym).get("sizeStep",0.001)), float(size))
 
     close_side_bs = _api_side_v2_bs(side, True)  # sell (long close) / buy (short close)
     hold_sd       = "long" if (side or "").lower()=="long" else "short"
 
-    # v2-표준 (try1)
+    # v2-표준 (try1) ── 청산이므로 reduceOnly=True 포함
     body_v2_new = {
         "productType": pt,
         "symbol": sym,
