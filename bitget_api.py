@@ -70,6 +70,9 @@ TICKER_TTL           = int(os.getenv("TICKER_TTL", "3"))
 # 주문 productType 강제 지정(선택)
 ORDER_PRODUCT_TYPE   = os.getenv("BITGET_ORDER_PRODUCT_TYPE", "").strip().upper()
 
+# [NEW] 헤지/원웨이 상관없이 v2 주문에 holdSide 항상 포함(기본 ON)
+SEND_HOLDSIDE_ALWAYS = os.getenv("BITGET_SEND_HOLDSIDE", "1") == "1"
+
 try:
     SYMBOL_ALIASES = json.loads(os.getenv("SYMBOL_ALIASES_JSON", "") or "{}")
 except Exception:
@@ -96,7 +99,6 @@ def _log(msg: str):
 def _ts_ms() -> str: return str(int(time.time()*1000))
 
 def _sign(ts: str, method: str, path: str, query: str, body: str) -> str:
-    # v2: base64(HMAC_SHA256(accessSecret, timestamp+method+requestPath+queryString+body))
     prehash = f"{ts}{method}{path}{query}{body}"
     mac = hmac.new(API_SEC.encode(), prehash.encode(), hashlib.sha256).digest()
     return base64.b64encode(mac).decode()
@@ -420,19 +422,15 @@ def get_last_price(symbol: str) -> Optional[float]:
 # 주문/감축
 # ────────────────────────────────────────────────────────
 def _api_side_legacy(side: str, reduce_only: bool) -> str:
-    """레거시 표현(open_long/close_short 등) — 폴백용"""
     s = (side or "").lower()
     if s in ("buy","long"):  return "close_short" if reduce_only else "open_long"
     else:                    return "close_long"  if reduce_only else "open_short"
 
 def _api_side_v2_bs(side: str, reduce_only: bool) -> str:
-    """[FIX] v2 표준 표현: buy/sell + reduceOnly"""
     s = (side or "").lower()
     if reduce_only:
-        # 보유 long → sell, 보유 short → buy
         return "sell" if s in ("buy","long","open_long") else "buy"
     else:
-        # 신규 진입 long → buy, short → sell
         return "buy" if s in ("buy","long","open_long") else "sell"
 
 def _guess_product_type(symbol: str) -> str:
@@ -451,6 +449,11 @@ def _order_size_from_usdt(symbol: str, usdt_amount: float) -> float:
     size = float(usdt_amount) / float(last)
     return max(step, round_down_step(size, step))
 
+def _hold_side_for(side_bs: str) -> str:
+    """buy/sell 기준에서 포지션 holdSide 계산"""
+    s = (side_bs or "buy").lower()
+    return "long" if s == "buy" else "short"
+
 def place_market_order(symbol: str, usdt_amount: float, side: str, leverage: float, reduce_only: bool=False) -> Dict[str,Any]:
     sym  = convert_symbol(symbol)
     size = _order_size_from_usdt(sym, float(usdt_amount))
@@ -458,26 +461,32 @@ def place_market_order(symbol: str, usdt_amount: float, side: str, leverage: flo
 
     pt = _guess_product_type(sym)
 
-    # [FIX] v2-표준 (buy/sell + reduceOnly)
+    side_bs = _api_side_v2_bs(side, reduce_only)
+    hold_sd = _hold_side_for(side_bs)  # long/short
+
+    # v2-표준
     body_v2_new = {
         "productType": pt,
         "symbol": sym,
         "marginCoin": MARGIN_COIN,
         "size": str(size),
-        "side": _api_side_v2_bs(side, reduce_only),  # ← buy/sell
+        "side": side_bs,                 # buy / sell
         "orderType": "market",
         "force": "gtc",
         "reduceOnly": bool(reduce_only),
         "marginMode": "crossed",
         "leverage": str(leverage),
     }
+    if SEND_HOLDSIDE_ALWAYS:
+        body_v2_new["holdSide"] = hold_sd
+
     sc, js, txt = _http_post_soft(V2_PLACE_ORDER_PATH, body_v2_new, True)
     if sc == 200 and isinstance(js, dict) and ((js.get("code") in ("00000","0",0,None)) or js.get("data")):
         return js
     if sc == 200 and isinstance(js, list):
         return {"code":"00000","data":js}
 
-    # 레거시(side=open_long/close_short) 폴백
+    # 레거시 폴백(open_long/close_short)
     body_v2_legacy = {
         "productType": pt,
         "symbol": sym,
@@ -492,6 +501,9 @@ def place_market_order(symbol: str, usdt_amount: float, side: str, leverage: flo
         "marginMode": "crossed",
         "leverage": str(leverage),
     }
+    if SEND_HOLDSIDE_ALWAYS:
+        body_v2_legacy["holdSide"] = hold_sd
+
     sc, js, txt = _http_post_soft(V2_PLACE_ORDER_PATH, body_v2_legacy, True)
     if sc == 200 and isinstance(js, dict) and ((js.get("code") in ("00000","0",0,None)) or js.get("data")):
         return js
@@ -524,19 +536,23 @@ def place_reduce_by_size(symbol: str, size: float, side: str) -> Dict[str,Any]:
     sym = convert_symbol(symbol)
     pt  = _guess_product_type(sym)
 
-    # [FIX] v2-표준: close(long)->sell, close(short)->buy + reduceOnly=true
-    close_side_bs = _api_side_v2_bs(side, True)
+    close_side_bs = _api_side_v2_bs(side, True)  # sell (long close) / buy (short close)
+    hold_sd       = "long" if (side or "").lower()=="long" else "short"
+
     body_v2_new = {
         "productType": pt,
         "symbol": sym,
         "marginCoin": MARGIN_COIN,
         "size": str(size),
-        "side": close_side_bs,
+        "side": close_side_bs,          # buy / sell
         "orderType": "market",
         "force": "gtc",
         "reduceOnly": True,
         "marginMode": "crossed",
     }
+    if SEND_HOLDSIDE_ALWAYS:
+        body_v2_new["holdSide"] = hold_sd
+
     sc, js, txt = _http_post_soft(V2_PLACE_ORDER_PATH, body_v2_new, True)
     if sc == 200 and isinstance(js, dict) and ((js.get("code") in ("00000","0",0,None)) or js.get("data")):
         return js
@@ -548,7 +564,7 @@ def place_reduce_by_size(symbol: str, size: float, side: str) -> Dict[str,Any]:
         "productType": pt,
         "symbol": sym,
         "marginCoin": MARGIN_COIN,
-        "side": _api_side_legacy(side, True),
+        "side": _api_side_legacy(side, True),  # close_long / close_short
         "orderType": "market",
         "timeInForceValue": "normal",
         "size": str(size),
@@ -556,6 +572,9 @@ def place_reduce_by_size(symbol: str, size: float, side: str) -> Dict[str,Any]:
         "reduceOnly": True,
         "marginMode": "crossed",
     }
+    if SEND_HOLDSIDE_ALWAYS:
+        body_v2_legacy["holdSide"] = hold_sd
+
     sc, js, txt = _http_post_soft(V2_PLACE_ORDER_PATH, body_v2_legacy, True)
     if sc == 200 and isinstance(js, dict) and ((js.get("code") in ("00000","0",0,None)) or js.get("data")):
         return js
