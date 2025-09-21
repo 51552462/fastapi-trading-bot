@@ -454,6 +454,30 @@ def _hold_side_for(side_bs: str) -> str:
     s = (side_bs or "buy").lower()
     return "long" if s == "buy" else "short"
 
+# ---- 추가: 성공/사이드미스 판정 + 트레이스 도우미 ----
+def _is_ok(sc: int, js: Optional[dict]) -> bool:
+    if sc != 200 or not isinstance(js, dict):
+        return False
+    code = str(js.get("code", ""))
+    if code in ("00000","0","") and (js.get("data") is not None or code == "00000"):
+        return True
+    return False
+
+def _is_side_mismatch(js: Optional[dict]) -> bool:
+    try:
+        if not isinstance(js, dict): return False
+        if str(js.get("code","")) == "400172": return True
+        return "side mismatch" in json.dumps(js).lower()
+    except: return False
+
+def _maybe_trace(tag: str, sym: str, sc: int, js: Optional[dict], body: dict):
+    if not TRACE: return
+    safe = dict(body or {})
+    for k in ("clientOid",):
+        if k in safe: safe[k] = "***"
+    _log(f"{tag} {sym}: {sc} {js} body={json.dumps(safe, ensure_ascii=False)}")
+
+# ---- 주문(엔트리/청산) ----
 def place_market_order(symbol: str, usdt_amount: float, side: str, leverage: float, reduce_only: bool=False) -> Dict[str,Any]:
     sym  = convert_symbol(symbol)
     size = _order_size_from_usdt(sym, float(usdt_amount))
@@ -464,7 +488,7 @@ def place_market_order(symbol: str, usdt_amount: float, side: str, leverage: flo
     side_bs = _api_side_v2_bs(side, reduce_only)
     hold_sd = _hold_side_for(side_bs)  # long/short
 
-    # v2-표준
+    # v2-표준 (try1)
     body_v2_new = {
         "productType": pt,
         "symbol": sym,
@@ -480,13 +504,22 @@ def place_market_order(symbol: str, usdt_amount: float, side: str, leverage: flo
     if SEND_HOLDSIDE_ALWAYS:
         body_v2_new["holdSide"] = hold_sd
 
-    sc, js, txt = _http_post_soft(V2_PLACE_ORDER_PATH, body_v2_new, True)
-    if sc == 200 and isinstance(js, dict) and ((js.get("code") in ("00000","0",0,None)) or js.get("data")):
-        return js
-    if sc == 200 and isinstance(js, list):
-        return {"code":"00000","data":js}
+    sc1, js1, _ = _http_post_soft(V2_PLACE_ORDER_PATH, body_v2_new, True)
+    if _is_ok(sc1, js1):
+        return js1
+    _maybe_trace("place_order v2#1 fail", sym, sc1, js1, body_v2_new)
 
-    # 레거시 폴백(open_long/close_short)
+    # v2-표준(holdSide 제거) (try2) — side mismatch일 때만
+    if _is_side_mismatch(js1) and "holdSide" in body_v2_new:
+        body_v2_new2 = dict(body_v2_new); body_v2_new2.pop("holdSide", None)
+        sc2, js2, _ = _http_post_soft(V2_PLACE_ORDER_PATH, body_v2_new2, True)
+        if _is_ok(sc2, js2):
+            return js2
+        _maybe_trace("place_order v2#2 no-holdSide fail", sym, sc2, js2, body_v2_new2)
+    else:
+        sc2 = None; js2 = None
+
+    # 레거시 (try3)
     body_v2_legacy = {
         "productType": pt,
         "symbol": sym,
@@ -504,30 +537,38 @@ def place_market_order(symbol: str, usdt_amount: float, side: str, leverage: flo
     if SEND_HOLDSIDE_ALWAYS:
         body_v2_legacy["holdSide"] = hold_sd
 
-    sc, js, txt = _http_post_soft(V2_PLACE_ORDER_PATH, body_v2_legacy, True)
-    if sc == 200 and isinstance(js, dict) and ((js.get("code") in ("00000","0",0,None)) or js.get("data")):
-        return js
-    if sc == 200 and isinstance(js, list):
-        return {"code":"00000","data":js}
+    sc3, js3, _ = _http_post_soft(V2_PLACE_ORDER_PATH, body_v2_legacy, True)
+    if _is_ok(sc3, js3):
+        return js3
+    _maybe_trace("place_order v2#3 legacy fail", sym, sc3, js3, body_v2_legacy)
 
-    # v1 폴백
+    # v1 폴백 (try4)
     body_v1 = {
         "symbol": f"{sym}_UMCBL",
         "marginCoin": MARGIN_COIN,
         "size": str(size),
-        "side": ("buy" if str(side).lower() in ("buy","long") else "sell"),
+        "side": ("buy" if str(side).lower() in ("buy","long") else "sell") if not reduce_only
+                else ("sell" if str(side).lower() in ("buy","long") else "buy"),
         "orderType": "market",
         "timeInForceValue": "normal",
         "reduceOnly": bool(reduce_only)
     }
-    sc, js, txt = _http_post_soft(V1_PLACE_ORDER_PATH, body_v1, True)
-    if sc == 200 and isinstance(js, dict) and ((js.get("code") in ("00000","0",0,None)) or js.get("data")):
-        return js
-    if sc == 200 and isinstance(js, list):
-        return {"code":"00000","data":js}
+    sc4, js4, txt4 = _http_post_soft(V1_PLACE_ORDER_PATH, body_v1, True)
+    if _is_ok(sc4, js4):
+        return js4
+    _maybe_trace("place_order v1 fail", sym, sc4, js4 or {"text":txt4}, body_v1)
 
-    _log(f"place_order fail {sym}: {sc} {txt}")
-    return {"code": str(sc), "msg": txt or "place_order_failed", "data": js}
+    # 전체 실패 묶어서 반환(추적용)
+    return {
+        "code": str(sc1),
+        "msg": js1,
+        "data": {
+            "try1": {"sc": sc1, "js": js1, "body": body_v2_new},
+            "try2": {"sc": sc2, "js": js2},
+            "try3": {"sc": sc3, "js": js3, "body": body_v2_legacy},
+            "v1":   {"sc": sc4, "js": js4 or {"text":txt4}, "body": body_v1},
+        }
+    }
 
 def place_reduce_by_size(symbol: str, size: float, side: str) -> Dict[str,Any]:
     """
@@ -539,6 +580,7 @@ def place_reduce_by_size(symbol: str, size: float, side: str) -> Dict[str,Any]:
     close_side_bs = _api_side_v2_bs(side, True)  # sell (long close) / buy (short close)
     hold_sd       = "long" if (side or "").lower()=="long" else "short"
 
+    # v2-표준 (try1)
     body_v2_new = {
         "productType": pt,
         "symbol": sym,
@@ -553,13 +595,22 @@ def place_reduce_by_size(symbol: str, size: float, side: str) -> Dict[str,Any]:
     if SEND_HOLDSIDE_ALWAYS:
         body_v2_new["holdSide"] = hold_sd
 
-    sc, js, txt = _http_post_soft(V2_PLACE_ORDER_PATH, body_v2_new, True)
-    if sc == 200 and isinstance(js, dict) and ((js.get("code") in ("00000","0",0,None)) or js.get("data")):
-        return js
-    if sc == 200 and isinstance(js, list):
-        return {"code":"00000","data":js}
+    sc1, js1, _ = _http_post_soft(V2_PLACE_ORDER_PATH, body_v2_new, True)
+    if _is_ok(sc1, js1):
+        return js1
+    _maybe_trace("reduce v2#1 fail", sym, sc1, js1, body_v2_new)
 
-    # 레거시 폴백
+    # v2-표준(holdSide 제거) (try2)
+    if _is_side_mismatch(js1) and "holdSide" in body_v2_new:
+        body_v2_new2 = dict(body_v2_new); body_v2_new2.pop("holdSide", None)
+        sc2, js2, _ = _http_post_soft(V2_PLACE_ORDER_PATH, body_v2_new2, True)
+        if _is_ok(sc2, js2):
+            return js2
+        _maybe_trace("reduce v2#2 no-holdSide fail", sym, sc2, js2, body_v2_new2)
+    else:
+        sc2 = None; js2 = None
+
+    # 레거시 (try3)
     body_v2_legacy = {
         "productType": pt,
         "symbol": sym,
@@ -575,13 +626,36 @@ def place_reduce_by_size(symbol: str, size: float, side: str) -> Dict[str,Any]:
     if SEND_HOLDSIDE_ALWAYS:
         body_v2_legacy["holdSide"] = hold_sd
 
-    sc, js, txt = _http_post_soft(V2_PLACE_ORDER_PATH, body_v2_legacy, True)
-    if sc == 200 and isinstance(js, dict) and ((js.get("code") in ("00000","0",0,None)) or js.get("data")):
-        return js
-    if sc == 200 and isinstance(js, list):
-        return {"code":"00000","data":js}
+    sc3, js3, _ = _http_post_soft(V2_PLACE_ORDER_PATH, body_v2_legacy, True)
+    if _is_ok(sc3, js3):
+        return js3
+    _maybe_trace("reduce v2#3 legacy fail", sym, sc3, js3, body_v2_legacy)
 
-    return js if isinstance(js, dict) else {"code": str(sc), "msg": txt, "data": js}
+    # v1 폴백 (try4)
+    body_v1 = {
+        "symbol": f"{sym}_UMCBL",
+        "marginCoin": MARGIN_COIN,
+        "size": str(size),
+        "side": ("sell" if (side or "").lower() in ("buy","long") else "buy"),  # 반대매매
+        "orderType": "market",
+        "timeInForceValue": "normal",
+        "reduceOnly": True,
+    }
+    sc4, js4, txt4 = _http_post_soft(V1_PLACE_ORDER_PATH, body_v1, True)
+    if _is_ok(sc4, js4):
+        return js4
+    _maybe_trace("reduce v1 fail", sym, sc4, js4 or {"text":txt4}, body_v1)
+
+    return {
+        "code": str(sc1),
+        "msg": js1,
+        "data": {
+            "try1": {"sc": sc1, "js": js1, "body": body_v2_new},
+            "try2": {"sc": sc2, "js": js2},
+            "try3": {"sc": sc3, "js": js3, "body": body_v2_legacy},
+            "v1":   {"sc": sc4, "js": js4 or {"text":txt4}, "body": body_v1},
+        }
+    }
 
 # ────────────────────────────────────────────────────────
 # 포지션 조회
