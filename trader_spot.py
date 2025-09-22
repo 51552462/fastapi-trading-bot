@@ -39,7 +39,7 @@ BALANCE_RETRY_DELAY = float(os.getenv("BALANCE_RETRY_DELAY", "2"))
 
 # === 자동 손절(실시간 PnL %) ===
 AUTO_SL_ENABLE    = os.getenv("AUTO_SL_ENABLE", "1") == "1"
-# 음수로 주면 그대로 임계값 사용(-3 = -3%), 양수로 주면 하락폭으로 해석(3 = -3%)
+# 음수로 주면 그대로 임계값 사용(-3 = -3%), 양수로 주면 하락폭으로 해석(3 = -3)
 _auto_sl_pct_env   = float(os.getenv("AUTO_SL_PCT", "-3"))
 AUTO_SL_PCT       = _auto_sl_pct_env if _auto_sl_pct_env < 0 else -abs(_auto_sl_pct_env)
 AUTO_SL_POLL_SEC  = float(os.getenv("AUTO_SL_POLL_SEC", "3"))   # 가격 폴링 주기
@@ -290,6 +290,7 @@ def _auto_sl_loop():
                         # 즉시 전량 종료
                         send_telegram(f"[SPOT] autoSL trigger {s} pnl≈{pnl_pct:.2f}% (th={AUTO_SL_PCT}%)")
                         close_spot(s, reason="autoSL")
+                        # close_spot 안에서 캐시가 정리됨
                 except Exception:
                     pass
 
@@ -310,16 +311,27 @@ def start_auto_stoploss():
     _ASL_THRD.start()
 
 
-# --------------------- (호환) pos_store 어댑터 ---------------------
+# --------------------- (중요) 호환용 pos_store ---------------------
 class _CompatPosStore:
-    """예전 main 코드가 `from trader_spot import pos_store` 를 임포트할 때 깨지지 않게 하는 호환 레이어"""
-    def size(self, symbol: str) -> float:
-        sym = convert_symbol(symbol)
-        return float(held_marks_qty.get(sym, 0.0))
+    """
+    기존 DD 모니터 등이 `pos_store.pos` 를 기대하는 경우가 있어
+    현재 내부 캐시(held_marks_*)를 읽어 같은 인터페이스로 노출한다.
+    """
+    def __init__(self):
+        self.version = 2  # 단순 표기
 
-    def entry(self, symbol: str):
-        """(평단, 누적수량) 튜플 반환. 없으면 (0.0, 0.0)"""
-        sym = convert_symbol(symbol)
-        return float(entry_px.get(sym, 0.0)), float(entry_qty.get(sym, 0.0))
+    @property
+    def pos(self) -> Dict[str, Dict[str, float]]:
+        # { "SYMBOL": {"qty": <free>, "ts": <last_ts>} } 형태로 제공
+        with _POS_LOCK:
+            keys = set(held_marks_qty.keys()) | set(held_marks_ts.keys())
+            return {
+                s: {
+                    "qty": float(held_marks_qty.get(s, 0.0)),
+                    "ts":  float(held_marks_ts.get(s, 0.0)),
+                }
+                for s in keys
+            }
 
+# 외부에서 import 하는 이름
 pos_store = _CompatPosStore()
