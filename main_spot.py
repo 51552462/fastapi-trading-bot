@@ -1,12 +1,6 @@
 # main_spot.py
 # ------------------------------------------------------------
-# TradingView → Render(FastAPI) → Bitget(Spot) 자동매매 엔진 (메인 엔드포인트)
-# - 중복/업무중복 방지(DEDUP/BIZ DEDUP)
-# - 워커 큐 기반 비동기 처리
-# - 심볼별 금액 설정/기본금액/강제기본금액
-# - TP/SL/FailCut/Close 라우팅
-# - 헬스/로그/밸런스/설정 조회
-# - 용량가드 + 자동 손절(-3% 등) 감시 스레드 시작
+# TradingView → Render(FastAPI) → Bitget(Spot) 자동매매 엔진
 # ------------------------------------------------------------
 import os
 import time
@@ -24,76 +18,62 @@ try:
     from telegram_spot_bot import send_telegram
 except Exception:
     try:
-        from telegram_bot import send_telegram  # 폴백(있으면 사용)
+        from telegram_bot import send_telegram  # 폴백
     except Exception:
         def send_telegram(msg: str):
             print("[TG]", msg)
 
 # Bitget Spot 헬퍼
-from bitget_api_spot import convert_symbol, get_spot_balances, get_last_price_spot  # NEW: get_last_price_spot
+from bitget_api_spot import convert_symbol, get_spot_balances
 
 # 트레이더(실거래 동작)
 from trader_spot import (
     enter_spot, take_partial_spot, close_spot,
-    start_capacity_guard, start_auto_stoploss,
-    # === NEW: 포지션 상태 접근용 ===
-    pos_store,
+    start_capacity_guard, start_auto_stoploss
 )
 
 # ----------------------- 환경변수 -----------------------
-DEFAULT_AMOUNT = float(os.getenv("DEFAULT_AMOUNT", "15"))  # 기본 진입 USDT
-DEDUP_TTL      = float(os.getenv("DEDUP_TTL", "15"))       # 동일 페이로드 중복 잠금
-BIZDEDUP_TTL   = float(os.getenv("BIZDEDUP_TTL", "3"))     # 같은 작업(타입/심볼/사이드) 잠금
+DEFAULT_AMOUNT = float(os.getenv("DEFAULT_AMOUNT", "15"))
+DEDUP_TTL      = float(os.getenv("DEDUP_TTL", "15"))
+BIZDEDUP_TTL   = float(os.getenv("BIZDEDUP_TTL", "3"))
 
 WORKERS        = int(os.getenv("WORKERS", "4"))
 QUEUE_MAX      = int(os.getenv("QUEUE_MAX", "1000"))
 
-LOG_INGRESS    = os.getenv("LOG_INGRESS", "0") == "1"      # 들어오는 시그널 로그 텔레그램 알림
-FORCE_DEFAULT_AMOUNT = os.getenv("FORCE_DEFAULT_AMOUNT", "0") == "1"  # 금액 강제 기본값
+LOG_INGRESS    = os.getenv("LOG_INGRESS", "0") == "1"
+FORCE_DEFAULT_AMOUNT = os.getenv("FORCE_DEFAULT_AMOUNT", "0") == "1"
 
-# 부분익절 비율(메인에서 pct를 정해서 trader에 전달)
 TP1_PCT = float(os.getenv("TP1_PCT", "0.30"))
 TP2_PCT = float(os.getenv("TP2_PCT", "0.40"))
 TP3_PCT = float(os.getenv("TP3_PCT", "0.30"))
 
-# 심볼별 고정 금액 매핑(JSON 문자열)
 SYMBOL_AMOUNT_JSON = os.getenv("SYMBOL_AMOUNT_JSON", "")
 try:
     SYMBOL_AMOUNT = json.loads(SYMBOL_AMOUNT_JSON) if SYMBOL_AMOUNT_JSON else {}
 except Exception:
     SYMBOL_AMOUNT = {}
 
-# 자동 손절(트레이더 내부 스레드가 수행; 메인에선 설정 표기만)
 AUTO_SL_ENABLE    = os.getenv("AUTO_SL_ENABLE", "1") == "1"
 _auto_sl_pct_env  = float(os.getenv("AUTO_SL_PCT", "-3"))
 AUTO_SL_PCT       = _auto_sl_pct_env if _auto_sl_pct_env < 0 else -abs(_auto_sl_pct_env)
 AUTO_SL_POLL_SEC  = float(os.getenv("AUTO_SL_POLL_SEC", "3"))
 AUTO_SL_GRACE_SEC = float(os.getenv("AUTO_SL_GRACE_SEC", "5"))
 
-# === NEW: Drawdown monitor(메인에서도 백업 감시) ===
-DD_ENABLE     = os.getenv("DD_ENABLE", "1") == "1"              # 켜기/끄기
-DD_THRESHOLD  = float(os.getenv("DD_THRESHOLD", "-0.03"))       # -3% = -0.03
-DD_INTERVAL_S = float(os.getenv("DD_INTERVAL_S", "3.0"))        # 체크 주기(초)
-# 동일 심볼 연속 종료 중복 방지 (30초 이내 재청산 금지)
-_DD_CLOSING_GUARD: Dict[str, float] = {}
-
 # ----------------------- 앱 상태 -----------------------
 app = FastAPI()
 
-INGRESS_LOG: deque = deque(maxlen=200)    # 최근 유입 시그널 기록
-_DEDUP: Dict[str, float] = {}             # 페이로드 중복 키
-_BIZDEDUP: Dict[str, float] = {}          # 업무중복 키(type+symbol+side)
+INGRESS_LOG: deque = deque(maxlen=200)
+_DEDUP: Dict[str, float] = {}
+_BIZDEDUP: Dict[str, float] = {}
 
 _task_q: "queue.Queue[Dict[str, Any]]" = queue.Queue(maxsize=QUEUE_MAX)
 
 
 # ----------------------- 유틸 -----------------------
 def _dedup_key(d: Dict[str, Any]) -> str:
-    """페이로드 전체로 해시 생성"""
     return hashlib.sha1(json.dumps(d, sort_keys=True).encode()).hexdigest()
 
 def _biz_key(typ: str, symbol: str, side: str) -> str:
-    """업무중복(같은 명령) 키"""
     return f"{typ}:{symbol}:{side}"
 
 def _infer_side(side: str, default: str = "long") -> str:
@@ -105,7 +85,6 @@ def _norm_symbol(sym: str) -> str:
 
 
 async def _parse_any(req: Request) -> Dict[str, Any]:
-    """JSON/Raw/Form 모두 파싱(TradingView/수동 curl 호환)"""
     # 1) JSON
     try:
         return await req.json()
@@ -118,7 +97,6 @@ async def _parse_any(req: Request) -> Dict[str, Any]:
             try:
                 return json.loads(raw)
             except Exception:
-                # 작은따옴표 → 큰따옴표 보정
                 fixed = raw.replace("'", '"')
                 return json.loads(fixed)
     except Exception:
@@ -137,8 +115,7 @@ async def _parse_any(req: Request) -> Dict[str, Any]:
 # ----------------------- 시그널 처리 -----------------------
 def _handle_signal(data: Dict[str, Any]):
     """
-    표준 입력:
-      { "type": "entry|tp1|tp2|tp3|sl1|sl2|close|failCut|emaExit|...", "symbol": "DOGEUSDT", "side": "long", "amount": 50 }
+    { "type": "entry|tp1|tp2|tp3|sl1|sl2|close|failCut|emaExit|...", "symbol": "DOGEUSDT", "side": "long", "amount": 50 }
     """
     typ    = (data.get("type") or "").strip()
     symbol = _norm_symbol(data.get("symbol", ""))
@@ -146,7 +123,6 @@ def _handle_signal(data: Dict[str, Any]):
     amount = float(data.get("amount", DEFAULT_AMOUNT))
     resolved_amount = float(amount)
 
-    # 심볼별 금액 우선
     if (symbol in SYMBOL_AMOUNT) and (str(SYMBOL_AMOUNT[symbol]).strip() != ""):
         try:
             resolved_amount = float(SYMBOL_AMOUNT[symbol])
@@ -159,12 +135,7 @@ def _handle_signal(data: Dict[str, Any]):
         send_telegram("[SPOT] symbol missing: " + json.dumps(data))
         return
 
-    # 레거시 키워드 매핑
-    legacy = {
-        "tp_1": "tp1", "tp_2": "tp2", "tp_3": "tp3",
-        "sl_1": "sl1", "sl_2": "sl2",
-        "ema_exit": "emaExit", "failcut": "failCut"
-    }
+    legacy = {"tp_1":"tp1","tp_2":"tp2","tp_3":"tp3","sl_1":"sl1","sl_2":"sl2","ema_exit":"emaExit","failcut":"failCut"}
     typ = legacy.get(typ.lower(), typ)
 
     now = time.time()
@@ -183,7 +154,6 @@ def _handle_signal(data: Dict[str, Any]):
         except Exception:
             pass
 
-    # 라우팅
     if typ == "entry":
         enter_spot(symbol, resolved_amount); return
 
@@ -191,14 +161,13 @@ def _handle_signal(data: Dict[str, Any]):
         pct = TP1_PCT if typ == "tp1" else (TP2_PCT if typ == "tp2" else TP3_PCT)
         take_partial_spot(symbol, pct); return
 
-    # sl1/sl2 → 전량 종료(트레이더에서 예쁜 포맷으로 텔레그램)
-    if typ in ("sl1", "sl2"):
+    if typ in ("sl1","sl2"):
         close_spot(symbol, reason=typ); return
 
-    if typ in ("failCut", "emaExit", "liquidation", "fullExit", "close", "exit"):
+    if typ in ("failCut","emaExit","liquidation","fullExit","close","exit"):
         close_spot(symbol, reason=typ); return
 
-    if typ in ("tailTouch", "info", "debug"):
+    if typ in ("tailTouch","info","debug"):
         return
 
     send_telegram("[SPOT] unknown signal: " + json.dumps(data))
@@ -218,7 +187,6 @@ def _worker_loop(idx: int):
 
 
 async def _ingest(req: Request):
-    """공통 인입 처리(+중복 방지, 큐 적재)"""
     now = time.time()
     try:
         data = await _parse_any(req)
@@ -239,7 +207,9 @@ async def _ingest(req: Request):
     return {"ok": True, "queued": True, "qsize": _task_q.qsize()}
 
 
-# ----------------------- FastAPI 엔드포인트 -----------------------
+# ----------------------- FastAPI -----------------------
+app = FastAPI()
+
 @app.get("/")
 def root():
     return {"ok": True, "service": "spot"}
@@ -262,17 +232,14 @@ def health():
 
 @app.get("/ingress")
 def ingress():
-    """최근 유입 30건 확인용(디버깅)"""
     return list(INGRESS_LOG)[-30:]
 
 @app.get("/balances")
 def balances():
-    """현물 잔고 스냅샷(가용)"""
     return {"balances": get_spot_balances(force=True)}
 
 @app.get("/config")
 def config():
-    """현재 설정값 확인"""
     return {
         "DEFAULT_AMOUNT": DEFAULT_AMOUNT,
         "DEDUP_TTL": DEDUP_TTL, "BIZDEDUP_TTL": BIZDEDUP_TTL,
@@ -285,79 +252,21 @@ def config():
         "AUTO_SL_PCT": AUTO_SL_PCT,
         "AUTO_SL_POLL_SEC": AUTO_SL_POLL_SEC,
         "AUTO_SL_GRACE_SEC": AUTO_SL_GRACE_SEC,
-        "SL_MODE": "sl1/sl2 → FULL CLOSE (autoSL thread active if enabled)",
-        # NEW: 모니터 설정 노출
-        "DD_ENABLE": DD_ENABLE, "DD_THRESHOLD": DD_THRESHOLD, "DD_INTERVAL_S": DD_INTERVAL_S,
+        "SL_MODE": "sl1/sl2 → FULL CLOSE (autoSL thread active if enabled)"
     }
 
 
 # ----------------------- 스타트업 -----------------------
-def _dd_monitor_loop():
-    """NEW: 포지션 상태 기반 드로우다운 모니터 (백업 안전장치)"""
-    if not DD_ENABLE:
-        return
-    try:
-        send_telegram(f"[SPOT] DD monitor start: threshold={DD_THRESHOLD*100:.1f}%, interval={DD_INTERVAL_S}s")
-    except Exception:
-        pass
-
-    while True:
-        try:
-            # trader_spot.PositionStore 의 현재 스냅샷
-            snapshot = dict(pos_store.pos)  # {"BTCUSDT":{"qty":..., "cost":...}, ...}
-            now = time.time()
-            for sym, pc in snapshot.items():
-                try:
-                    qty  = float(pc.get("qty", 0.0))
-                    cost = float(pc.get("cost", 0.0))
-                except Exception:
-                    qty, cost = 0.0, 0.0
-
-                if qty <= 0 or cost <= 0:
-                    continue
-
-                # 최근 30초 내 이미 종료 시도했으면 skip
-                last = _DD_CLOSING_GUARD.get(sym, 0.0)
-                if now - last < 30:
-                    continue
-
-                avg = cost / qty
-                px  = get_last_price_spot(sym) or 0.0
-                if px <= 0:
-                    continue
-
-                pnl_pct = (px / avg) - 1.0
-                if pnl_pct <= DD_THRESHOLD:
-                    _DD_CLOSING_GUARD[sym] = now
-                    try:
-                        send_telegram(f"[SPOT] DD trigger {sym} pnl={pnl_pct*100:.2f}% ≤ {DD_THRESHOLD*100:.1f}% → market close")
-                    except Exception:
-                        pass
-                    # 전량 종료 (trader_spot 쪽에서 실현손익/알림 처리 보장)
-                    close_spot(sym, reason="dd")
-        except Exception as e:
-            try:
-                send_telegram(f"[SPOT] DD monitor error: {e}")
-            except Exception:
-                pass
-
-        time.sleep(DD_INTERVAL_S)
-
-
 @app.on_event("startup")
 def on_startup():
-    # 워커 시작
+    # 워커
     for i in range(WORKERS):
         t = threading.Thread(target=_worker_loop, args=(i,), daemon=True, name=f"spot-worker-{i}")
         t.start()
 
-    # 용량가드 + 자동손절 감시 스레드 시작(기존 로직 유지)
+    # 용량가드 + 자동손절
     start_capacity_guard()
     start_auto_stoploss()
-
-    # NEW: 드로우다운 모니터 스레드 (백업 안전장치)
-    if DD_ENABLE:
-        threading.Thread(target=_dd_monitor_loop, daemon=True, name="spot-dd-monitor").start()
 
     # 기동 알림
     try:
