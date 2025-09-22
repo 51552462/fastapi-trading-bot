@@ -30,12 +30,14 @@ except Exception:
             print("[TG]", msg)
 
 # Bitget Spot 헬퍼
-from bitget_api_spot import convert_symbol, get_spot_balances
+from bitget_api_spot import convert_symbol, get_spot_balances, get_last_price_spot  # NEW: get_last_price_spot
 
 # 트레이더(실거래 동작)
 from trader_spot import (
     enter_spot, take_partial_spot, close_spot,
-    start_capacity_guard, start_auto_stoploss
+    start_capacity_guard, start_auto_stoploss,
+    # === NEW: 포지션 상태 접근용 ===
+    pos_store,
 )
 
 # ----------------------- 환경변수 -----------------------
@@ -67,6 +69,13 @@ _auto_sl_pct_env  = float(os.getenv("AUTO_SL_PCT", "-3"))
 AUTO_SL_PCT       = _auto_sl_pct_env if _auto_sl_pct_env < 0 else -abs(_auto_sl_pct_env)
 AUTO_SL_POLL_SEC  = float(os.getenv("AUTO_SL_POLL_SEC", "3"))
 AUTO_SL_GRACE_SEC = float(os.getenv("AUTO_SL_GRACE_SEC", "5"))
+
+# === NEW: Drawdown monitor(메인에서도 백업 감시) ===
+DD_ENABLE     = os.getenv("DD_ENABLE", "1") == "1"              # 켜기/끄기
+DD_THRESHOLD  = float(os.getenv("DD_THRESHOLD", "-0.03"))       # -3% = -0.03
+DD_INTERVAL_S = float(os.getenv("DD_INTERVAL_S", "3.0"))        # 체크 주기(초)
+# 동일 심볼 연속 종료 중복 방지 (30초 이내 재청산 금지)
+_DD_CLOSING_GUARD: Dict[str, float] = {}
 
 # ----------------------- 앱 상태 -----------------------
 app = FastAPI()
@@ -276,11 +285,65 @@ def config():
         "AUTO_SL_PCT": AUTO_SL_PCT,
         "AUTO_SL_POLL_SEC": AUTO_SL_POLL_SEC,
         "AUTO_SL_GRACE_SEC": AUTO_SL_GRACE_SEC,
-        "SL_MODE": "sl1/sl2 → FULL CLOSE (autoSL thread active if enabled)"
+        "SL_MODE": "sl1/sl2 → FULL CLOSE (autoSL thread active if enabled)",
+        # NEW: 모니터 설정 노출
+        "DD_ENABLE": DD_ENABLE, "DD_THRESHOLD": DD_THRESHOLD, "DD_INTERVAL_S": DD_INTERVAL_S,
     }
 
 
 # ----------------------- 스타트업 -----------------------
+def _dd_monitor_loop():
+    """NEW: 포지션 상태 기반 드로우다운 모니터 (백업 안전장치)"""
+    if not DD_ENABLE:
+        return
+    try:
+        send_telegram(f"[SPOT] DD monitor start: threshold={DD_THRESHOLD*100:.1f}%, interval={DD_INTERVAL_S}s")
+    except Exception:
+        pass
+
+    while True:
+        try:
+            # trader_spot.PositionStore 의 현재 스냅샷
+            snapshot = dict(pos_store.pos)  # {"BTCUSDT":{"qty":..., "cost":...}, ...}
+            now = time.time()
+            for sym, pc in snapshot.items():
+                try:
+                    qty  = float(pc.get("qty", 0.0))
+                    cost = float(pc.get("cost", 0.0))
+                except Exception:
+                    qty, cost = 0.0, 0.0
+
+                if qty <= 0 or cost <= 0:
+                    continue
+
+                # 최근 30초 내 이미 종료 시도했으면 skip
+                last = _DD_CLOSING_GUARD.get(sym, 0.0)
+                if now - last < 30:
+                    continue
+
+                avg = cost / qty
+                px  = get_last_price_spot(sym) or 0.0
+                if px <= 0:
+                    continue
+
+                pnl_pct = (px / avg) - 1.0
+                if pnl_pct <= DD_THRESHOLD:
+                    _DD_CLOSING_GUARD[sym] = now
+                    try:
+                        send_telegram(f"[SPOT] DD trigger {sym} pnl={pnl_pct*100:.2f}% ≤ {DD_THRESHOLD*100:.1f}% → market close")
+                    except Exception:
+                        pass
+                    # 전량 종료 (trader_spot 쪽에서 실현손익/알림 처리 보장)
+                    close_spot(sym, reason="dd")
+        except Exception as e:
+            try:
+                send_telegram(f"[SPOT] DD monitor error: {e}")
+            except Exception:
+                pass
+
+        time.sleep(DD_INTERVAL_S)
+
+
 @app.on_event("startup")
 def on_startup():
     # 워커 시작
@@ -288,9 +351,13 @@ def on_startup():
         t = threading.Thread(target=_worker_loop, args=(i,), daemon=True, name=f"spot-worker-{i}")
         t.start()
 
-    # 용량가드 + 자동손절 감시 스레드 시작
+    # 용량가드 + 자동손절 감시 스레드 시작(기존 로직 유지)
     start_capacity_guard()
     start_auto_stoploss()
+
+    # NEW: 드로우다운 모니터 스레드 (백업 안전장치)
+    if DD_ENABLE:
+        threading.Thread(target=_dd_monitor_loop, daemon=True, name="spot-dd-monitor").start()
 
     # 기동 알림
     try:
