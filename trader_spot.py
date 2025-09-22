@@ -290,8 +290,7 @@ def _auto_sl_loop():
                         # 즉시 전량 종료
                         send_telegram(f"[SPOT] autoSL trigger {s} pnl≈{pnl_pct:.2f}% (th={AUTO_SL_PCT}%)")
                         close_spot(s, reason="autoSL")
-                        # close_spot 안에서 캐시가 정리됨
-                except Exception as _:
+                except Exception:
                     pass
 
         except Exception as e:
@@ -309,3 +308,18 @@ def start_auto_stoploss():
     _ASL_ON = True
     _ASL_THRD = threading.Thread(target=_auto_sl_loop, daemon=True, name="spot-autoSL")
     _ASL_THRD.start()
+
+
+# --------------------- (호환) pos_store 어댑터 ---------------------
+class _CompatPosStore:
+    """예전 main 코드가 `from trader_spot import pos_store` 를 임포트할 때 깨지지 않게 하는 호환 레이어"""
+    def size(self, symbol: str) -> float:
+        sym = convert_symbol(symbol)
+        return float(held_marks_qty.get(sym, 0.0))
+
+    def entry(self, symbol: str):
+        """(평단, 누적수량) 튜플 반환. 없으면 (0.0, 0.0)"""
+        sym = convert_symbol(symbol)
+        return float(entry_px.get(sym, 0.0)), float(entry_qty.get(sym, 0.0))
+
+pos_store = _CompatPosStore()
