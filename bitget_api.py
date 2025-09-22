@@ -184,7 +184,7 @@ _spec_cache: Dict[str,Dict[str,Any]] = {}
 def get_symbol_spec(symbol: str) -> Dict[str,Any]:
     sym = convert_symbol(symbol); sp = _spec_cache.get(sym)
     if sp: return sp
-    sp = {"sizeStep":0.001, "priceStep":0.01}
+    sp = {"sizeStep":0.001, "priceStep":0.01}  # 필요 시 제품정보 API로 교체 가능
     _spec_cache[sym] = sp; return sp
 
 def round_down_step(v: float, step: float) -> float:
@@ -419,6 +419,29 @@ def get_last_price(symbol: str) -> Optional[float]:
     return None
 
 # ────────────────────────────────────────────────────────
+# 포지션 모드(one_way/hedge) 조회
+# ────────────────────────────────────────────────────────
+_account_mode_cache = {"ts": 0, "mode": None}  # 'one_way' or 'hedge'
+
+def _get_account_mode(product_type: str) -> str:
+    """v2 단일계정 조회로 positionMode(one_way/hedge) 확인"""
+    now = time.time()
+    if _account_mode_cache["mode"] and (now - _account_mode_cache["ts"] < 60):
+        return _account_mode_cache["mode"]
+
+    path = "/api/v2/mix/account/get-single-account"
+    params = {"productType": product_type, "marginCoin": MARGIN_COIN}
+    try:
+        sc, js, _ = _http_get_soft(path, params, True)
+        mode = (js.get("data", {}).get("positionMode") or "").lower() if sc == 200 else ""
+        if mode not in ("one_way", "hedge"):
+            mode = (os.getenv("BITGET_FORCE_POSITION_MODE", "") or "one_way").lower()
+        _account_mode_cache.update({"ts": now, "mode": mode})
+        return mode
+    except Exception:
+        return (os.getenv("BITGET_FORCE_POSITION_MODE", "") or "one_way").lower()
+
+# ────────────────────────────────────────────────────────
 # 주문/감축
 # ────────────────────────────────────────────────────────
 def _api_side_legacy(side: str, reduce_only: bool) -> str:
@@ -426,34 +449,6 @@ def _api_side_legacy(side: str, reduce_only: bool) -> str:
     if s in ("buy","long"):  return "close_short" if reduce_only else "open_long"
     else:                    return "close_long"  if reduce_only else "open_short"
 
-def _api_side_v2_bs(side: str, reduce_only: bool) -> str:
-    s = (side or "").lower()
-    if reduce_only:
-        return "sell" if s in ("buy","long","open_long") else "buy"
-    else:
-        return "buy" if s in ("buy","long","open_long") else "sell"
-
-def _guess_product_type(symbol: str) -> str:
-    if ORDER_PRODUCT_TYPE:
-        return ORDER_PRODUCT_TYPE
-    s = symbol.upper()
-    if s.endswith("USDT"): return "USDT-FUTURES"
-    if s.endswith("USDC"): return "USDC-FUTURES"
-    if s.endswith("USD"):  return "COIN-FUTURES"
-    return V2_PRODUCT_TYPE or "USDT-FUTURES"
-
-def _order_size_from_usdt(symbol: str, usdt_amount: float) -> float:
-    last = get_last_price(symbol)
-    if not last or last<=0: return 0.0
-    step = float(get_symbol_spec(symbol).get("sizeStep",0.001))
-    size = float(usdt_amount) / float(last)
-    return max(step, round_down_step(size, step))
-
-def _hold_side_for(side_bs: str) -> str:
-    s = (side_bs or "buy").lower()
-    return "long" if s == "buy" else "short"
-
-# ---- 성공/사이드미스 판정 + 트레이스 도우미 ----
 def _is_ok(sc: int, js: Optional[dict]) -> bool:
     if sc != 200 or not isinstance(js, dict):
         return False
@@ -476,6 +471,26 @@ def _maybe_trace(tag: str, sym: str, sc: int, js: Optional[dict], body: dict):
         if k in safe: safe[k] = "***"
     _log(f"{tag} {sym}: {sc} {js} body={json.dumps(safe, ensure_ascii=False)}")
 
+def _guess_product_type(symbol: str) -> str:
+    if ORDER_PRODUCT_TYPE:
+        return ORDER_PRODUCT_TYPE
+    s = symbol.upper()
+    if s.endswith("USDT"): return "USDT-FUTURES"
+    if s.endswith("USDC"): return "USDC-FUTURES"
+    if s.endswith("USD"):  return "COIN-FUTURES"
+    return V2_PRODUCT_TYPE or "USDT-FUTURES"
+
+def _order_size_from_usdt(symbol: str, usdt_amount: float) -> float:
+    last = get_last_price(symbol)
+    if not last or last<=0: return 0.0
+    step = float(get_symbol_spec(symbol).get("sizeStep",0.001))
+    size = float(usdt_amount) / float(last)
+    return max(step, round_down_step(size, step))
+
+def _hold_side_for(side_bs: str) -> str:
+    s = (side_bs or "buy").lower()
+    return "long" if s == "buy" else "short"
+
 # ---- 주문(엔트리/청산) ----
 def place_market_order(symbol: str, usdt_amount: float, side: str, leverage: float, reduce_only: bool=False) -> Dict[str,Any]:
     sym  = convert_symbol(symbol)
@@ -483,48 +498,44 @@ def place_market_order(symbol: str, usdt_amount: float, side: str, leverage: flo
     if size <= 0: raise RuntimeError(f"size_calc_fail {sym} amt={usdt_amount}")
 
     pt = _guess_product_type(sym)
+    mode = _get_account_mode(pt)  # 'one_way' or 'hedge'
 
-    side_bs = _api_side_v2_bs(side, reduce_only)
-    hold_sd = _hold_side_for(side_bs)  # long/short
-
-    # v2-표준 (try1)  ── ※ 진입일 때 reduceOnly 필드 **미포함**
+    # v2 표준 바디(진입). 진입은 모드와 무관하게 reduceOnly 미포함
+    side_bs = "buy" if str(side).lower() in ("buy","long","open_long") else "sell"
     body_v2_new = {
         "productType": pt,
         "symbol": sym,
         "marginCoin": MARGIN_COIN,
         "size": str(size),
-        "side": side_bs,                 # buy / sell
+        "side": side_bs,
         "orderType": "market",
         "force": "gtc",
         "marginMode": "crossed",
         "leverage": str(leverage),
     }
-    if reduce_only:                      # 청산 주문일 때만 포함
-        body_v2_new["reduceOnly"] = True
     if SEND_HOLDSIDE_ALWAYS:
-        body_v2_new["holdSide"] = hold_sd
+        body_v2_new["holdSide"] = _hold_side_for(side_bs)
 
     sc1, js1, _ = _http_post_soft(V2_PLACE_ORDER_PATH, body_v2_new, True)
-    if _is_ok(sc1, js1):
-        return js1
+    if _is_ok(sc1, js1): return js1
     _maybe_trace("place_order v2#1 fail", sym, sc1, js1, body_v2_new)
 
-    # v2-표준(holdSide 제거) (try2) — side mismatch일 때만
+    # holdSide 제거 재시도(일부 계정 side mismatch 회피)
     if _is_side_mismatch(js1) and "holdSide" in body_v2_new:
         body_v2_new2 = dict(body_v2_new); body_v2_new2.pop("holdSide", None)
         sc2, js2, _ = _http_post_soft(V2_PLACE_ORDER_PATH, body_v2_new2, True)
-        if _is_ok(sc2, js2):
-            return js2
+        if _is_ok(sc2, js2): return js2
         _maybe_trace("place_order v2#2 no-holdSide fail", sym, sc2, js2, body_v2_new2)
     else:
-        sc2 = None; js2 = None
+        sc2, js2 = None, None
 
-    # 레거시 (try3)  ── 진입일 때 reduceOnly **미포함**
+    # 레거시 모드(여전히 v2 endpoint). 진입은 reduceOnly 미포함
+    legacy_side = _api_side_legacy(side, False)  # open_long/open_short
     body_v2_legacy = {
         "productType": pt,
         "symbol": sym,
         "marginCoin": MARGIN_COIN,
-        "side": _api_side_legacy(side, reduce_only),
+        "side": legacy_side,
         "orderType": "market",
         "timeInForceValue": "normal",
         "size": str(size),
@@ -533,133 +544,120 @@ def place_market_order(symbol: str, usdt_amount: float, side: str, leverage: flo
         "marginMode": "crossed",
         "leverage": str(leverage),
     }
-    if reduce_only:
-        body_v2_legacy["reduceOnly"] = True
     if SEND_HOLDSIDE_ALWAYS:
-        body_v2_legacy["holdSide"] = hold_sd
+        body_v2_legacy["holdSide"] = _hold_side_for(side_bs)
 
     sc3, js3, _ = _http_post_soft(V2_PLACE_ORDER_PATH, body_v2_legacy, True)
-    if _is_ok(sc3, js3):
-        return js3
+    if _is_ok(sc3, js3): return js3
     _maybe_trace("place_order v2#3 legacy fail", sym, sc3, js3, body_v2_legacy)
 
-    # v1 폴백 (try4)  ── 진입일 때 reduceOnly **미포함**
+    # v1 폴백
     body_v1 = {
         "symbol": f"{sym}_UMCBL",
         "marginCoin": MARGIN_COIN,
         "size": str(size),
-        "side": ("buy" if str(side).lower() in ("buy","long") else "sell") if not reduce_only
-                else ("sell" if str(side).lower() in ("buy","long") else "buy"),
+        "side": side_bs,  # buy/sell
         "orderType": "market",
         "timeInForceValue": "normal",
     }
-    if reduce_only:
-        body_v1["reduceOnly"] = True
-
     sc4, js4, txt4 = _http_post_soft(V1_PLACE_ORDER_PATH, body_v1, True)
-    if _is_ok(sc4, js4):
-        return js4
+    if _is_ok(sc4, js4): return js4
     _maybe_trace("place_order v1 fail", sym, sc4, js4 or {"text":txt4}, body_v1)
 
-    # 전체 실패 묶어서 반환(추적용)
-    return {
-        "code": str(sc1),
-        "msg": js1,
-        "data": {
-            "try1": {"sc": sc1, "js": js1, "body": body_v2_new},
-            "try2": {"sc": sc2, "js": js2},
-            "try3": {"sc": sc3, "js": js3, "body": body_v2_legacy},
-            "v1":   {"sc": sc4, "js": js4 or {"text":txt4}, "body": body_v1},
-        }
-    }
+    return {"code": str(sc1), "msg": js1, "data": {
+        "try1": {"sc": sc1, "js": js1, "body": body_v2_new},
+        "try2": {"sc": sc2, "js": js2},
+        "try3": {"sc": sc3, "js": js3, "body": body_v2_legacy},
+        "v1":   {"sc": sc4, "js": js4 or {"text":txt4}, "body": body_v1},
+    }}
 
 def place_reduce_by_size(symbol: str, size: float, side: str) -> Dict[str,Any]:
     """
-    size: 포지션 계약 수량, side: 보유 포지션의 방향(long/short).
+    size: 줄일(청산할) 계약 수량
+    side: 보유 포지션의 방향 ('long' 또는 'short')
     """
     sym = convert_symbol(symbol)
     pt  = _guess_product_type(sym)
-    size = max(float(get_symbol_spec(sym).get("sizeStep",0.001)), float(size))
+    mode = _get_account_mode(pt)  # 'one_way' or 'hedge'
 
-    close_side_bs = _api_side_v2_bs(side, True)  # sell (long close) / buy (short close)
-    hold_sd       = "long" if (side or "").lower()=="long" else "short"
+    step = float(get_symbol_spec(sym).get("sizeStep", 0.001))
+    size = max(step, round_down_step(float(size), step))
 
-    # v2-표준 (try1) ── 청산이므로 reduceOnly=True 포함
+    # 원웨이면 reduceOnly 미사용(반대방향 시장가로 감축), 헤지면 reduceOnly 사용
+    close_bs = ("sell" if (side or "").lower() == "long" else "buy")
     body_v2_new = {
         "productType": pt,
         "symbol": sym,
         "marginCoin": MARGIN_COIN,
         "size": str(size),
-        "side": close_side_bs,          # buy / sell
+        "side": close_bs,
         "orderType": "market",
         "force": "gtc",
-        "reduceOnly": True,
         "marginMode": "crossed",
     }
+    if mode == "hedge":
+        body_v2_new["reduceOnly"] = True
     if SEND_HOLDSIDE_ALWAYS:
-        body_v2_new["holdSide"] = hold_sd
+        body_v2_new["holdSide"] = (side or "").lower()
 
     sc1, js1, _ = _http_post_soft(V2_PLACE_ORDER_PATH, body_v2_new, True)
-    if _is_ok(sc1, js1):
-        return js1
+    if _is_ok(sc1, js1): return js1
     _maybe_trace("reduce v2#1 fail", sym, sc1, js1, body_v2_new)
 
-    # v2-표준(holdSide 제거) (try2)
+    # holdSide 제거 재시도
     if _is_side_mismatch(js1) and "holdSide" in body_v2_new:
         body_v2_new2 = dict(body_v2_new); body_v2_new2.pop("holdSide", None)
         sc2, js2, _ = _http_post_soft(V2_PLACE_ORDER_PATH, body_v2_new2, True)
-        if _is_ok(sc2, js2):
-            return js2
+        if _is_ok(sc2, js2): return js2
         _maybe_trace("reduce v2#2 no-holdSide fail", sym, sc2, js2, body_v2_new2)
     else:
-        sc2 = None; js2 = None
+        sc2, js2 = None, None
 
-    # 레거시 (try3)
+    # 레거시(여전히 v2 endpoint)
+    legacy_side = _api_side_legacy(side, True)  # close_long/close_short
     body_v2_legacy = {
         "productType": pt,
         "symbol": sym,
         "marginCoin": MARGIN_COIN,
-        "side": _api_side_legacy(side, True),  # close_long / close_short
+        "side": legacy_side,
         "orderType": "market",
         "timeInForceValue": "normal",
         "size": str(size),
         "price": "",
-        "reduceOnly": True,
+        "force": "gtc",
         "marginMode": "crossed",
     }
+    if mode == "hedge":
+        body_v2_legacy["reduceOnly"] = True
     if SEND_HOLDSIDE_ALWAYS:
-        body_v2_legacy["holdSide"] = hold_sd
+        body_v2_legacy["holdSide"] = (side or "").lower()
 
     sc3, js3, _ = _http_post_soft(V2_PLACE_ORDER_PATH, body_v2_legacy, True)
-    if _is_ok(sc3, js3):
-        return js3
+    if _is_ok(sc3, js3): return js3
     _maybe_trace("reduce v2#3 legacy fail", sym, sc3, js3, body_v2_legacy)
 
-    # v1 폴백 (try4)
+    # v1 폴백
     body_v1 = {
         "symbol": f"{sym}_UMCBL",
         "marginCoin": MARGIN_COIN,
         "size": str(size),
-        "side": ("sell" if (side or "").lower() in ("buy","long") else "buy"),  # 반대매매
+        "side": close_bs,  # 반대방향
         "orderType": "market",
         "timeInForceValue": "normal",
-        "reduceOnly": True,
     }
+    if mode == "hedge":
+        body_v1["reduceOnly"] = True
+
     sc4, js4, txt4 = _http_post_soft(V1_PLACE_ORDER_PATH, body_v1, True)
-    if _is_ok(sc4, js4):
-        return js4
+    if _is_ok(sc4, js4): return js4
     _maybe_trace("reduce v1 fail", sym, sc4, js4 or {"text":txt4}, body_v1)
 
-    return {
-        "code": str(sc1),
-        "msg": js1,
-        "data": {
-            "try1": {"sc": sc1, "js": js1, "body": body_v2_new},
-            "try2": {"sc": sc2, "js": js2},
-            "try3": {"sc": sc3, "js": js3, "body": body_v2_legacy},
-            "v1":   {"sc": sc4, "js": js4 or {"text":txt4}, "body": body_v1},
-        }
-    }
+    return {"code": str(sc1), "msg": js1, "data": {
+        "try1": {"sc": sc1, "js": js1, "body": body_v2_new},
+        "try2": {"sc": sc2, "js": js2},
+        "try3": {"sc": sc3, "js": js3, "body": body_v2_legacy},
+        "v1":   {"sc": sc4, "js": js4 or {"text":txt4}, "body": body_v1},
+    }}
 
 # ────────────────────────────────────────────────────────
 # 포지션 조회
