@@ -37,11 +37,11 @@ STOP_COOLDOWN_SEC  = float(os.getenv("STOP_COOLDOWN_SEC", "5.0"))
 PX_STOP_DROP_LONG  = float(os.getenv("PX_STOP_DROP_LONG",  "0.02"))   # 롱 -2%
 PX_STOP_DROP_SHORT = float(os.getenv("PX_STOP_DROP_SHORT", "0.015"))  # 숏 +1.5%
 
-# === (추가) ROE 기반 긴급 손절 설정 ===
+# === ROE 기반 긴급 손절 설정 ===
 STOP_USE_ROE        = os.getenv("STOP_USE_ROE", "1") == "1"
 STOP_ROE_LONG       = float(os.getenv("STOP_ROE_LONG", "-10"))   # 롱 ROE% 임계
 STOP_ROE_SHORT      = float(os.getenv("STOP_ROE_SHORT", "-8"))   # 숏 ROE% 임계
-STOP_ROE_COOLDOWN   = int(os.getenv("STOP_ROE_COOLDOWN", "20"))  # 동일 심볼/사이드 쿨다운(sec)
+STOP_ROE_COOLDOWN   = float(os.getenv("STOP_ROE_COOLDOWN", "20"))  # 동일 심볼/사이드 쿨다운(sec)
 
 # 재조정/재시도
 RECON_INTERVAL_SEC = float(os.getenv("RECON_INTERVAL_SEC", "40"))
@@ -66,9 +66,21 @@ CLOSE_IMMEDIATE     = os.getenv("CLOSE_IMMEDIATE", "1") == "1"
 TP3_CLOSE_IMMEDIATE = os.getenv("TP3_CLOSE_IMMEDIATE", "1") == "1"
 
 # ============================================================================
+# 유틸: ENV를 런타임에 재평가(재배포 없이 즉시 반영되도록)
+# ============================================================================
+def _env_float(name: str, default: float) -> float:
+    try:
+        return float(os.getenv(name, str(default)))
+    except Exception:
+        return float(default)
+
+def _env_bool(name: str, default: bool) -> bool:
+    v = os.getenv(name, "1" if default else "0").strip().lower()
+    return v in ("1", "true", "yes", "on")
+
+# ============================================================================
 # 상태/락
 # ============================================================================
-
 _CAPACITY = {"blocked": False, "last_count": 0, "short_blocked": False, "short_count": 0, "ts": 0.0}
 _CAP_LOCK = threading.Lock()
 
@@ -111,7 +123,7 @@ def _should_fire_stop(key: str) -> bool:
         _STOP_FIRED[key] = now
         return True
 
-# === (추가) ROE 쿨다운 ===
+# ROE 쿨다운
 _last_roe_close_ts: Dict[str, float] = {}  # { "SYMBOL_long": ts, "SYMBOL_short": ts }
 
 # ============================================================================
@@ -166,30 +178,12 @@ def _to_float(x) -> float:
         return 0.0
 
 # ============================================================================
-# (추가) 사이드 표준화
-# ============================================================================
-def _canon_side(s: Optional[str]) -> str:
-    """
-    Bitget가 상황에 따라 'buy/sell', 'open_long/open_short', 'long/short' 등으로 줄 수 있으므로
-    여기서 반드시 'long' 혹은 'short' 로 표준화한다.
-    """
-    if not s: return ""
-    s = s.lower()
-    if s in ("long", "open_long", "buy"):
-        return "long"
-    if s in ("short", "open_short", "sell"):
-        return "short"
-    return s  # 알 수 없는 경우 원본 리턴(비교 시엔 사용하지 않게 됨)
-
-# ============================================================================
 # 원격 포지션 조회
 # ============================================================================
 def _get_remote(symbol: str, side: Optional[str] = None):
     symbol = convert_symbol(symbol)
-    want = _canon_side(side) if side else None
     for p in get_open_positions():
-        ps = _canon_side(p.get("side"))
-        if p.get("symbol") == symbol and (want is None or ps == want):
+        if p.get("symbol") == symbol and (side is None or p.get("side") == side):
             return p
     return None
 
@@ -222,12 +216,8 @@ def _adverse_move_ratio(entry: float, last: float, side: str) -> float:
     else:               # 숏: 올라가면 손실
         return max(0.0, (last - entry) / entry)
 
-# === (추가) ROE% 계산 ===
+# ROE% 계산(앱과 동일하게 레버리지 반영)
 def _calc_roe_pct(entry_price: float, mark_price: float, side: str, leverage: float) -> float:
-    """
-    Bitget 앱 ROE% 근사:
-      ROE% ≈ ((mark - entry) / entry) * ( +1 for long / -1 for short ) * leverage * 100
-    """
     try:
         if not entry_price or not mark_price or leverage <= 0:
             return 0.0
@@ -326,7 +316,7 @@ def enter_position(symbol: str, usdt_amount: float, side: str = "long", leverage
     symbol = convert_symbol(symbol)
     side   = (side or "long").lower()
     key    = _key(symbol, side)
-    lev    = float(leverage or LEVERAGE)
+    lev    = float(leverage or _env_float("LEVERAGE", LEVERAGE))
     pkey   = _pending_key_entry(symbol, side)
     trace  = os.getenv("CURRENT_TRACE_ID", "")
 
@@ -414,7 +404,7 @@ def take_partial_profit(symbol: str, pct: float, side: str = "long"):
     key    = _key(symbol, side)
 
     with _lock_for(key):
-        p = _get_remote(symbol, side)  # ← 요청된 side 우선 (표준화 반영됨)
+        p = _get_remote(symbol, side)  # ← 요청된 side 우선
         if not p or _to_float(p.get("size")) <= 0:
             send_telegram(f"⚠️ TP 스킵: 원격 포지션 없음 {_key(symbol, side)}")
             return
@@ -473,7 +463,7 @@ def close_position(symbol: str, side: str = "long", reason: str = "manual"):
             send_telegram(f"⚠️ CLOSE 스킵: 원격 포지션 없음 {key_req} ({reason})")
             return
 
-        pos_side = _canon_side(p.get("side"))  # (추가) 반드시 표준화
+        pos_side = (p.get("side") or "").lower()
         key_real = _key(symbol, pos_side)
         with _lock_for(key_real):
             size = _to_float(p.get("size"))
@@ -525,14 +515,21 @@ def _sweep_full_close(symbol: str, side: str, reason: str, max_retry: int = 5, s
     return (not p) or _to_float(p.get("size")) <= 0
 
 # ============================================================================
-# 워치독: 가격기반 즉시 종료 + 마진기반 긴급정지 + (추가)ROE기반 긴급손절
+# 워치독: 가격기반 즉시 종료 + 마진기반 긴급정지 + ROE기반 긴급손절
 # ============================================================================
 def _watchdog_loop():
     while True:
         try:
+            # 동적 ENV 반영
+            lev_env      = _env_float("LEVERAGE", LEVERAGE)
+            use_roe      = _env_bool("STOP_USE_ROE", STOP_USE_ROE)
+            roe_thr_long = _env_float("STOP_ROE_LONG", STOP_ROE_LONG)
+            roe_thr_short= _env_float("STOP_ROE_SHORT", STOP_ROE_SHORT)
+            roe_cooldown = _env_float("STOP_ROE_COOLDOWN", STOP_ROE_COOLDOWN)
+
             for p in get_open_positions():
                 symbol = p.get("symbol")
-                side   = _canon_side(p.get("side"))  # (추가) 반드시 표준화
+                side   = (p.get("side") or "").lower()
                 entry  = _to_float(p.get("entry_price"))
                 size   = _to_float(p.get("size"))
                 if not symbol or side not in ("long", "short") or entry <= 0 or size <= 0:
@@ -542,23 +539,24 @@ def _watchdog_loop():
                 if not last:
                     continue
 
-                # === (추가) ROE 기반 긴급 손절 먼저 체크(앱 ROE 기준) ===
-                if STOP_USE_ROE:
-                    lev = float(os.getenv("DEFAULT_LEVERAGE", str(LEVERAGE)))
-                    roe = _calc_roe_pct(entry, last, side, lev)
-                    thr = STOP_ROE_LONG if side == "long" else STOP_ROE_SHORT
+                # === ROE 기반 긴급 손절 먼저 체크 ===
+                if use_roe:
+                    roe = _calc_roe_pct(entry, last, side, lev_env)
+                    thr = roe_thr_long if side == "long" else roe_thr_short
                     k   = _key(symbol, side)
                     now = time.time()
                     last_ts = _last_roe_close_ts.get(k, 0.0)
-                    if roe <= thr and (now - last_ts) >= STOP_ROE_COOLDOWN:
+                    near = abs(roe - thr) <= 0.6  # 근처일 때 디버그 도움
+                    if RECON_DEBUG and (near or roe <= thr):
+                        send_telegram(f"🧪 ROE dbg {symbol} {side} ROE={roe:.2f}% thr={thr:.2f}% lev={lev_env}x")
+                    if roe <= thr and (now - last_ts) >= roe_cooldown:
                         _last_roe_close_ts[k] = now
                         send_telegram(
                             f"⛔ ROE STOP {side.upper()} {symbol} "
                             f"(ROE {roe:.2f}% ≤ {thr:.2f}%)"
                         )
                         close_position(symbol, side=side, reason="roeStop")
-                        # 다음 체크로 넘어가자(중복 트리거 방지)
-                        continue
+                        continue  # 중복 트리거 방지
 
                 # 가격 기반 즉시 종료
                 adverse      = _adverse_move_ratio(entry, last, side)
@@ -574,7 +572,7 @@ def _watchdog_loop():
                     continue
 
                 # 마진 기반 긴급 정지(손실/증거금 비율)
-                loss_ratio = _loss_ratio_on_margin(entry, last, size, side, leverage=LEVERAGE)
+                loss_ratio = _loss_ratio_on_margin(entry, last, size, side, leverage=lev_env)
                 if loss_ratio >= STOP_PCT:
                     k = _key(symbol, side)
                     if _should_fire_stop(k):
@@ -597,7 +595,7 @@ def _breakeven_watchdog():
         try:
             for p in get_open_positions():
                 symbol = p.get("symbol")
-                side   = _canon_side(p.get("side"))  # (추가) 표준화
+                side   = (p.get("side") or "").lower()
                 entry  = _to_float(p.get("entry_price"))
                 size   = _to_float(p.get("size"))
                 if not symbol or side not in ("long", "short") or entry <= 0 or size <= 0:
@@ -713,7 +711,7 @@ def _reconciler_loop():
                         send_telegram(f"🔁 retry [close] {pkey}")
 
                     size = _to_float(p.get("size"))
-                    side_real = _canon_side(p.get("side"))  # (추가) 표준화
+                    side_real = (p.get("side") or "").lower()
                     resp = place_reduce_by_size(sym, size, side_real)
                     item["last_try"] = now
                     item["attempts"] = item.get("attempts", 0) + 1
