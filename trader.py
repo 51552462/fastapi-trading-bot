@@ -166,12 +166,30 @@ def _to_float(x) -> float:
         return 0.0
 
 # ============================================================================
+# (추가) 사이드 표준화
+# ============================================================================
+def _canon_side(s: Optional[str]) -> str:
+    """
+    Bitget가 상황에 따라 'buy/sell', 'open_long/open_short', 'long/short' 등으로 줄 수 있으므로
+    여기서 반드시 'long' 혹은 'short' 로 표준화한다.
+    """
+    if not s: return ""
+    s = s.lower()
+    if s in ("long", "open_long", "buy"):
+        return "long"
+    if s in ("short", "open_short", "sell"):
+        return "short"
+    return s  # 알 수 없는 경우 원본 리턴(비교 시엔 사용하지 않게 됨)
+
+# ============================================================================
 # 원격 포지션 조회
 # ============================================================================
 def _get_remote(symbol: str, side: Optional[str] = None):
     symbol = convert_symbol(symbol)
+    want = _canon_side(side) if side else None
     for p in get_open_positions():
-        if p.get("symbol") == symbol and (side is None or p.get("side") == side):
+        ps = _canon_side(p.get("side"))
+        if p.get("symbol") == symbol and (want is None or ps == want):
             return p
     return None
 
@@ -396,7 +414,7 @@ def take_partial_profit(symbol: str, pct: float, side: str = "long"):
     key    = _key(symbol, side)
 
     with _lock_for(key):
-        p = _get_remote(symbol, side)  # ← 요청된 side 우선
+        p = _get_remote(symbol, side)  # ← 요청된 side 우선 (표준화 반영됨)
         if not p or _to_float(p.get("size")) <= 0:
             send_telegram(f"⚠️ TP 스킵: 원격 포지션 없음 {_key(symbol, side)}")
             return
@@ -425,7 +443,7 @@ def take_partial_profit(symbol: str, pct: float, side: str = "long"):
 
         resp = place_reduce_by_size(symbol, cut_size, side)
         if str(resp.get("code", "")) == "00000":
-            send_telegram(f"🤑 TP {int(pct*100)}% {side.UPPER()} {symbol} cut={cut_size}")
+            send_telegram(f"🤑 TP {int(pct*100)}% {side.upper()} {symbol} cut={cut_size}")
         else:
             send_telegram(f"❌ TP 실패 {symbol} {side} → {resp}")
 
@@ -455,7 +473,7 @@ def close_position(symbol: str, side: str = "long", reason: str = "manual"):
             send_telegram(f"⚠️ CLOSE 스킵: 원격 포지션 없음 {key_req} ({reason})")
             return
 
-        pos_side = (p.get("side") or "").lower()
+        pos_side = _canon_side(p.get("side"))  # (추가) 반드시 표준화
         key_real = _key(symbol, pos_side)
         with _lock_for(key_real):
             size = _to_float(p.get("size"))
@@ -514,7 +532,7 @@ def _watchdog_loop():
         try:
             for p in get_open_positions():
                 symbol = p.get("symbol")
-                side   = (p.get("side") or "").lower()
+                side   = _canon_side(p.get("side"))  # (추가) 반드시 표준화
                 entry  = _to_float(p.get("entry_price"))
                 size   = _to_float(p.get("size"))
                 if not symbol or side not in ("long", "short") or entry <= 0 or size <= 0:
@@ -549,7 +567,7 @@ def _watchdog_loop():
                     k = _key(symbol, side)
                     if _should_fire_stop(k):
                         send_telegram(
-                            f"⛔ PRICE STOP {side.UPPER()} {symbol} "
+                            f"⛔ PRICE STOP {side.upper()} {symbol} "
                             f"(adverse {adverse*100:.2f}% ≥ {px_threshold*100:.2f}%)"
                         )
                         close_position(symbol, side=side, reason="priceStop")
@@ -579,7 +597,7 @@ def _breakeven_watchdog():
         try:
             for p in get_open_positions():
                 symbol = p.get("symbol")
-                side   = (p.get("side") or "").lower()
+                side   = _canon_side(p.get("side"))  # (추가) 표준화
                 entry  = _to_float(p.get("entry_price"))
                 size   = _to_float(p.get("size"))
                 if not symbol or side not in ("long", "short") or entry <= 0 or size <= 0:
@@ -695,7 +713,7 @@ def _reconciler_loop():
                         send_telegram(f"🔁 retry [close] {pkey}")
 
                     size = _to_float(p.get("size"))
-                    side_real = (p.get("side") or "").lower()
+                    side_real = _canon_side(p.get("side"))  # (추가) 표준화
                     resp = place_reduce_by_size(sym, size, side_real)
                     item["last_try"] = now
                     item["attempts"] = item.get("attempts", 0) + 1
