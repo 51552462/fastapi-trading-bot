@@ -37,6 +37,12 @@ STOP_COOLDOWN_SEC  = float(os.getenv("STOP_COOLDOWN_SEC", "5.0"))
 PX_STOP_DROP_LONG  = float(os.getenv("PX_STOP_DROP_LONG",  "0.02"))   # 롱 -2%
 PX_STOP_DROP_SHORT = float(os.getenv("PX_STOP_DROP_SHORT", "0.015"))  # 숏 +1.5%
 
+# === (추가) ROE 기반 긴급 손절 설정 ===
+STOP_USE_ROE        = os.getenv("STOP_USE_ROE", "1") == "1"
+STOP_ROE_LONG       = float(os.getenv("STOP_ROE_LONG", "-10"))   # 롱 ROE% 임계
+STOP_ROE_SHORT      = float(os.getenv("STOP_ROE_SHORT", "-8"))   # 숏 ROE% 임계
+STOP_ROE_COOLDOWN   = int(os.getenv("STOP_ROE_COOLDOWN", "20"))  # 동일 심볼/사이드 쿨다운(sec)
+
 # 재조정/재시도
 RECON_INTERVAL_SEC = float(os.getenv("RECON_INTERVAL_SEC", "40"))
 TP_EPSILON_RATIO   = float(os.getenv("TP_EPSILON_RATIO", "0.001"))
@@ -104,6 +110,9 @@ def _should_fire_stop(key: str) -> bool:
             return False
         _STOP_FIRED[key] = now
         return True
+
+# === (추가) ROE 쿨다운 ===
+_last_roe_close_ts: Dict[str, float] = {}  # { "SYMBOL_long": ts, "SYMBOL_short": ts }
 
 # ============================================================================
 # Pending 레지스트리 (재시도/조정용)
@@ -194,6 +203,22 @@ def _adverse_move_ratio(entry: float, last: float, side: str) -> float:
         return max(0.0, (entry - last) / entry)
     else:               # 숏: 올라가면 손실
         return max(0.0, (last - entry) / entry)
+
+# === (추가) ROE% 계산 ===
+def _calc_roe_pct(entry_price: float, mark_price: float, side: str, leverage: float) -> float:
+    """
+    Bitget 앱 ROE% 근사:
+      ROE% ≈ ((mark - entry) / entry) * ( +1 for long / -1 for short ) * leverage * 100
+    """
+    try:
+        if not entry_price or not mark_price or leverage <= 0:
+            return 0.0
+        s = (side or "").lower()
+        dir_sign = 1.0 if s in ("long", "buy") else -1.0
+        pnl_rate = (mark_price - entry_price) / entry_price * dir_sign
+        return pnl_rate * float(leverage) * 100.0
+    except Exception:
+        return 0.0
 
 # ============================================================================
 # 용량(상한) 가드 — 숏만 제한, 롱은 무제한
@@ -482,7 +507,7 @@ def _sweep_full_close(symbol: str, side: str, reason: str, max_retry: int = 5, s
     return (not p) or _to_float(p.get("size")) <= 0
 
 # ============================================================================
-# 워치독: 가격기반 즉시 종료 + 마진기반 긴급정지
+# 워치독: 가격기반 즉시 종료 + 마진기반 긴급정지 + (추가)ROE기반 긴급손절
 # ============================================================================
 def _watchdog_loop():
     while True:
@@ -499,18 +524,38 @@ def _watchdog_loop():
                 if not last:
                     continue
 
+                # === (추가) ROE 기반 긴급 손절 먼저 체크(앱 ROE 기준) ===
+                if STOP_USE_ROE:
+                    lev = float(os.getenv("DEFAULT_LEVERAGE", str(LEVERAGE)))
+                    roe = _calc_roe_pct(entry, last, side, lev)
+                    thr = STOP_ROE_LONG if side == "long" else STOP_ROE_SHORT
+                    k   = _key(symbol, side)
+                    now = time.time()
+                    last_ts = _last_roe_close_ts.get(k, 0.0)
+                    if roe <= thr and (now - last_ts) >= STOP_ROE_COOLDOWN:
+                        _last_roe_close_ts[k] = now
+                        send_telegram(
+                            f"⛔ ROE STOP {side.upper()} {symbol} "
+                            f"(ROE {roe:.2f}% ≤ {thr:.2f}%)"
+                        )
+                        close_position(symbol, side=side, reason="roeStop")
+                        # 다음 체크로 넘어가자(중복 트리거 방지)
+                        continue
+
+                # 가격 기반 즉시 종료
                 adverse      = _adverse_move_ratio(entry, last, side)
                 px_threshold = PX_STOP_DROP_LONG if side == "long" else PX_STOP_DROP_SHORT
                 if adverse >= px_threshold:
                     k = _key(symbol, side)
                     if _should_fire_stop(k):
                         send_telegram(
-                            f"⛔ PRICE STOP {side.upper()} {symbol} "
+                            f"⛔ PRICE STOP {side.UPPER()} {symbol} "
                             f"(adverse {adverse*100:.2f}% ≥ {px_threshold*100:.2f}%)"
                         )
                         close_position(symbol, side=side, reason="priceStop")
                     continue
 
+                # 마진 기반 긴급 정지(손실/증거금 비율)
                 loss_ratio = _loss_ratio_on_margin(entry, last, size, side, leverage=LEVERAGE)
                 if loss_ratio >= STOP_PCT:
                     k = _key(symbol, side)
