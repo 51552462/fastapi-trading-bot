@@ -55,6 +55,9 @@ BE_EPSILON_RATIO = float(os.getenv("BE_EPSILON_RATIO", "0.0005"))
 CLOSE_IMMEDIATE     = os.getenv("CLOSE_IMMEDIATE", "1") == "1"
 TP3_CLOSE_IMMEDIATE = os.getenv("TP3_CLOSE_IMMEDIATE", "1") == "1"
 
+# ── (변경) 디버그 메시지 레이트 리미트 환경변수 추가 ─────────────
+DEBUG_MSG_EVERY_SEC = float(os.getenv("DEBUG_MSG_EVERY_SEC", "10"))
+
 # ============================================================================
 # ENV 재평가 유틸 (Render에서 값 바꾸면 즉시 반영)
 # ============================================================================
@@ -515,12 +518,17 @@ def _sweep_full_close(symbol: str, side: str, reason: str, max_retry: int = 5, s
     return (not p) or _to_float(p.get("size")) <= 0
 
 # ============================================================================
-# (변경 1/2 + 2/2 반영) 워치독: ROE → 가격 → 마진, 하트비트 1회, entry_price 보정
+# (변경) 워치독: ROE → 가격 → 마진, 하트비트 1회, entry_price 보정, 디버그 레이트리밋
 # ============================================================================
-_HEARTBEAT_SENT_ONCE = False            # ← 하트비트 1회 전송 플래그
-_ENTRY_MISS_WARNED = set()              # ← entry 0 경고 중복 억제
+_HEARTBEAT_SENT_ONCE = False
+_ENTRY_MISS_WARNED = set()
+
+# ── (변경) 디버그 레이트 리미트용 타임스탬프
+_last_dbg_ts = 0.0
+_last_sample = {}
 
 def _watchdog_loop():
+    global _HEARTBEAT_SENT_ONCE, _last_dbg_ts, _last_sample
     try:
         send_telegram("🟢 watchdog started (RECON_DEBUG=1이면 디버그/하트비트 출력)")
     except: pass
@@ -529,21 +537,26 @@ def _watchdog_loop():
         try:
             pos_list = get_open_positions()
 
-            # 디버그: 포지션 개수 / 샘플 원시필드
+            # ── (변경) 디버그 메시지: 설정된 주기마다 1회만
             if os.getenv("RECON_DEBUG", "0") == "1":
-                try:
-                    send_telegram(f"🔎 watchdog positions={len(pos_list)}")
-                    if pos_list:
-                        sample = pos_list[0]
-                        send_telegram("🔎 pos[0] raw=" + str({k: sample.get(k) for k in list(sample.keys())[:10]}))
-                except:
-                    pass
+                now = time.time()
+                if now - _last_dbg_ts >= max(1.0, DEBUG_MSG_EVERY_SEC):
+                    _last_dbg_ts = now
+                    try:
+                        send_telegram(f"🔎 watchdog positions={len(pos_list)}")
+                        if pos_list:
+                            sample = {k: pos_list[0].get(k) for k in list(pos_list[0].keys())[:10]}
+                            # 샘플이 바뀌었을 때만 raw 출력
+                            if sample != _last_sample:
+                                _last_sample = sample
+                                send_telegram("🔎 pos[0] raw=" + str(sample))
+                    except:
+                        pass
 
             if RECON_DEBUG and not pos_list:
                 send_telegram("💤 watchdog: open positions = 0")
 
             for p in pos_list:
-                # --- 다양한 거래소 표기 보정 ---
                 side_raw = (p.get("side") or p.get("holdSide") or p.get("positionSide")
                             or p.get("openType") or "").strip().lower()
                 if side_raw in ("buy", "long", "open_long"):
@@ -553,7 +566,6 @@ def _watchdog_loop():
                 else:
                     side = side_raw
 
-                # symbol / size / entry 1차 파싱
                 symbol = p.get("symbol")
                 size = _to_float(
                     p.get("size") or p.get("total") or p.get("available") or p.get("holdAmount")
@@ -564,7 +576,6 @@ def _watchdog_loop():
                     or p.get("holdAvgPrice") or p.get("openPrice") or p.get("avgEntryPrice")
                 )
 
-                # 누락 이유 디버깅(심볼/사이드/사이즈)
                 if not symbol:
                     if RECON_DEBUG: send_telegram(f"⚠️ skip pos: symbol missing raw={p}")
                     continue
@@ -575,7 +586,6 @@ def _watchdog_loop():
                     if RECON_DEBUG: send_telegram(f"⚠️ skip {symbol} {side}: size<=0 raw_size={p.get('size')}")
                     continue
 
-                # entry 0.0 보정: 로컬 캐시 → 대체 필드 → 1회 경고 후 스킵
                 key = _key(symbol, side)
                 if entry <= 0:
                     with _POS_LOCK:
@@ -648,7 +658,6 @@ def _watchdog_loop():
                         close_position(symbol, side=side, reason="emergencyStop")
 
             # --- 하트비트: 재가동 직후 1회만 전송 ---
-            global _HEARTBEAT_SENT_ONCE
             if os.getenv("RECON_DEBUG", "0") == "1" and not _HEARTBEAT_SENT_ONCE:
                 try: send_telegram("💓 watchdog heartbeat")
                 except: pass
