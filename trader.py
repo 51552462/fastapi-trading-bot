@@ -35,7 +35,7 @@ PX_STOP_DROP_SHORT = float(os.getenv("PX_STOP_DROP_SHORT", "0.015"))
 
 STOP_USE_ROE        = os.getenv("STOP_USE_ROE", "1") == "1"
 STOP_ROE_LONG       = float(os.getenv("STOP_ROE_LONG", "-10"))
-STOP_ROE_SHORT      = float(os.getenv("STOP_ROE_SHORT", "-8"))
+STOP_ROE_SHORT      = float(os.getenv("STOP_ROE_SHORT", "-7"))  # ← 숏 -7% 예시
 STOP_ROE_COOLDOWN   = float(os.getenv("STOP_ROE_COOLDOWN", "20"))
 
 RECON_INTERVAL_SEC = float(os.getenv("RECON_INTERVAL_SEC", "40"))
@@ -423,7 +423,9 @@ def take_partial_profit(symbol: str, pct: float, side: str = "long"):
                 realized = _pnl_usdt(entry, exit_price, entry * cur_size, side)
                 send_telegram(
                     f"🤑 TP3 FULL CLOSE {side.upper()} {symbol}\n"
-                    f"• Exit: {exit_price}\n• Size: {cur_size}\n• Realized≈ {realized:+.2f} USDT"
+                    f"• Exit: {exit_price}\n"
+                    f"• Size: {cur_size}\n"
+                    f"• Realized≈ {realized:+.2f} USDT"
                 )
             else:
                 send_telegram(f"❌ TP3 즉시 종료 실패 {symbol} {side} → {resp}")
@@ -475,7 +477,9 @@ def close_position(symbol: str, side: str = "long", reason: str = "manual"):
                 _last_roe_close_ts[key_real] = time.time()  # 성공시에만 쿨다운
                 send_telegram(
                     f"✅ CLOSE {pos_side.upper()} {symbol} ({reason})\n"
-                    f"• Exit: {exit_price}\n• Size: {size}\n• Realized≈ {realized:+.2f} USDT"
+                    f"• Exit: {exit_price}\n"
+                    f"• Size: {size}\n"
+                    f"• Realized≈ {realized:+.2f} USDT"
                 )
             else:
                 send_telegram(f"❌ CLOSE 실패 {symbol} {pos_side} → {resp}")
@@ -511,8 +515,11 @@ def _sweep_full_close(symbol: str, side: str, reason: str, max_retry: int = 5, s
     return (not p) or _to_float(p.get("size")) <= 0
 
 # ============================================================================
-# 워치독: (패치 반영) ROE → 가격 → 마진
+# (변경 1/2 + 2/2 반영) 워치독: ROE → 가격 → 마진, 하트비트 1회, entry_price 보정
 # ============================================================================
+_HEARTBEAT_SENT_ONCE = False            # ← 하트비트 1회 전송 플래그
+_ENTRY_MISS_WARNED = set()              # ← entry 0 경고 중복 억제
+
 def _watchdog_loop():
     try:
         send_telegram("🟢 watchdog started (RECON_DEBUG=1이면 디버그/하트비트 출력)")
@@ -546,29 +553,49 @@ def _watchdog_loop():
                 else:
                     side = side_raw
 
-                entry = _to_float(
-                    p.get("entry_price") or p.get("avgPrice") or p.get("openAvgPrice")
-                    or p.get("holdAvgPrice") or p.get("openPrice") or p.get("avgEntryPrice")
-                )
+                # symbol / size / entry 1차 파싱
+                symbol = p.get("symbol")
                 size = _to_float(
                     p.get("size") or p.get("total") or p.get("available") or p.get("holdAmount")
                     or p.get("openAmount") or p.get("positionAmt")
                 )
-                symbol = p.get("symbol")
+                entry = _to_float(
+                    p.get("entry_price") or p.get("avgPrice") or p.get("openAvgPrice")
+                    or p.get("holdAvgPrice") or p.get("openPrice") or p.get("avgEntryPrice")
+                )
 
-                # 누락 이유 디버깅
+                # 누락 이유 디버깅(심볼/사이드/사이즈)
                 if not symbol:
                     if RECON_DEBUG: send_telegram(f"⚠️ skip pos: symbol missing raw={p}")
                     continue
                 if side not in ("long", "short"):
                     if RECON_DEBUG: send_telegram(f"⚠️ skip {symbol}: side unrecognized raw_side='{side_raw}'")
                     continue
-                if entry <= 0:
-                    if RECON_DEBUG: send_telegram(f"⚠️ skip {symbol} {side}: entry<=0 raw={p}")
-                    continue
                 if size <= 0:
                     if RECON_DEBUG: send_telegram(f"⚠️ skip {symbol} {side}: size<=0 raw_size={p.get('size')}")
                     continue
+
+                # entry 0.0 보정: 로컬 캐시 → 대체 필드 → 1회 경고 후 스킵
+                key = _key(symbol, side)
+                if entry <= 0:
+                    with _POS_LOCK:
+                        entry_local = _to_float(position_data.get(key, {}).get("entry_price"))
+                    if entry_local > 0:
+                        entry = entry_local
+                if entry <= 0:
+                    entry = _to_float(
+                        p.get("avgOpenPrice") or p.get("averageOpenPrice") or
+                        p.get("openAvgPrice")  or p.get("holdAvgPrice")    or
+                        p.get("avgEntryPrice") or p.get("openPrice")       or
+                        p.get("entryPrice")
+                    )
+                if entry <= 0:
+                    if RECON_DEBUG and key not in _ENTRY_MISS_WARNED:
+                        _ENTRY_MISS_WARNED.add(key)
+                        send_telegram(f"⚠️ skip {symbol} {side}: entry<=0 raw={p}")
+                    continue
+                else:
+                    _ENTRY_MISS_WARNED.discard(key)
 
                 last = _to_float(get_last_price(symbol))
                 if not last:
@@ -620,10 +647,12 @@ def _watchdog_loop():
                         )
                         close_position(symbol, side=side, reason="emergencyStop")
 
-            # 하트비트
-            if os.getenv("RECON_DEBUG", "0") == "1":
+            # --- 하트비트: 재가동 직후 1회만 전송 ---
+            global _HEARTBEAT_SENT_ONCE
+            if os.getenv("RECON_DEBUG", "0") == "1" and not _HEARTBEAT_SENT_ONCE:
                 try: send_telegram("💓 watchdog heartbeat")
                 except: pass
+                _HEARTBEAT_SENT_ONCE = True
 
         except Exception as e:
             print("watchdog error:", e)
