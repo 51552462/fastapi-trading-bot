@@ -1,6 +1,6 @@
 # trader.py
 # -*- coding: utf-8 -*-
-import os, time, threading
+import os, time, threading, hashlib
 from typing import Dict, Optional
 
 from bitget_api import (
@@ -8,19 +8,75 @@ from bitget_api import (
     place_market_order, place_reduce_by_size, get_symbol_spec, round_down_step,
 )
 
-# 텔레그램 래퍼 (없어도 동작)
+# ─────────────────────────────────────────────────────────────────────────────
+# 텔레그램 래퍼 + 디바운스/중복억제 (중요알림 보장)
+# ─────────────────────────────────────────────────────────────────────────────
 try:
-    from telegram_bot import send_telegram
+    from telegram_bot import send_telegram as _send_tg_real
 except Exception:
-    def send_telegram(msg: str):
+    def _send_tg_real(msg: str):
         print("[TG]", msg)
 
+RECON_DEBUG = os.getenv("RECON_DEBUG", "0") == "1"
+
+# 동일/유사 메시지 억제 윈도우(초)
+TG_SUPPRESS_WINDOW_SEC = float(os.getenv("TG_SUPPRESS_WINDOW_SEC", "8"))
+# 심볼·사이드별 ROE dbg 최소 주기(초)
+ROE_DBG_EVERY_SEC = float(os.getenv("ROE_DBG_EVERY_SEC", "15"))
+
+# 메시지 최근 전송 시각/해시 캐시
+_TG_LAST_TS: Dict[str, float] = {}
+_TG_LAST_HASH: Dict[str, str] = {}
+_TG_LOCK = threading.Lock()
+
+def _tg_send(msg: str, *, key: Optional[str] = None, important: bool = False, debug: bool = False):
+    """
+    - important=True: 손절/청산/오류/주문실패 → 항상 전송(중복 억제 적용 안 함)
+    - debug=True: RECON_DEBUG=1일 때만 전송
+    - key: 같은 메시지로 판단할 기준 키(없으면 msg 자체)
+    """
+    if debug and not RECON_DEBUG:
+        return
+
+    if important:
+        try:
+            _send_tg_real(msg)
+        except Exception as e:
+            print("[TG important send fail]", e)
+        return
+
+    k = key or msg
+    h = hashlib.sha256(msg.encode("utf-8")).hexdigest()
+    now = time.time()
+    with _TG_LOCK:
+        last_ts = _TG_LAST_TS.get(k, 0.0)
+        last_h  = _TG_LAST_HASH.get(k, "")
+        if last_h == h and (now - last_ts) < TG_SUPPRESS_WINDOW_SEC:
+            # 같은 내용이 억제 윈도우 내 재등장 → 무시
+            return
+        # 갱신 후 전송
+        _TG_LAST_TS[k] = now
+        _TG_LAST_HASH[k] = h
+    try:
+        _send_tg_real(msg)
+    except Exception as e:
+        print("[TG send fail]", e)
+
+def tg_info(msg: str, key: Optional[str] = None):
+    _tg_send(msg, key=key, important=False, debug=False)
+
+def tg_debug(msg: str, key: Optional[str] = None):
+    _tg_send(msg, key=key, important=False, debug=True)
+
+def tg_important(msg: str):
+    _tg_send(msg, important=True)
+
 # ============================================================================
-# ENV
+// ENV
 # ============================================================================
 LEVERAGE   = float(os.getenv("LEVERAGE", "5"))
 TRACE_LOG  = os.getenv("TRACE_LOG", "0") == "1"
-RECON_DEBUG= os.getenv("RECON_DEBUG", "0") == "1"
+# RECON_DEBUG 는 위 래퍼에서 이미 읽음
 
 TP1_PCT = float(os.getenv("TP1_PCT", "0.30"))
 TP2_PCT = float(os.getenv("TP2_PCT", "0.40"))
@@ -35,7 +91,7 @@ PX_STOP_DROP_SHORT = float(os.getenv("PX_STOP_DROP_SHORT", "0.015"))
 
 STOP_USE_ROE        = os.getenv("STOP_USE_ROE", "1") == "1"
 STOP_ROE_LONG       = float(os.getenv("STOP_ROE_LONG", "-10"))  # % (음수)
-STOP_ROE_SHORT      = float(os.getenv("STOP_ROE_SHORT", "-7"))  # % (음수)
+STOP_ROE_SHORT      = float(os.getenv("STOP_ROE_SHORT", "-7"))   # % (음수)
 STOP_ROE_COOLDOWN   = float(os.getenv("STOP_ROE_COOLDOWN", "20"))
 
 RECON_INTERVAL_SEC = float(os.getenv("RECON_INTERVAL_SEC", "40"))
@@ -55,7 +111,7 @@ BE_EPSILON_RATIO = float(os.getenv("BE_EPSILON_RATIO", "0.0005"))
 CLOSE_IMMEDIATE     = os.getenv("CLOSE_IMMEDIATE", "1") == "1"
 TP3_CLOSE_IMMEDIATE = os.getenv("TP3_CLOSE_IMMEDIATE", "1") == "1"
 
-# 디버그 메시지 속도 제한(스팸 방지)
+# 디버그 메시지 속도 제한(스팸 방지) – 일반 디버그 묶음용
 DEBUG_MSG_EVERY_SEC = float(os.getenv("DEBUG_MSG_EVERY_SEC", "10"))
 # ROE가 임계선 근처일 때는 RECON_DEBUG가 꺼져 있어도 1줄은 보낸다.
 ROE_LOG_SLACK_PCT   = float(os.getenv("ROE_LOG_SLACK_PCT", "1.0"))  # thr보다 1% 여유
@@ -131,7 +187,7 @@ def _mark_done(typ: str, pkey: str, note: str = ""):
     with _PENDING_LOCK:
         _PENDING.get(typ, {}).pop(pkey, None)
     if RECON_DEBUG and note:
-        send_telegram(f"✅ pending done [{typ}] {pkey} {note}")
+        tg_debug(f"✅ pending done [{typ}] {pkey} {note}", key=f"done:{typ}")
 
 def get_pending_snapshot() -> Dict[str, Dict]:
     with _PENDING_LOCK, _CAP_LOCK, _POS_LOCK:
@@ -260,7 +316,7 @@ def can_enter_now(side: str) -> bool:
 
 def _capacity_loop():
     prev_blocked = None
-    try: send_telegram("🟢 capacity-guard started")
+    try: tg_info("🟢 capacity-guard started", key="cap-start")
     except: pass
     while True:
         try:
@@ -277,7 +333,7 @@ def _capacity_loop():
                 })
             if prev_blocked is None or prev_blocked != short_blocked:
                 state = "BLOCKED (total>=cap)" if short_blocked else "UNBLOCKED (total<cap)"
-                try: send_telegram(f"ℹ️ Capacity {state} | {total}/{MAX_OPEN_POSITIONS}")
+                try: tg_info(f"ℹ️ Capacity {state} | {total}/{MAX_OPEN_POSITIONS}", key="cap-state")
                 except: pass
                 prev_blocked = short_blocked
         except Exception as e:
@@ -327,21 +383,21 @@ def enter_position(symbol: str, usdt_amount: float, side: str = "long", leverage
     trace  = os.getenv("CURRENT_TRACE_ID", "")
 
     if TRACE_LOG:
-        send_telegram(f"🔎 ENTRY request trace={trace} {symbol} {side} amt={usdt_amount}")
+        tg_info(f"🔎 ENTRY request trace={trace} {symbol} {side} amt={usdt_amount}", key=f"entry-req:{symbol}:{side}")
 
     if _is_busy(key) or _recent_ok(key):
-        if RECON_DEBUG: send_telegram(f"⏸️ skip entry (busy/recent) {key}")
+        if RECON_DEBUG: tg_debug(f"⏸️ skip entry (busy/recent) {key}", key=f"entry-skip:{key}")
         return
 
     if not _strict_try_reserve(side):
         st = capacity_status()
-        send_telegram(f"🧱 STRICT HOLD {symbol} {side} {st['last_count']}/{MAX_OPEN_POSITIONS}")
+        tg_info(f"🧱 STRICT HOLD {symbol} {side} {st['last_count']}/{MAX_OPEN_POSITIONS}", key="strict-hold")
         return
 
     try:
         if not can_enter_now(side):
             st = capacity_status()
-            send_telegram(f"⏳ ENTRY HOLD (periodic) {symbol} {side} {st['last_count']}/{MAX_OPEN_POSITIONS}")
+            tg_info(f"⏳ ENTRY HOLD (periodic) {symbol} {side} {st['last_count']}/{MAX_OPEN_POSITIONS}", key="periodic-hold")
             return
 
         with _PENDING_LOCK:
@@ -349,7 +405,7 @@ def enter_position(symbol: str, usdt_amount: float, side: str = "long", leverage
                 "symbol": symbol, "side": side, "amount": usdt_amount,
                 "leverage": lev, "created": time.time(), "last_try": 0.0, "attempts": 0
             }
-        if RECON_DEBUG: send_telegram(f"📌 pending add [entry] {pkey}")
+        if RECON_DEBUG: tg_debug(f"📌 pending add [entry] {pkey}", key=f"pend-entry:{pkey}")
 
         with _lock_for(key):
             if _local_has_any(symbol) or _get_remote_any_side(symbol) or _recent_ok(key):
@@ -359,7 +415,7 @@ def enter_position(symbol: str, usdt_amount: float, side: str = "long", leverage
 
             last = _to_float(get_last_price(symbol))
             if last <= 0:
-                if TRACE_LOG: send_telegram(f"❗ ticker_fail {symbol} trace={trace}")
+                if TRACE_LOG: tg_info(f"❗ ticker_fail {symbol} trace={trace}", key=f"ticker-fail:{symbol}")
                 return
 
             resp = place_market_order(
@@ -369,7 +425,7 @@ def enter_position(symbol: str, usdt_amount: float, side: str = "long", leverage
             )
             code = str(resp.get("code", "")) if isinstance(resp, dict) else ""
             if TRACE_LOG:
-                send_telegram(f"📦 order_resp code={code} {symbol} {side} trace={trace}")
+                tg_info(f"📦 order_resp code={code} {symbol} {side} trace={trace}", key=f"order-resp:{symbol}:{side}")
 
             if code == "00000":
                 with _POS_LOCK:
@@ -382,15 +438,15 @@ def enter_position(symbol: str, usdt_amount: float, side: str = "long", leverage
                     _STOP_FIRED.pop(key, None)
                 _mark_done("entry", pkey)
                 _mark_recent_ok(key)
-                send_telegram(
+                tg_important(
                     f"🚀 ENTRY {side.upper()} {symbol}\n"
                     f"• Notional≈ {usdt_amount} USDT\n• Lvg: {lev}x"
                 )
             elif code.startswith("LOCAL_MIN_QTY") or code.startswith("LOCAL_BAD_QTY"):
                 _mark_done("entry", pkey, "(minQty/badQty)")
-                send_telegram(f"⛔ ENTRY 스킵 {symbol} {side} → {resp}")
+                tg_info(f"⛔ ENTRY 스킵 {symbol} {side} → {resp}", key=f"entry-skip:{symbol}:{side}")
             else:
-                if TRACE_LOG: send_telegram(f"❌ order_fail resp={resp} trace={trace}")
+                if TRACE_LOG: tg_important(f"❌ order_fail resp={resp} trace={trace}")
     finally:
         _clear_busy(key)
         _strict_release(side)
@@ -401,7 +457,7 @@ def take_partial_profit(symbol: str, pct: float, side: str = "long"):
     with _lock_for(key):
         p = _get_remote(symbol, side)
         if not p or _to_float(p.get("size")) <= 0:
-            send_telegram(f"⚠️ TP 스킵: 원격 포지션 없음 {_key(symbol, side)}")
+            tg_info(f"⚠️ TP 스킵: 원격 포지션 없음 {_key(symbol, side)}", key=f"tp-skip:{symbol}:{side}")
             return
 
         size_step = _to_float(get_symbol_spec(symbol).get("sizeStep", 0.001))
@@ -409,7 +465,7 @@ def take_partial_profit(symbol: str, pct: float, side: str = "long"):
         pct       = max(0.0, min(1.0, float(pct)))
         cut_size  = round_down_step(cur_size * pct, size_step)
         if cut_size <= 0:
-            send_telegram(f"⚠️ TP 스킵: 계산된 사이즈=0 ({_key(symbol, side)})")
+            tg_info(f"⚠️ TP 스킵: 계산된 사이즈=0 ({_key(symbol, side)})", key=f"tp-zero:{symbol}:{side}")
             return
 
         if abs(pct - 1.0) < 1e-9 and TP3_CLOSE_IMMEDIATE:
@@ -418,21 +474,21 @@ def take_partial_profit(symbol: str, pct: float, side: str = "long"):
                 exit_price = _to_float(get_last_price(symbol)) or _to_float(p.get("entry_price"))
                 entry = _to_float(p.get("entry_price"))
                 realized = _pnl_usdt(entry, exit_price, entry * cur_size, side)
-                send_telegram(
+                tg_important(
                     f"🤑 TP3 FULL CLOSE {side.upper()} {symbol}\n"
                     f"• Exit: {exit_price}\n"
                     f"• Size: {cur_size}\n"
                     f"• Realized≈ {realized:+.2f} USDT"
                 )
             else:
-                send_telegram(f"❌ TP3 즉시 종료 실패 {symbol} {side} → {resp}")
+                tg_important(f"❌ TP3 즉시 종료 실패 {symbol} {side} → {resp}")
             return
 
         resp = place_reduce_by_size(symbol, cut_size, side)
         if str(resp.get("code", "")) == "00000":
-            send_telegram(f"🤑 TP {int(pct*100)}% {side.upper()} {symbol} cut={cut_size}")
+            tg_info(f"🤑 TP {int(pct*100)}% {side.upper()} {symbol} cut={cut_size}", key=f"tp:{symbol}:{side}:{int(pct*100)}")
         else:
-            send_telegram(f"❌ TP 실패 {symbol} {side} → {resp}")
+            tg_important(f"❌ TP 실패 {symbol} {side} → {resp}")
 
 def close_position(symbol: str, side: str = "long", reason: str = "manual"):
     symbol = convert_symbol(symbol); req_side = side.lower()
@@ -444,14 +500,14 @@ def close_position(symbol: str, side: str = "long", reason: str = "manual"):
             "symbol": symbol, "side": req_side, "reason": reason,
             "created": time.time(), "last_try": 0.0, "attempts": 0
         }
-    if RECON_DEBUG: send_telegram(f"📌 pending add [close] {pkey}")
+    if RECON_DEBUG: tg_debug(f"📌 pending add [close] {pkey}", key=f"pend-close:{pkey}")
 
     if CLOSE_IMMEDIATE:
         p = _get_remote(symbol, req_side) or _get_remote_any_side(symbol)
         if not p or _to_float(p.get("size")) <= 0:
             with _POS_LOCK: position_data.pop(key_req, None)
             _mark_done("close", pkey, "(no-remote)")
-            send_telegram(f"⚠️ CLOSE 스킵: 원격 포지션 없음 {key_req} ({reason})")
+            tg_info(f"⚠️ CLOSE 스킵: 원격 포지션 없음 {key_req} ({reason})", key=f"close-skip:{key_req}")
             return
 
         pos_side = (p.get("side") or p.get("holdSide") or p.get("positionSide") or "").lower()
@@ -468,14 +524,14 @@ def close_position(symbol: str, side: str = "long", reason: str = "manual"):
                 _mark_done("close", pkey)
                 _mark_recent_ok(key_real)
                 _last_roe_close_ts[key_real] = time.time()  # 성공시에만 쿨다운
-                send_telegram(
+                tg_important(
                     f"✅ CLOSE {pos_side.upper()} {symbol} ({reason})\n"
                     f"• Exit: {exit_price}\n"
                     f"• Size: {size}\n"
                     f"• Realized≈ {realized:+.2f} USDT"
                 )
             else:
-                send_telegram(f"❌ CLOSE 실패 {symbol} {pos_side} → {resp}")
+                tg_important(f"❌ CLOSE 실패 {symbol} {pos_side} → {resp}")
 
 def reduce_by_contracts(symbol: str, contracts: float, side: str = "long"):
     symbol = convert_symbol(symbol); side = side.lower()
@@ -484,13 +540,13 @@ def reduce_by_contracts(symbol: str, contracts: float, side: str = "long"):
         step = _to_float(get_symbol_spec(symbol).get("sizeStep", 0.001))
         qty  = round_down_step(_to_float(contracts), step)
         if qty <= 0:
-            send_telegram(f"⚠️ reduceByContracts 스킵: step 미달 {key}")
+            tg_info(f"⚠️ reduceByContracts 스킵: step 미달 {key}", key=f"reduce-skip:{key}")
             return
         resp = place_reduce_by_size(symbol, qty, side)
         if str(resp.get("code", "")) == "00000":
-            send_telegram(f"🔻 Reduce {qty} {side.upper()} {symbol}")
+            tg_info(f"🔻 Reduce {qty} {side.upper()} {symbol}", key=f"reduce:{symbol}:{side}")
         else:
-            send_telegram(f"❌ Reduce 실패 {key} → {resp}")
+            tg_important(f"❌ Reduce 실패 {key} → {resp}")
 
 # ============================================================================
 # 보조
@@ -507,38 +563,39 @@ def _sweep_full_close(symbol: str, side: str, reason: str, max_retry: int = 5, s
     return (not p) or _to_float(p.get("size")) <= 0
 
 # ============================================================================
-# 워치독 (손절)
+# 워치독 (손절)  — 하트비트 1회, ROE dbg 심볼/사이드별 15초 최소주기
 # ============================================================================
 _HEARTBEAT_SENT_ONCE = False
 _ENTRY_MISS_WARNED = set()
 _last_dbg_ts = 0.0
 _last_sample = {}
+_last_roe_dbg_ts: Dict[str, float] = {}
 
 def _watchdog_loop():
     global _HEARTBEAT_SENT_ONCE, _last_dbg_ts, _last_sample
-    try: send_telegram("🟢 watchdog started (RECON_DEBUG=1이면 디버그/하트비트 출력)")
+    try: tg_info("🟢 watchdog started", key="wd-start")
     except: pass
 
     while True:
         try:
             pos_list = get_open_positions()
 
-            # 디버그(레이트 리미트)
-            if os.getenv("RECON_DEBUG", "0") == "1":
+            # 디버그(묶음) – RECON_DEBUG=1일 때만, 주기 제한
+            if RECON_DEBUG:
                 now = time.time()
                 if now - _last_dbg_ts >= max(1.0, DEBUG_MSG_EVERY_SEC):
                     _last_dbg_ts = now
                     try:
-                        send_telegram(f"🔎 watchdog positions={len(pos_list)}")
+                        tg_debug(f"🔎 watchdog positions={len(pos_list)}", key="wd-count")
                         if pos_list:
                             sample = {k: pos_list[0].get(k) for k in list(pos_list[0].keys())[:10]}
                             if sample != _last_sample:
                                 _last_sample = sample
-                                send_telegram("🔎 pos[0] raw=" + str(sample))
+                                tg_debug("🔎 pos[0] raw=" + str(sample), key="wd-raw")
                     except: pass
 
             if RECON_DEBUG and not pos_list:
-                send_telegram("💤 watchdog: open positions = 0")
+                tg_debug("💤 watchdog: open positions = 0", key="wd-zero")
 
             for p in pos_list:
                 side_raw = (p.get("side") or p.get("holdSide") or p.get("positionSide")
@@ -569,64 +626,61 @@ def _watchdog_loop():
                 if entry <= 0:
                     if RECON_DEBUG and key not in _ENTRY_MISS_WARNED:
                         _ENTRY_MISS_WARNED.add(key)
-                        send_telegram(f"⚠️ skip {symbol} {side}: entry<=0 raw={p}")
+                        tg_debug(f"⚠️ skip {symbol} {side}: entry<=0", key=f"skip-entry0:{symbol}:{side}")
                     continue
                 else:
                     _ENTRY_MISS_WARNED.discard(key)
 
                 last = _to_float(get_last_price(symbol))
                 if not last:
-                    if RECON_DEBUG: send_telegram(f"❗ last price fail {symbol}")
+                    if RECON_DEBUG: tg_debug(f"❗ last price fail {symbol}", key=f"last-fail:{symbol}")
                     continue
 
-                # ── ROE STOP (보강)
+                # ── ROE STOP (3중 계산 + 레버리지 반영)
                 if _env_bool("STOP_USE_ROE", STOP_USE_ROE):
                     lev_env   = _env_float("DEFAULT_LEVERAGE", _env_float("LEVERAGE", LEVERAGE))
                     roe_val   = _calc_roe_from_exchange_fields(p, entry, last, side, lev_env)
                     thr       = _env_float("STOP_ROE_LONG", STOP_ROE_LONG) if side == "long" \
                                 else _env_float("STOP_ROE_SHORT", STOP_ROE_SHORT)
 
-                    # 임계선 근처(또는 아래)면 RECON_DEBUG와 무관하게 1줄은 로그
-                    if roe_val <= (thr + abs(thr) * (ROE_LOG_SLACK_PCT/100.0)) or RECON_DEBUG:
-                        lev_disp  = _to_float(p.get("leverage") or p.get("marginLeverage") or lev_env)
-                        try:
-                            send_telegram(f"🧪 ROE dbg {symbol} {side} ROE={roe_val:.2f}% thr={thr:.2f}% lev={lev_disp}x")
-                        except: pass
-
-                    k = key
+                    # 심볼·사이드별 ROE dbg 주기 제한 + 임계선 근처면 항상 1줄
+                    dbg_key = f"roe:{symbol}:{side}"
                     now = time.time()
-                    last_ok = _last_roe_close_ts.get(k, 0.0)
-                    cool    = _env_float("STOP_ROE_COOLDOWN", STOP_ROE_COOLDOWN)
+                    last_dbg = _last_roe_dbg_ts.get(dbg_key, 0.0)
+                    if (roe_val <= (thr + abs(thr) * (ROE_LOG_SLACK_PCT/100.0))) or (RECON_DEBUG and now - last_dbg >= ROE_DBG_EVERY_SEC):
+                        lev_disp  = _to_float(p.get("leverage") or p.get("marginLeverage") or lev_env)
+                        tg_info(f"🧪 ROE dbg {symbol} {side} ROE={roe_val:.2f}% thr={thr:.2f}% lev={lev_disp}x", key=dbg_key)
+                        _last_roe_dbg_ts[dbg_key] = now
 
+                    last_ok = _last_roe_close_ts.get(key, 0.0)
+                    cool    = _env_float("STOP_ROE_COOLDOWN", STOP_ROE_COOLDOWN)
                     if roe_val <= thr and (now - last_ok) >= cool:
-                        send_telegram(f"⛔ ROE STOP {side.upper()} {symbol} (ROE {roe_val:.2f}% ≤ {thr:.2f}%)")
+                        tg_important(f"⛔ ROE STOP {side.upper()} {symbol} (ROE {roe_val:.2f}% ≤ {thr:.2f}%)")
                         close_position(symbol, side=side, reason="roeStop")
                         continue
 
-                # 가격 기반 STOP
+                # 가격 기반 STOP (백업)
                 adverse      = _adverse_move_ratio(entry, last, side)
                 px_threshold = PX_STOP_DROP_LONG if side == "long" else PX_STOP_DROP_SHORT
                 if adverse >= px_threshold:
-                    k = key
-                    if _should_fire_stop(k):
-                        send_telegram(
+                    if _should_fire_stop(key):
+                        tg_important(
                             f"⛔ PRICE STOP {side.upper()} {symbol} "
                             f"(adverse {adverse*100:.2f}% ≥ {px_threshold*100:.2f}%)"
                         )
                         close_position(symbol, side=side, reason="priceStop")
                     continue
 
-                # 마진 기반 STOP (백업)
+                # 마진 기반 STOP (최후 백업)
                 loss_ratio = _loss_ratio_on_margin(entry, last, size, side, leverage=_env_float("LEVERAGE", LEVERAGE))
                 if loss_ratio >= STOP_PCT:
-                    k = key
-                    if _should_fire_stop(k):
-                        send_telegram(f"⛔ MARGIN STOP {symbol} {side.upper()} (loss/margin ≥ {int(STOP_PCT*100)}%)")
+                    if _should_fire_stop(key):
+                        tg_important(f"⛔ MARGIN STOP {symbol} {side.upper()} (loss/margin ≥ {int(STOP_PCT*100)}%)")
                         close_position(symbol, side=side, reason="emergencyStop")
 
             # 하트비트는 재가동 직후 1회
-            if os.getenv("RECON_DEBUG", "0") == "1" and not _HEARTBEAT_SENT_ONCE:
-                try: send_telegram("💓 watchdog heartbeat")
+            if RECON_DEBUG and not _HEARTBEAT_SENT_ONCE:
+                try: tg_info("💓 watchdog heartbeat", key="wd-heartbeat")
                 except: pass
                 _HEARTBEAT_SENT_ONCE = True
 
@@ -640,7 +694,7 @@ def _watchdog_loop():
 # ============================================================================
 def _breakeven_watchdog():
     if not BE_ENABLE: return
-    try: send_telegram("🟢 breakeven-watchdog started")
+    try: tg_info("🟢 breakeven-watchdog started", key="be-start")
     except: pass
     while True:
         try:
@@ -662,14 +716,14 @@ def _breakeven_watchdog():
                 eps = max(be_entry * BE_EPSILON_RATIO, 0.0)
                 trigger = (last <= be_entry - eps) if side == "long" else (last >= be_entry + eps)
                 if trigger:
-                    send_telegram(f"🧷 Breakeven stop → CLOSE {side.upper()} {symbol} @≈{last} (entry≈{be_entry})")
+                    tg_important(f"🧷 Breakeven stop → CLOSE {side.upper()} {symbol} @≈{last} (entry≈{be_entry})")
                     close_position(symbol, side=side, reason="breakeven")
         except Exception as e:
             print("breakeven watchdog error:", e)
         time.sleep(0.8)
 
 def _reconciler_loop():
-    try: send_telegram("🟢 reconciler started")
+    try: tg_info("🟢 reconciler started", key="rec-start")
     except: pass
     while True:
         time.sleep(RECON_INTERVAL_SEC)
@@ -686,7 +740,7 @@ def _reconciler_loop():
                 if not _strict_try_reserve(side):
                     if TRACE_LOG:
                         st = capacity_status()
-                        send_telegram(f"⏸️ retry_hold STRICT {sym} {side} {st['last_count']}/{MAX_OPEN_POSITIONS}")
+                        tg_info(f"⏸️ retry_hold STRICT {sym} {side} {st['last_count']}/{MAX_OPEN_POSITIONS}", key="retry-hold")
                     continue
                 try:
                     if not can_enter_now(side): continue
@@ -696,7 +750,7 @@ def _reconciler_loop():
                         _set_busy(key)
                         amt, lev = item["amount"], item["leverage"]
                         if RECON_DEBUG or TRACE_LOG:
-                            send_telegram(f"🔁 retry_entry {sym} {side} attempt={item.get('attempts', 0) + 1}")
+                            tg_debug(f"🔁 retry_entry {sym} {side} attempt={item.get('attempts', 0) + 1}", key="retry-entry")
                         resp = place_market_order(sym, amt, side=("buy" if side == "long" else "sell"),
                                                   leverage=lev, reduce_only=False)
                         item["last_try"] = now
@@ -708,10 +762,10 @@ def _reconciler_loop():
                                 position_data[key] = {"symbol": sym, "side": side, "entry_usd": amt,
                                                       "ts": time.time(), "entry_price": _to_float(get_last_price(sym)) or 0.0}
                             _mark_recent_ok(key)
-                            send_telegram(f"🔁 ENTRY 재시도 성공 {side.upper()} {sym}")
+                            tg_info(f"🔁 ENTRY 재시도 성공 {side.upper()} {sym}", key="retry-ok")
                         elif code.startswith("LOCAL_MIN_QTY") or code.startswith("LOCAL_BAD_QTY"):
                             _mark_done("entry", pkey, "(minQty/badQty)")
-                            send_telegram(f"⛔ ENTRY 재시도 스킵 {sym} {side} → {resp}")
+                            tg_info(f"⛔ ENTRY 재시도 스킵 {sym} {side} → {resp}", key="retry-skip")
                 finally:
                     _clear_busy(key); _strict_release(side)
 
@@ -729,7 +783,7 @@ def _reconciler_loop():
                 with _lock_for(key):
                     now = time.time()
                     if now - item.get("last_try", 0.0) < RECON_INTERVAL_SEC - 1: continue
-                    if RECON_DEBUG: send_telegram(f"🔁 retry [close] {pkey}")
+                    if RECON_DEBUG: tg_debug(f"🔁 retry [close] {pkey}", key="retry-close")
                     size = _to_float(p.get("size"))
                     side_real = (p.get("side") or p.get("holdSide") or p.get("positionSide") or "").lower()
                     resp = place_reduce_by_size(sym, size, side_real)
@@ -740,9 +794,9 @@ def _reconciler_loop():
                         if ok:
                             _mark_done("close", pkey)
                             with _POS_LOCK: position_data.pop(_key(sym, side_real), None)
-                            send_telegram(f"🔁 CLOSE 재시도 성공 {side_real.upper()} {sym}")
+                            tg_info(f"🔁 CLOSE 재시도 성공 {side_real.upper()} {sym}", key="retry-close-ok")
 
-            # TP3 재시도 (유지)
+            # TP3 재시도
             with _PENDING_LOCK:
                 tp_items = list(_PENDING["tp"].items())
             for pkey, item in tp_items:
@@ -765,12 +819,12 @@ def _reconciler_loop():
                 with _lock_for(key):
                     now = time.time()
                     if now - item.get("last_try", 0.0) < RECON_INTERVAL_SEC - 1: continue
-                    if RECON_DEBUG: send_telegram(f"🔁 retry [tp3] {pkey} remain≈{remain}")
+                    if RECON_DEBUG: tg_debug(f"🔁 retry [tp3] {pkey} remain≈{remain}", key="retry-tp3")
                     resp = place_reduce_by_size(sym, remain, side)
                     item["last_try"] = now
                     item["attempts"] = item.get("attempts", 0) + 1
                     if str(resp.get("code", "")) == "00000":
-                        send_telegram(f"🔁 TP3 재시도 감축 {side.upper()} {sym} remain≈{remain}")
+                        tg_info(f"🔁 TP3 재시도 감축 {side.upper()} {sym} remain≈{remain}", key="retry-tp3-ok")
         except Exception as e:
             print("reconciler error:", e)
 
