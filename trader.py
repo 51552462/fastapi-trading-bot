@@ -8,6 +8,7 @@ from bitget_api import (
     place_market_order, place_reduce_by_size, get_symbol_spec, round_down_step,
 )
 
+# 텔레그램 래퍼
 try:
     from telegram_bot import send_telegram
 except Exception:
@@ -15,9 +16,8 @@ except Exception:
         print("[TG]", msg)
 
 # ============================================================================
-# ENV 설정 (기본값)
+# ENV 기본값 (필수 항목은 main/Render에서 세팅)
 # ============================================================================
-
 LEVERAGE   = float(os.getenv("LEVERAGE", "5"))
 TRACE_LOG  = os.getenv("TRACE_LOG", "0") == "1"
 RECON_DEBUG= os.getenv("RECON_DEBUG", "0") == "1"
@@ -56,7 +56,7 @@ CLOSE_IMMEDIATE     = os.getenv("CLOSE_IMMEDIATE", "1") == "1"
 TP3_CLOSE_IMMEDIATE = os.getenv("TP3_CLOSE_IMMEDIATE", "1") == "1"
 
 # ============================================================================
-# 유틸: ENV를 루프마다 재평가(재배포 없이 즉시 반영)
+# ENV 재평가 유틸 (Render에서 값 바꾸면 즉시 반영)
 # ============================================================================
 def _env_float(name: str, default: float) -> float:
     try:
@@ -117,7 +117,7 @@ def _should_fire_stop(key: str) -> bool:
 _last_roe_close_ts: Dict[str, float] = {}
 
 # ============================================================================
-# Pending 레지스트리 (재시도/조정용)
+# Pending 레지스트리
 # ============================================================================
 _PENDING = {"entry": {}, "close": {}, "tp": {}}
 _PENDING_LOCK = threading.RLock()
@@ -154,7 +154,7 @@ def get_pending_snapshot() -> Dict[str, Dict]:
         }
 
 # ============================================================================
-# 숫자 파싱 보강
+# 숫자 파싱
 # ============================================================================
 def _to_float(x) -> float:
     try:
@@ -208,7 +208,6 @@ def _adverse_move_ratio(entry: float, last: float, side: str) -> float:
         return max(0.0, (last - entry) / entry)
 
 def _calc_roe_pct(entry_price: float, mark_price: float, side: str, leverage: float) -> float:
-    """엔트리/마크/레버리지로 계산식 ROE%"""
     try:
         if not entry_price or not mark_price or leverage <= 0:
             return 0.0
@@ -220,14 +219,9 @@ def _calc_roe_pct(entry_price: float, mark_price: float, side: str, leverage: fl
         return 0.0
 
 def _calc_roe_from_exchange_fields(p: dict, entry: float, last: float, side: str, fallback_lev: float) -> float:
-    """
-    거래소가 포지션에 'unrealizedPnl'과 'margin'을 제공하면 그것으로 ROE% = PnL/margin*100
-    없으면 _calc_roe_pct로 폴백
-    """
     lev_pos = _to_float(p.get("leverage") or p.get("marginLeverage") or 0.0)
     margin  = _to_float(p.get("margin") or p.get("marginSize") or 0.0)
     upnl    = _to_float(p.get("unrealizedPnl") or 0.0)
-
     lev = lev_pos if lev_pos > 0 else fallback_lev
     if margin > 0:
         return (upnl / margin) * 100.0
@@ -262,6 +256,9 @@ def can_enter_now(side: str) -> bool:
 
 def _capacity_loop():
     prev_blocked = None
+    try:
+        send_telegram("🟢 capacity-guard started")
+    except: pass
     while True:
         try:
             total_count   = _total_open_positions_now()
@@ -514,19 +511,26 @@ def _sweep_full_close(symbol: str, side: str, reason: str, max_retry: int = 5, s
     return (not p) or _to_float(p.get("size")) <= 0
 
 # ============================================================================
-# 워치독: ROE 기반 → 가격 기반 → 마진 기반 순서로 즉시 종료 평가
+# 워치독: ROE → 가격 → 마진
 # ============================================================================
 def _watchdog_loop():
+    try:
+        send_telegram("🟢 watchdog started (RECON_DEBUG=1이면 디버그/하트비트 출력)")
+    except: pass
+
     while True:
         try:
-            # 동적 ENV 반영
             use_roe      = _env_bool("STOP_USE_ROE", STOP_USE_ROE)
             roe_thr_long = _env_float("STOP_ROE_LONG", STOP_ROE_LONG)
             roe_thr_short= _env_float("STOP_ROE_SHORT", STOP_ROE_SHORT)
             roe_cooldown = _env_float("STOP_ROE_COOLDOWN", STOP_ROE_COOLDOWN)
             lev_env      = _env_float("DEFAULT_LEVERAGE", _env_float("LEVERAGE", LEVERAGE))
 
-            for p in get_open_positions():
+            pos_list = get_open_positions()
+            if RECON_DEBUG and not pos_list:
+                send_telegram("💤 watchdog: open positions = 0")
+
+            for p in pos_list:
                 symbol = p.get("symbol")
                 side   = (p.get("side") or p.get("holdSide") or p.get("positionSide") or "").lower()
                 entry  = _to_float(p.get("entry_price"))
@@ -536,24 +540,28 @@ def _watchdog_loop():
 
                 last = _to_float(get_last_price(symbol))
                 if not last:
+                    if RECON_DEBUG:
+                        send_telegram(f"❗ last price fail {symbol}")
                     continue
 
-                # ---- 1) ROE 기반 긴급 손절 ----
+                # 1) ROE STOP
                 if use_roe:
                     roe = _calc_roe_from_exchange_fields(p, entry, last, side, lev_env)
                     thr = roe_thr_long if side == "long" else roe_thr_short
                     k   = _key(symbol, side)
                     now = time.time()
                     last_ok_ts = _last_roe_close_ts.get(k, 0.0)
+
                     if RECON_DEBUG:
-                        send_telegram(f"🧪 ROE dbg {symbol} {side} ROE={roe:.2f}% thr={thr:.2f}% lev={_to_float(p.get('leverage') or p.get('marginLeverage') or lev_env)}x")
+                        lev_display = _to_float(p.get("leverage") or p.get("marginLeverage") or lev_env)
+                        send_telegram(f"🧪 ROE dbg {symbol} {side} ROE={roe:.2f}% thr={thr:.2f}% lev={lev_display}x")
+
                     if roe <= thr and (now - last_ok_ts) >= roe_cooldown:
                         send_telegram(f"⛔ ROE STOP {side.upper()} {symbol} (ROE {roe:.2f}% ≤ {thr:.2f}%)")
                         close_position(symbol, side=side, reason="roeStop")
-                        # close 성공 시점에 _last_roe_close_ts 갱신됨
-                        continue  # 동일 루프 내 다른 스톱은 스킵
+                        continue
 
-                # ---- 2) 가격 기반 즉시 종료 ----
+                # 2) 가격 기반 STOP
                 adverse      = _adverse_move_ratio(entry, last, side)
                 px_threshold = PX_STOP_DROP_LONG if side == "long" else PX_STOP_DROP_SHORT
                 if adverse >= px_threshold:
@@ -566,7 +574,7 @@ def _watchdog_loop():
                         close_position(symbol, side=side, reason="priceStop")
                     continue
 
-                # ---- 3) 마진 기반 긴급 정지 ----
+                # 3) 마진 기반 STOP
                 loss_ratio = _loss_ratio_on_margin(entry, last, size, side, leverage=lev_env)
                 if loss_ratio >= STOP_PCT:
                     k = _key(symbol, side)
@@ -575,8 +583,15 @@ def _watchdog_loop():
                             f"⛔ MARGIN STOP {symbol} {side.upper()} (loss/margin ≥ {int(STOP_PCT*100)}%)"
                         )
                         close_position(symbol, side=side, reason="emergencyStop")
+
+            # 하트비트(쓰레드/텔레그램 정상 동작 확인)
+            if os.getenv("RECON_DEBUG", "0") == "1":
+                try: send_telegram("💓 watchdog heartbeat")
+                except: pass
+
         except Exception as e:
             print("watchdog error:", e)
+
         time.sleep(STOP_CHECK_SEC)
 
 # ============================================================================
@@ -585,6 +600,10 @@ def _watchdog_loop():
 def _breakeven_watchdog():
     if not BE_ENABLE:
         return
+    try:
+        send_telegram("🟢 breakeven-watchdog started")
+    except: pass
+
     while True:
         try:
             for p in get_open_positions():
@@ -623,6 +642,10 @@ def _breakeven_watchdog():
 # 재조정 루프(엔트리/클로즈/TP3 재시도)
 # ============================================================================
 def _reconciler_loop():
+    try:
+        send_telegram("🟢 reconciler started")
+    except: pass
+
     while True:
         time.sleep(RECON_INTERVAL_SEC)
         try:
@@ -716,7 +739,7 @@ def _reconciler_loop():
                                 position_data.pop(_key(sym, side_real), None)
                             send_telegram(f"🔁 CLOSE 재시도 성공 {side_real.upper()} {sym}")
 
-            # TP3 재시도(달성 보장)
+            # TP3 재시도
             with _PENDING_LOCK:
                 tp_items = list(_PENDING["tp"].items())
             for pkey, item in tp_items:
@@ -789,6 +812,7 @@ def start_watchdogs():
     threading.Thread(target=_watchdog_loop, name="emergency-stop-watchdog", daemon=True).start()
     if BE_ENABLE:
         threading.Thread(target=_breakeven_watchdog, name="breakeven-watchdog", daemon=True).start()
+    start_capacity_guard()
 
 def start_reconciler():
     threading.Thread(target=_reconciler_loop, name="reconciler", daemon=True).start()
