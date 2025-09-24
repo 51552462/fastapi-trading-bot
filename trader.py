@@ -511,7 +511,7 @@ def _sweep_full_close(symbol: str, side: str, reason: str, max_retry: int = 5, s
     return (not p) or _to_float(p.get("size")) <= 0
 
 # ============================================================================
-# 워치독: ROE → 가격 → 마진
+# 워치독: (패치 반영) ROE → 가격 → 마진
 # ============================================================================
 def _watchdog_loop():
     try:
@@ -520,22 +520,54 @@ def _watchdog_loop():
 
     while True:
         try:
-            use_roe      = _env_bool("STOP_USE_ROE", STOP_USE_ROE)
-            roe_thr_long = _env_float("STOP_ROE_LONG", STOP_ROE_LONG)
-            roe_thr_short= _env_float("STOP_ROE_SHORT", STOP_ROE_SHORT)
-            roe_cooldown = _env_float("STOP_ROE_COOLDOWN", STOP_ROE_COOLDOWN)
-            lev_env      = _env_float("DEFAULT_LEVERAGE", _env_float("LEVERAGE", LEVERAGE))
-
             pos_list = get_open_positions()
+
+            # 디버그: 포지션 개수 / 샘플 원시필드
+            if os.getenv("RECON_DEBUG", "0") == "1":
+                try:
+                    send_telegram(f"🔎 watchdog positions={len(pos_list)}")
+                    if pos_list:
+                        sample = pos_list[0]
+                        send_telegram("🔎 pos[0] raw=" + str({k: sample.get(k) for k in list(sample.keys())[:10]}))
+                except:
+                    pass
+
             if RECON_DEBUG and not pos_list:
                 send_telegram("💤 watchdog: open positions = 0")
 
             for p in pos_list:
+                # --- 다양한 거래소 표기 보정 ---
+                side_raw = (p.get("side") or p.get("holdSide") or p.get("positionSide")
+                            or p.get("openType") or "").strip().lower()
+                if side_raw in ("buy", "long", "open_long"):
+                    side = "long"
+                elif side_raw in ("sell", "short", "open_short", "sellshort"):
+                    side = "short"
+                else:
+                    side = side_raw
+
+                entry = _to_float(
+                    p.get("entry_price") or p.get("avgPrice") or p.get("openAvgPrice")
+                    or p.get("holdAvgPrice") or p.get("openPrice") or p.get("avgEntryPrice")
+                )
+                size = _to_float(
+                    p.get("size") or p.get("total") or p.get("available") or p.get("holdAmount")
+                    or p.get("openAmount") or p.get("positionAmt")
+                )
                 symbol = p.get("symbol")
-                side   = (p.get("side") or p.get("holdSide") or p.get("positionSide") or "").lower()
-                entry  = _to_float(p.get("entry_price"))
-                size   = _to_float(p.get("size"))
-                if not symbol or side not in ("long", "short") or entry <= 0 or size <= 0:
+
+                # 누락 이유 디버깅
+                if not symbol:
+                    if RECON_DEBUG: send_telegram(f"⚠️ skip pos: symbol missing raw={p}")
+                    continue
+                if side not in ("long", "short"):
+                    if RECON_DEBUG: send_telegram(f"⚠️ skip {symbol}: side unrecognized raw_side='{side_raw}'")
+                    continue
+                if entry <= 0:
+                    if RECON_DEBUG: send_telegram(f"⚠️ skip {symbol} {side}: entry<=0 raw={p}")
+                    continue
+                if size <= 0:
+                    if RECON_DEBUG: send_telegram(f"⚠️ skip {symbol} {side}: size<=0 raw_size={p.get('size')}")
                     continue
 
                 last = _to_float(get_last_price(symbol))
@@ -545,18 +577,21 @@ def _watchdog_loop():
                     continue
 
                 # 1) ROE STOP
-                if use_roe:
-                    roe = _calc_roe_from_exchange_fields(p, entry, last, side, lev_env)
-                    thr = roe_thr_long if side == "long" else roe_thr_short
-                    k   = _key(symbol, side)
-                    now = time.time()
-                    last_ok_ts = _last_roe_close_ts.get(k, 0.0)
+                if _env_bool("STOP_USE_ROE", STOP_USE_ROE):
+                    lev_env   = _env_float("DEFAULT_LEVERAGE", _env_float("LEVERAGE", LEVERAGE))
+                    roe       = _calc_roe_from_exchange_fields(p, entry, last, side, lev_env)
+                    thr       = _env_float("STOP_ROE_LONG", STOP_ROE_LONG) if side == "long" \
+                                else _env_float("STOP_ROE_SHORT", STOP_ROE_SHORT)
+                    lev_disp  = _to_float(p.get("leverage") or p.get("marginLeverage") or lev_env)
+                    k         = _key(symbol, side)
+                    now       = time.time()
+                    cool      = _env_float("STOP_ROE_COOLDOWN", STOP_ROE_COOLDOWN)
+                    last_ok   = _last_roe_close_ts.get(k, 0.0)
 
                     if RECON_DEBUG:
-                        lev_display = _to_float(p.get("leverage") or p.get("marginLeverage") or lev_env)
-                        send_telegram(f"🧪 ROE dbg {symbol} {side} ROE={roe:.2f}% thr={thr:.2f}% lev={lev_display}x")
+                        send_telegram(f"🧪 ROE dbg {symbol} {side} ROE={roe:.2f}% thr={thr:.2f}% lev={lev_disp}x")
 
-                    if roe <= thr and (now - last_ok_ts) >= roe_cooldown:
+                    if roe <= thr and (now - last_ok) >= cool:
                         send_telegram(f"⛔ ROE STOP {side.upper()} {symbol} (ROE {roe:.2f}% ≤ {thr:.2f}%)")
                         close_position(symbol, side=side, reason="roeStop")
                         continue
@@ -575,7 +610,8 @@ def _watchdog_loop():
                     continue
 
                 # 3) 마진 기반 STOP
-                loss_ratio = _loss_ratio_on_margin(entry, last, size, side, leverage=lev_env)
+                loss_ratio = _loss_ratio_on_margin(entry, last, size, side,
+                                                   leverage=_env_float("LEVERAGE", LEVERAGE))
                 if loss_ratio >= STOP_PCT:
                     k = _key(symbol, side)
                     if _should_fire_stop(k):
@@ -584,7 +620,7 @@ def _watchdog_loop():
                         )
                         close_position(symbol, side=side, reason="emergencyStop")
 
-            # 하트비트(쓰레드/텔레그램 정상 동작 확인)
+            # 하트비트
             if os.getenv("RECON_DEBUG", "0") == "1":
                 try: send_telegram("💓 watchdog heartbeat")
                 except: pass
@@ -595,7 +631,7 @@ def _watchdog_loop():
         time.sleep(STOP_CHECK_SEC)
 
 # ============================================================================
-# 브레이크이븐 워치독
+# 브레이크이븐 워치독(기존 유지)
 # ============================================================================
 def _breakeven_watchdog():
     if not BE_ENABLE:
@@ -639,7 +675,7 @@ def _breakeven_watchdog():
         time.sleep(0.8)
 
 # ============================================================================
-# 재조정 루프(엔트리/클로즈/TP3 재시도)
+# 재조정 루프(엔트리/클로즈/TP3 재시도) – 기존 유지
 # ============================================================================
 def _reconciler_loop():
     try:
@@ -806,7 +842,7 @@ def _strict_release(side: str):
             _RESERVE["short"] -= 1
 
 # ============================================================================
-# 외부에서 호출
+# 외부에서 호출(기존 유지)
 # ============================================================================
 def start_watchdogs():
     threading.Thread(target=_watchdog_loop, name="emergency-stop-watchdog", daemon=True).start()
