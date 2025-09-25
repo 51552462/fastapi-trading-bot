@@ -35,7 +35,7 @@ PX_STOP_DROP_SHORT = float(os.getenv("PX_STOP_DROP_SHORT", "0.015"))
 
 STOP_USE_ROE        = os.getenv("STOP_USE_ROE", "1") == "1"
 STOP_ROE_LONG       = float(os.getenv("STOP_ROE_LONG", "-10"))  # % (음수)
-STOP_ROE_SHORT      = float(os.getenv("STOP_ROE_SHORT", "-7"))  # % (음수)
+STOP_ROE_SHORT      = float(os.getenv("STOP_ROE_SHORT", "-7"))   # % (음수)
 STOP_ROE_COOLDOWN   = float(os.getenv("STOP_ROE_COOLDOWN", "20"))
 
 RECON_INTERVAL_SEC = float(os.getenv("RECON_INTERVAL_SEC", "40"))
@@ -59,6 +59,9 @@ TP3_CLOSE_IMMEDIATE = os.getenv("TP3_CLOSE_IMMEDIATE", "1") == "1"
 DEBUG_MSG_EVERY_SEC = float(os.getenv("DEBUG_MSG_EVERY_SEC", "10"))
 # ROE가 임계선 근처일 때는 RECON_DEBUG가 꺼져 있어도 1줄은 보낸다.
 ROE_LOG_SLACK_PCT   = float(os.getenv("ROE_LOG_SLACK_PCT", "1.0"))  # thr보다 1% 여유
+
+# [추가] ROE 디버그 메시지를 재기동 후 각 (심볼,사이드)당 1회만 전송
+ROE_DBG_ONCE = os.getenv("ROE_DBG_ONCE", "1") == "1"
 
 def _env_float(name: str, default: float) -> float:
     try:
@@ -116,6 +119,9 @@ def _should_fire_stop(key: str) -> bool:
         return True
 
 _last_roe_close_ts: Dict[str, float] = {}
+
+# [추가] ROE 디버그 1회 전송 표식
+_ROE_DBG_SENT: Dict[str, bool] = {}
 
 # ============================================================================
 # Pending
@@ -586,16 +592,19 @@ def _watchdog_loop():
                     thr       = _env_float("STOP_ROE_LONG", STOP_ROE_LONG) if side == "long" \
                                 else _env_float("STOP_ROE_SHORT", STOP_ROE_SHORT)
 
-                    # 임계선 근처(또는 아래)면 RECON_DEBUG와 무관하게 1줄은 로그
-                    if roe_val <= (thr + abs(thr) * (ROE_LOG_SLACK_PCT/100.0)) or RECON_DEBUG:
+                    # [변경] ROE 디버그 — 재가동 후 종목/사이드당 1회만 전송(스팸 방지)
+                    should_dbg = True
+                    if ROE_DBG_ONCE:
+                        should_dbg = not _ROE_DBG_SENT.get(key, False)
+                    if should_dbg and (roe_val <= (thr + abs(thr) * (ROE_LOG_SLACK_PCT/100.0)) or RECON_DEBUG):
                         lev_disp  = _to_float(p.get("leverage") or p.get("marginLeverage") or lev_env)
                         try:
                             send_telegram(f"🧪 ROE dbg {symbol} {side} ROE={roe_val:.2f}% thr={thr:.2f}% lev={lev_disp}x")
                         except: pass
+                        _ROE_DBG_SENT[key] = True  # 1회 전송 표시
 
-                    k = key
                     now = time.time()
-                    last_ok = _last_roe_close_ts.get(k, 0.0)
+                    last_ok = _last_roe_close_ts.get(key, 0.0)
                     cool    = _env_float("STOP_ROE_COOLDOWN", STOP_ROE_COOLDOWN)
 
                     if roe_val <= thr and (now - last_ok) >= cool:
@@ -607,8 +616,7 @@ def _watchdog_loop():
                 adverse      = _adverse_move_ratio(entry, last, side)
                 px_threshold = PX_STOP_DROP_LONG if side == "long" else PX_STOP_DROP_SHORT
                 if adverse >= px_threshold:
-                    k = key
-                    if _should_fire_stop(k):
+                    if _should_fire_stop(key):
                         send_telegram(
                             f"⛔ PRICE STOP {side.upper()} {symbol} "
                             f"(adverse {adverse*100:.2f}% ≥ {px_threshold*100:.2f}%)"
@@ -619,8 +627,7 @@ def _watchdog_loop():
                 # 마진 기반 STOP (백업)
                 loss_ratio = _loss_ratio_on_margin(entry, last, size, side, leverage=_env_float("LEVERAGE", LEVERAGE))
                 if loss_ratio >= STOP_PCT:
-                    k = key
-                    if _should_fire_stop(k):
+                    if _should_fire_stop(key):
                         send_telegram(f"⛔ MARGIN STOP {symbol} {side.upper()} (loss/margin ≥ {int(STOP_PCT*100)}%)")
                         close_position(symbol, side=side, reason="emergencyStop")
 
