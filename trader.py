@@ -63,6 +63,11 @@ ROE_LOG_SLACK_PCT   = float(os.getenv("ROE_LOG_SLACK_PCT", "1.0"))  # thr보다 
 # [추가] ROE 디버그 메시지를 재기동 후 각 (심볼,사이드)당 1회만 전송
 ROE_DBG_ONCE = os.getenv("ROE_DBG_ONCE", "1") == "1"
 
+# [추가] SHORT TRAIL — 숏 포지션에서 ROE가 ARM 이상 갔다가 EXIT 이하면 즉시 종료
+SHORT_TRAIL_ENABLE = os.getenv("SHORT_TRAIL_ENABLE", "1") == "1"
+SHORT_TRAIL_ARM_PCT   = float(os.getenv("SHORT_TRAIL_ARM_PCT", "7.0"))    # +7% 도달 시 무장
+SHORT_TRAIL_EXIT_PCT  = float(os.getenv("SHORT_TRAIL_EXIT_PCT", "-1.0"))  # -1% 찍히면 종료
+
 def _env_float(name: str, default: float) -> float:
     try:
         return float(os.getenv(name, str(default)))
@@ -122,6 +127,12 @@ _last_roe_close_ts: Dict[str, float] = {}
 
 # [추가] ROE 디버그 1회 전송 표식
 _ROE_DBG_SENT: Dict[str, bool] = {}
+
+# [추가] SHORT TRAIL 상태 (심볼_사이드별)
+#  - armed: ARM 임계치 도달 후 True
+#  - peak:  지금까지의 최대 ROE(%) (정보용)
+_SHORT_TRAIL: Dict[str, Dict[str, float]] = {}
+_TRAIL_LOCK = threading.Lock()
 
 # ============================================================================
 # Pending
@@ -386,6 +397,12 @@ def enter_position(symbol: str, usdt_amount: float, side: str = "long", leverage
                     }
                 with _STOP_LOCK:
                     _STOP_FIRED.pop(key, None)
+
+                # [추가] 숏 트레일 상태 초기화
+                if side == "short":
+                    with _TRAIL_LOCK:
+                        _SHORT_TRAIL[key] = {"armed": 0.0, "peak": 0.0}
+
                 _mark_done("entry", pkey)
                 _mark_recent_ok(key)
                 send_telegram(
@@ -436,7 +453,7 @@ def take_partial_profit(symbol: str, pct: float, side: str = "long"):
 
         resp = place_reduce_by_size(symbol, cut_size, side)
         if str(resp.get("code", "")) == "00000":
-            send_telegram(f"🤑 TP {int(pct*100)}% {side.upper()} {symbol} cut={cut_size}")
+            send_telegram(f"🤑 TP {int(pct*100)}% {side.UPPER()} {symbol} cut={cut_size}")
         else:
             send_telegram(f"❌ TP 실패 {symbol} {side} → {resp}")
 
@@ -471,6 +488,11 @@ def close_position(symbol: str, side: str = "long", reason: str = "manual"):
                 entry = _to_float(p.get("entry_price"))
                 realized = _pnl_usdt(entry, exit_price, entry * size, pos_side)
                 with _POS_LOCK: position_data.pop(key_real, None)
+
+                # [추가] 숏 트레일 상태 정리
+                with _TRAIL_LOCK:
+                    _SHORT_TRAIL.pop(key_real, None)
+
                 _mark_done("close", pkey)
                 _mark_recent_ok(key_real)
                 _last_roe_close_ts[key_real] = time.time()  # 성공시에만 쿨다운
@@ -610,6 +632,37 @@ def _watchdog_loop():
                     if roe_val <= thr and (now - last_ok) >= cool:
                         send_telegram(f"⛔ ROE STOP {side.upper()} {symbol} (ROE {roe_val:.2f}% ≤ {thr:.2f}%)")
                         close_position(symbol, side=side, reason="roeStop")
+                        # 트레일 상태도 정리
+                        with _TRAIL_LOCK:
+                            _SHORT_TRAIL.pop(key, None)
+                        continue
+
+                # [추가] SHORT TRAIL: 숏에서 +ARM% 돌파 후 -EXIT% 도달 시 종료
+                if side == "short" and SHORT_TRAIL_ENABLE:
+                    roe_val = _calc_roe_from_exchange_fields(
+                        p, entry, last, side, _env_float("DEFAULT_LEVERAGE", _env_float("LEVERAGE", LEVERAGE))
+                    )
+                    with _TRAIL_LOCK:
+                        st = _SHORT_TRAIL.get(key) or {"armed": 0.0, "peak": 0.0}
+                        if roe_val > st.get("peak", 0.0):
+                            st["peak"] = roe_val
+                        # ARM 달성
+                        if st.get("armed", 0.0) == 0.0 and roe_val >= SHORT_TRAIL_ARM_PCT:
+                            st["armed"] = time.time()
+                            try:
+                                send_telegram(f"🧷 SHORT TRAIL ARMED {symbol} (ROE {roe_val:.2f}% ≥ {SHORT_TRAIL_ARM_PCT:.2f}%)")
+                            except: pass
+                        _SHORT_TRAIL[key] = st
+                        armed = st.get("armed", 0.0) > 0.0
+                    if armed and roe_val <= SHORT_TRAIL_EXIT_PCT:
+                        try:
+                            send_telegram(
+                                f"⛔ SHORT TRAIL EXIT {symbol} (ROE {roe_val:.2f}% ≤ {SHORT_TRAIL_EXIT_PCT:.2f}%)"
+                            )
+                        except: pass
+                        close_position(symbol, side=side, reason="shortTrail")
+                        with _TRAIL_LOCK:
+                            _SHORT_TRAIL.pop(key, None)
                         continue
 
                 # 가격 기반 STOP
@@ -715,6 +768,10 @@ def _reconciler_loop():
                                 position_data[key] = {"symbol": sym, "side": side, "entry_usd": amt,
                                                       "ts": time.time(), "entry_price": _to_float(get_last_price(sym)) or 0.0}
                             _mark_recent_ok(key)
+                            # 숏 트레일 초기화
+                            if side == "short":
+                                with _TRAIL_LOCK:
+                                    _SHORT_TRAIL[key] = {"armed": 0.0, "peak": 0.0}
                             send_telegram(f"🔁 ENTRY 재시도 성공 {side.upper()} {sym}")
                         elif code.startswith("LOCAL_MIN_QTY") or code.startswith("LOCAL_BAD_QTY"):
                             _mark_done("entry", pkey, "(minQty/badQty)")
@@ -732,6 +789,9 @@ def _reconciler_loop():
                 if not p or _to_float(p.get("size")) <= 0:
                     _mark_done("close", pkey, "(no-remote)")
                     with _POS_LOCK: position_data.pop(key, None)
+                    # 트레일 정리
+                    with _TRAIL_LOCK:
+                        _SHORT_TRAIL.pop(key, None)
                     continue
                 with _lock_for(key):
                     now = time.time()
@@ -747,6 +807,7 @@ def _reconciler_loop():
                         if ok:
                             _mark_done("close", pkey)
                             with _POS_LOCK: position_data.pop(_key(sym, side_real), None)
+                            with _TRAIL_LOCK: _SHORT_TRAIL.pop(_key(sym, side_real), None)
                             send_telegram(f"🔁 CLOSE 재시도 성공 {side_real.upper()} {sym}")
 
             # TP3 재시도 (유지)
