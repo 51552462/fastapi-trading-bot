@@ -6,18 +6,19 @@ from typing import Dict, Optional
 from bitget_api import (
     convert_symbol, get_last_price, get_open_positions,
     place_market_order, place_reduce_by_size, get_symbol_spec, round_down_step,
+    force_close_position,
 )
 
-# 텔레그램 래퍼 (없어도 동작)
+# 텔레그램(없어도 동작)
 try:
     from telegram_bot import send_telegram
 except Exception:
     def send_telegram(msg: str):
         print("[TG]", msg)
 
-# ============================================================================
+# ─────────────────────────────────────────────────────────────────────────────
 # ENV
-# ============================================================================
+# ─────────────────────────────────────────────────────────────────────────────
 LEVERAGE   = float(os.getenv("LEVERAGE", "5"))
 TRACE_LOG  = os.getenv("TRACE_LOG", "0") == "1"
 RECON_DEBUG= os.getenv("RECON_DEBUG", "0") == "1"
@@ -27,15 +28,15 @@ TP2_PCT = float(os.getenv("TP2_PCT", "0.40"))
 TP3_PCT = float(os.getenv("TP3_PCT", "0.30"))
 
 STOP_PCT           = float(os.getenv("STOP_PCT", "0.10"))
-STOP_CHECK_SEC     = float(os.getenv("STOP_CHECK_SEC", "1.0"))
+STOP_CHECK_SEC     = float(os.getenv("STOP_CHECK_SEC", "1.0"))  # ← Render에서 10으로 주면 10초마다 점검
 STOP_COOLDOWN_SEC  = float(os.getenv("STOP_COOLDOWN_SEC", "5.0"))
 
 PX_STOP_DROP_LONG  = float(os.getenv("PX_STOP_DROP_LONG",  "0.02"))
 PX_STOP_DROP_SHORT = float(os.getenv("PX_STOP_DROP_SHORT", "0.015"))
 
 STOP_USE_ROE        = os.getenv("STOP_USE_ROE", "1") == "1"
-STOP_ROE_LONG       = float(os.getenv("STOP_ROE_LONG", "-10"))  # % (음수)
-STOP_ROE_SHORT      = float(os.getenv("STOP_ROE_SHORT", "-7"))   # % (음수)
+STOP_ROE_LONG       = float(os.getenv("STOP_ROE_LONG", "-10"))  # 롱 즉시 종료 임계(%)  (음수)
+STOP_ROE_SHORT      = float(os.getenv("STOP_ROE_SHORT", "-7"))   # 숏 즉시 종료 임계(%)  (음수)
 STOP_ROE_COOLDOWN   = float(os.getenv("STOP_ROE_COOLDOWN", "20"))
 
 RECON_INTERVAL_SEC = float(os.getenv("RECON_INTERVAL_SEC", "40"))
@@ -55,18 +56,14 @@ BE_EPSILON_RATIO = float(os.getenv("BE_EPSILON_RATIO", "0.0005"))
 CLOSE_IMMEDIATE     = os.getenv("CLOSE_IMMEDIATE", "1") == "1"
 TP3_CLOSE_IMMEDIATE = os.getenv("TP3_CLOSE_IMMEDIATE", "1") == "1"
 
-# 디버그 메시지 속도 제한(스팸 방지)
 DEBUG_MSG_EVERY_SEC = float(os.getenv("DEBUG_MSG_EVERY_SEC", "10"))
-# ROE가 임계선 근처일 때는 RECON_DEBUG가 꺼져 있어도 1줄은 보낸다.
-ROE_LOG_SLACK_PCT   = float(os.getenv("ROE_LOG_SLACK_PCT", "1.0"))  # thr보다 1% 여유
+ROE_LOG_SLACK_PCT   = float(os.getenv("ROE_LOG_SLACK_PCT", "1.0"))
+ROE_DBG_ONCE        = os.getenv("ROE_DBG_ONCE", "1") == "1"
 
-# [추가] ROE 디버그 메시지를 재기동 후 각 (심볼,사이드)당 1회만 전송
-ROE_DBG_ONCE = os.getenv("ROE_DBG_ONCE", "1") == "1"
-
-# [추가] SHORT TRAIL — 숏 포지션에서 ROE가 ARM 이상 갔다가 EXIT 이하면 즉시 종료
-SHORT_TRAIL_ENABLE = os.getenv("SHORT_TRAIL_ENABLE", "1") == "1"
-SHORT_TRAIL_ARM_PCT   = float(os.getenv("SHORT_TRAIL_ARM_PCT", "7.0"))    # +7% 도달 시 무장
-SHORT_TRAIL_EXIT_PCT  = float(os.getenv("SHORT_TRAIL_EXIT_PCT", "-1.0"))  # -1% 찍히면 종료
+# 숏 전용 트레일: +7% 찍은 뒤 -1% 떨어지면 즉시 종료
+SHORT_TRAIL_ENABLE   = os.getenv("SHORT_TRAIL_ENABLE", "1") == "1"
+SHORT_TRAIL_ARM_PCT  = float(os.getenv("SHORT_TRAIL_ARM_PCT", "7.0"))   # +7% 도달 시 무장
+SHORT_TRAIL_EXIT_PCT = float(os.getenv("SHORT_TRAIL_EXIT_PCT", "-1.0")) # -1% 도달 시 종료
 
 def _env_float(name: str, default: float) -> float:
     try:
@@ -78,9 +75,9 @@ def _env_bool(name: str, default: bool) -> bool:
     v = os.getenv(name, "1" if default else "0").strip().lower()
     return v in ("1", "true", "yes", "on")
 
-# ============================================================================
-# 상태/락
-# ============================================================================
+# ─────────────────────────────────────────────────────────────────────────────
+# STATE / LOCK
+# ─────────────────────────────────────────────────────────────────────────────
 _CAPACITY = {"blocked": False, "last_count": 0, "short_blocked": False, "short_count": 0, "ts": 0.0}
 _CAP_LOCK = threading.Lock()
 
@@ -111,7 +108,6 @@ def _local_has_any(symbol: str) -> bool:
                 return True
     return False
 
-# STOP 쿨다운(연타 방지)
 _STOP_FIRED: Dict[str, float] = {}
 _STOP_LOCK = threading.Lock()
 def _should_fire_stop(key: str) -> bool:
@@ -124,19 +120,15 @@ def _should_fire_stop(key: str) -> bool:
         return True
 
 _last_roe_close_ts: Dict[str, float] = {}
-
-# [추가] ROE 디버그 1회 전송 표식
 _ROE_DBG_SENT: Dict[str, bool] = {}
 
-# [추가] SHORT TRAIL 상태 (심볼_사이드별)
-#  - armed: ARM 임계치 도달 후 True
-#  - peak:  지금까지의 최대 ROE(%) (정보용)
+# 숏 트레일 상태
 _SHORT_TRAIL: Dict[str, Dict[str, float]] = {}
 _TRAIL_LOCK = threading.Lock()
 
-# ============================================================================
-# Pending
-# ============================================================================
+# ─────────────────────────────────────────────────────────────────────────────
+# PENDING
+# ─────────────────────────────────────────────────────────────────────────────
 _PENDING = {"entry": {}, "close": {}, "tp": {}}
 _PENDING_LOCK = threading.RLock()
 
@@ -171,9 +163,9 @@ def get_pending_snapshot() -> Dict[str, Dict]:
             "local_keys": list(position_data.keys()),
         }
 
-# ============================================================================
-# 유틸
-# ============================================================================
+# ─────────────────────────────────────────────────────────────────────────────
+# UTIL
+# ─────────────────────────────────────────────────────────────────────────────
 def _to_float(x) -> float:
     try:
         if isinstance(x, (int, float)): return float(x)
@@ -200,7 +192,6 @@ def _get_remote_any_side(symbol: str):
             return p
     return None
 
-# PnL/ROE
 def _pnl_usdt(entry: float, exit: float, notional: float, side: str) -> float:
     pct = (exit - entry) / entry if side == "long" else (entry - exit) / entry
     return notional * pct
@@ -228,18 +219,15 @@ def _calc_roe_pct(entry_price: float, mark_price: float, side: str, leverage: fl
         return 0.0
 
 def _calc_roe_from_exchange_fields(p: dict, entry: float, last: float, side: str, fallback_lev: float) -> float:
-    # 1) 거래소 제공 값 우선
     margin  = _to_float(p.get("margin") or p.get("marginSize") or p.get("isolatedMargin") or 0.0)
     upnl    = _to_float(p.get("unrealizedPnl") or p.get("unrealisedPnl") or 0.0)
     lev_pos = _to_float(p.get("leverage") or p.get("marginLeverage") or 0.0)
     if margin > 0:
         return (upnl / margin) * 100.0
-    # 2) 포지션/환경 레버리지로 산출
     lev = lev_pos if lev_pos > 0 else fallback_lev
     roe = _calc_roe_pct(entry, last, side, lev)
     if roe != 0.0:
         return roe
-    # 3) 최후: notional/증거금 추정
     size = _to_float(p.get("size") or p.get("positionAmt") or 0.0)
     if size > 0 and entry > 0:
         notional = entry * size
@@ -248,9 +236,9 @@ def _calc_roe_from_exchange_fields(p: dict, entry: float, last: float, side: str
         return (pnl / margin_est) * 100.0
     return 0.0
 
-# ============================================================================
-# 용량 가드
-# ============================================================================
+# ─────────────────────────────────────────────────────────────────────────────
+# CAPACITY GUARD
+# ─────────────────────────────────────────────────────────────────────────────
 def _total_open_positions_now() -> int:
     try:
         return len(get_open_positions()) + _local_open_count()
@@ -304,9 +292,9 @@ def _capacity_loop():
 def start_capacity_guard():
     threading.Thread(target=_capacity_loop, name="capacity-guard", daemon=True).start()
 
-# ============================================================================
-# 진입 인플라이트/중복 가드
-# ============================================================================
+# ─────────────────────────────────────────────────────────────────────────────
+# ENTRY GUARD
+# ─────────────────────────────────────────────────────────────────────────────
 _ENTRY_BUSY: Dict[str, float] = {}
 _RECENT_OK: Dict[str, float]  = {}
 _ENTRY_G_LOCK = threading.Lock()
@@ -333,9 +321,9 @@ def _recent_ok(key: str) -> bool:
         ts = _RECENT_OK.get(key, 0.0)
     return (time.time() - ts) < ENTRY_DUP_TTL_SEC
 
-# ============================================================================
-# 주문
-# ============================================================================
+# ─────────────────────────────────────────────────────────────────────────────
+# ORDERS
+# ─────────────────────────────────────────────────────────────────────────────
 def enter_position(symbol: str, usdt_amount: float, side: str = "long", leverage: float = None):
     symbol = convert_symbol(symbol); side = side.lower()
     key    = _key(symbol, side)
@@ -398,7 +386,7 @@ def enter_position(symbol: str, usdt_amount: float, side: str = "long", leverage
                 with _STOP_LOCK:
                     _STOP_FIRED.pop(key, None)
 
-                # [추가] 숏 트레일 상태 초기화
+                # 숏 트레일 초기화
                 if side == "short":
                     with _TRAIL_LOCK:
                         _SHORT_TRAIL[key] = {"armed": 0.0, "peak": 0.0}
@@ -453,7 +441,7 @@ def take_partial_profit(symbol: str, pct: float, side: str = "long"):
 
         resp = place_reduce_by_size(symbol, cut_size, side)
         if str(resp.get("code", "")) == "00000":
-            send_telegram(f"🤑 TP {int(pct*100)}% {side.UPPER()} {symbol} cut={cut_size}")
+            send_telegram(f"🤑 TP {int(pct*100)}% {side.upper()} {symbol} cut={cut_size}")
         else:
             send_telegram(f"❌ TP 실패 {symbol} {side} → {resp}")
 
@@ -482,28 +470,28 @@ def close_position(symbol: str, side: str = "long", reason: str = "manual"):
         with _lock_for(key_real):
             size = _to_float(p.get("size"))
             resp = place_reduce_by_size(symbol, size, pos_side)
-            exit_price = _to_float(get_last_price(symbol)) or _to_float(p.get("entry_price"))
             success = str(resp.get("code", "")) == "00000"
-            if success:
-                entry = _to_float(p.get("entry_price"))
-                realized = _pnl_usdt(entry, exit_price, entry * size, pos_side)
-                with _POS_LOCK: position_data.pop(key_real, None)
 
-                # [추가] 숏 트레일 상태 정리
-                with _TRAIL_LOCK:
-                    _SHORT_TRAIL.pop(key_real, None)
+            # 실패 시 전량 종료 폴백(5USDT 미만/side mismatch 등)
+            if not success:
+                fb = force_close_position(symbol, pos_side)
+                success = str(fb.get("code", "")) == "00000"
+                if not success:
+                    send_telegram(f"❌ CLOSE 실패(폴백도 실패) {symbol} {pos_side} → {resp} / fb={fb}")
+                    return
+                resp = fb
 
-                _mark_done("close", pkey)
-                _mark_recent_ok(key_real)
-                _last_roe_close_ts[key_real] = time.time()  # 성공시에만 쿨다운
-                send_telegram(
-                    f"✅ CLOSE {pos_side.upper()} {symbol} ({reason})\n"
-                    f"• Exit: {exit_price}\n"
-                    f"• Size: {size}\n"
-                    f"• Realized≈ {realized:+.2f} USDT"
-                )
-            else:
-                send_telegram(f"❌ CLOSE 실패 {symbol} {pos_side} → {resp}")
+            exit_price = _to_float(get_last_price(symbol)) or _to_float(p.get("entry_price"))
+            entry = _to_float(p.get("entry_price"))
+            realized = _pnl_usdt(entry, exit_price, entry * size, pos_side)
+            with _POS_LOCK: position_data.pop(key_real, None)
+            _mark_done("close", pkey)
+            _mark_recent_ok(key_real)
+            _last_roe_close_ts[key_real] = time.time()
+            send_telegram(
+                f"✅ CLOSE {pos_side.upper()} {symbol} ({reason})\n"
+                f"• Exit: {exit_price}\n• Size: {size}\n• Realized≈ {realized:+.2f} USDT"
+            )
 
 def reduce_by_contracts(symbol: str, contracts: float, side: str = "long"):
     symbol = convert_symbol(symbol); side = side.lower()
@@ -520,9 +508,9 @@ def reduce_by_contracts(symbol: str, contracts: float, side: str = "long"):
         else:
             send_telegram(f"❌ Reduce 실패 {key} → {resp}")
 
-# ============================================================================
-# 보조
-# ============================================================================
+# ─────────────────────────────────────────────────────────────────────────────
+# HELPERS
+# ─────────────────────────────────────────────────────────────────────────────
 def _sweep_full_close(symbol: str, side: str, reason: str, max_retry: int = 5, sleep_s: float = 0.3):
     for _ in range(max_retry):
         p = _get_remote(symbol, side)
@@ -534,9 +522,9 @@ def _sweep_full_close(symbol: str, side: str, reason: str, max_retry: int = 5, s
     p = _get_remote(symbol, side)
     return (not p) or _to_float(p.get("size")) <= 0
 
-# ============================================================================
-# 워치독 (손절)
-# ============================================================================
+# ─────────────────────────────────────────────────────────────────────────────
+# WATCHDOG (손절/ROE/숏 트레일)
+# ─────────────────────────────────────────────────────────────────────────────
 _HEARTBEAT_SENT_ONCE = False
 _ENTRY_MISS_WARNED = set()
 _last_dbg_ts = 0.0
@@ -544,14 +532,14 @@ _last_sample = {}
 
 def _watchdog_loop():
     global _HEARTBEAT_SENT_ONCE, _last_dbg_ts, _last_sample
-    try: send_telegram("🟢 watchdog started (RECON_DEBUG=1이면 디버그/하트비트 출력)")
+    try: send_telegram("🟢 watchdog started (RECON_DEBUG=1에서만 디버그/하트비트)")
     except: pass
 
     while True:
         try:
             pos_list = get_open_positions()
 
-            # 디버그(레이트 리미트)
+            # 디버그 레이트 리미트
             if os.getenv("RECON_DEBUG", "0") == "1":
                 now = time.time()
                 if now - _last_dbg_ts >= max(1.0, DEBUG_MSG_EVERY_SEC):
@@ -585,7 +573,7 @@ def _watchdog_loop():
 
                 key = _key(symbol, side)
 
-                # entry=0 보정 시도
+                # entry 보정
                 if entry <= 0:
                     with _POS_LOCK:
                         entry_local = _to_float(position_data.get(key, {}).get("entry_price"))
@@ -607,23 +595,22 @@ def _watchdog_loop():
                     if RECON_DEBUG: send_telegram(f"❗ last price fail {symbol}")
                     continue
 
-                # ── ROE STOP (보강)
+                # ROE STOP (레버리지 반영)
                 if _env_bool("STOP_USE_ROE", STOP_USE_ROE):
                     lev_env   = _env_float("DEFAULT_LEVERAGE", _env_float("LEVERAGE", LEVERAGE))
                     roe_val   = _calc_roe_from_exchange_fields(p, entry, last, side, lev_env)
                     thr       = _env_float("STOP_ROE_LONG", STOP_ROE_LONG) if side == "long" \
                                 else _env_float("STOP_ROE_SHORT", STOP_ROE_SHORT)
 
-                    # [변경] ROE 디버그 — 재가동 후 종목/사이드당 1회만 전송(스팸 방지)
+                    # ROE 디버그 — 재가동 후 1회만(옵션)
                     should_dbg = True
                     if ROE_DBG_ONCE:
                         should_dbg = not _ROE_DBG_SENT.get(key, False)
                     if should_dbg and (roe_val <= (thr + abs(thr) * (ROE_LOG_SLACK_PCT/100.0)) or RECON_DEBUG):
                         lev_disp  = _to_float(p.get("leverage") or p.get("marginLeverage") or lev_env)
-                        try:
-                            send_telegram(f"🧪 ROE dbg {symbol} {side} ROE={roe_val:.2f}% thr={thr:.2f}% lev={lev_disp}x")
+                        try: send_telegram(f"🧪 ROE dbg {symbol} {side} ROE={roe_val:.2f}% thr={thr:.2f}% lev={lev_disp}x")
                         except: pass
-                        _ROE_DBG_SENT[key] = True  # 1회 전송 표시
+                        _ROE_DBG_SENT[key] = True
 
                     now = time.time()
                     last_ok = _last_roe_close_ts.get(key, 0.0)
@@ -632,12 +619,11 @@ def _watchdog_loop():
                     if roe_val <= thr and (now - last_ok) >= cool:
                         send_telegram(f"⛔ ROE STOP {side.upper()} {symbol} (ROE {roe_val:.2f}% ≤ {thr:.2f}%)")
                         close_position(symbol, side=side, reason="roeStop")
-                        # 트레일 상태도 정리
                         with _TRAIL_LOCK:
                             _SHORT_TRAIL.pop(key, None)
                         continue
 
-                # [추가] SHORT TRAIL: 숏에서 +ARM% 돌파 후 -EXIT% 도달 시 종료
+                # 숏 트레일: +ARM% 돌파 후 -EXIT% 도달 시 종료
                 if side == "short" and SHORT_TRAIL_ENABLE:
                     roe_val = _calc_roe_from_exchange_fields(
                         p, entry, last, side, _env_float("DEFAULT_LEVERAGE", _env_float("LEVERAGE", LEVERAGE))
@@ -646,38 +632,32 @@ def _watchdog_loop():
                         st = _SHORT_TRAIL.get(key) or {"armed": 0.0, "peak": 0.0}
                         if roe_val > st.get("peak", 0.0):
                             st["peak"] = roe_val
-                        # ARM 달성
                         if st.get("armed", 0.0) == 0.0 and roe_val >= SHORT_TRAIL_ARM_PCT:
                             st["armed"] = time.time()
-                            try:
-                                send_telegram(f"🧷 SHORT TRAIL ARMED {symbol} (ROE {roe_val:.2f}% ≥ {SHORT_TRAIL_ARM_PCT:.2f}%)")
+                            try: send_telegram(f"🧷 SHORT TRAIL ARMED {symbol} (ROE {roe_val:.2f}% ≥ {SHORT_TRAIL_ARM_PCT:.2f}%)")
                             except: pass
                         _SHORT_TRAIL[key] = st
                         armed = st.get("armed", 0.0) > 0.0
                     if armed and roe_val <= SHORT_TRAIL_EXIT_PCT:
-                        try:
-                            send_telegram(
-                                f"⛔ SHORT TRAIL EXIT {symbol} (ROE {roe_val:.2f}% ≤ {SHORT_TRAIL_EXIT_PCT:.2f}%)"
-                            )
+                        try: send_telegram(f"⛔ SHORT TRAIL EXIT {symbol} (ROE {roe_val:.2f}% ≤ {SHORT_TRAIL_EXIT_PCT:.2f}%)")
                         except: pass
                         close_position(symbol, side=side, reason="shortTrail")
                         with _TRAIL_LOCK:
                             _SHORT_TRAIL.pop(key, None)
                         continue
 
-                # 가격 기반 STOP
+                # 가격 기반 STOP (백업)
                 adverse      = _adverse_move_ratio(entry, last, side)
                 px_threshold = PX_STOP_DROP_LONG if side == "long" else PX_STOP_DROP_SHORT
                 if adverse >= px_threshold:
                     if _should_fire_stop(key):
                         send_telegram(
-                            f"⛔ PRICE STOP {side.upper()} {symbol} "
-                            f"(adverse {adverse*100:.2f}% ≥ {px_threshold*100:.2f}%)"
+                            f"⛔ PRICE STOP {side.upper()} {symbol} (adverse {adverse*100:.2f}% ≥ {px_threshold*100:.2f}%)"
                         )
                         close_position(symbol, side=side, reason="priceStop")
                     continue
 
-                # 마진 기반 STOP (백업)
+                # 마진 기반 STOP (최후 백업)
                 loss_ratio = _loss_ratio_on_margin(entry, last, size, side, leverage=_env_float("LEVERAGE", LEVERAGE))
                 if loss_ratio >= STOP_PCT:
                     if _should_fire_stop(key):
@@ -695,9 +675,9 @@ def _watchdog_loop():
 
         time.sleep(STOP_CHECK_SEC)
 
-# ============================================================================
-# 브레이크이븐/리컨실러 (기존 유지)
-# ============================================================================
+# ─────────────────────────────────────────────────────────────────────────────
+# BREAKEVEN / RECONCILER
+# ─────────────────────────────────────────────────────────────────────────────
 def _breakeven_watchdog():
     if not BE_ENABLE: return
     try: send_telegram("🟢 breakeven-watchdog started")
@@ -768,7 +748,6 @@ def _reconciler_loop():
                                 position_data[key] = {"symbol": sym, "side": side, "entry_usd": amt,
                                                       "ts": time.time(), "entry_price": _to_float(get_last_price(sym)) or 0.0}
                             _mark_recent_ok(key)
-                            # 숏 트레일 초기화
                             if side == "short":
                                 with _TRAIL_LOCK:
                                     _SHORT_TRAIL[key] = {"armed": 0.0, "peak": 0.0}
@@ -789,9 +768,7 @@ def _reconciler_loop():
                 if not p or _to_float(p.get("size")) <= 0:
                     _mark_done("close", pkey, "(no-remote)")
                     with _POS_LOCK: position_data.pop(key, None)
-                    # 트레일 정리
-                    with _TRAIL_LOCK:
-                        _SHORT_TRAIL.pop(key, None)
+                    with _TRAIL_LOCK: _SHORT_TRAIL.pop(key, None)
                     continue
                 with _lock_for(key):
                     now = time.time()
@@ -800,8 +777,7 @@ def _reconciler_loop():
                     size = _to_float(p.get("size"))
                     side_real = (p.get("side") or p.get("holdSide") or p.get("positionSide") or "").lower()
                     resp = place_reduce_by_size(sym, size, side_real)
-                    item["last_try"] = now
-                    item["attempts"] = item.get("attempts", 0) + 1
+
                     if str(resp.get("code", "")) == "00000":
                         ok = _sweep_full_close(sym, side_real, "reconcile")
                         if ok:
@@ -809,8 +785,17 @@ def _reconciler_loop():
                             with _POS_LOCK: position_data.pop(_key(sym, side_real), None)
                             with _TRAIL_LOCK: _SHORT_TRAIL.pop(_key(sym, side_real), None)
                             send_telegram(f"🔁 CLOSE 재시도 성공 {side_real.upper()} {sym}")
+                    else:
+                        fb = force_close_position(sym, side_real)
+                        if str(fb.get("code", "")) == "00000":
+                            _mark_done("close", pkey)
+                            with _POS_LOCK: position_data.pop(_key(sym, side_real), None)
+                            with _TRAIL_LOCK: _SHORT_TRAIL.pop(_key(sym, side_real), None)
+                            send_telegram(f"🔁 CLOSE 폴백 성공 {side_real.upper()} {sym}")
+                        else:
+                            send_telegram(f"❌ CLOSE 재시도 실패 {side_real.upper()} {sym} → {resp} / fb={fb}")
 
-            # TP3 재시도 (유지)
+            # TP3 재시도
             with _PENDING_LOCK:
                 tp_items = list(_PENDING["tp"].items())
             for pkey, item in tp_items:
@@ -857,9 +842,9 @@ def _strict_release(side: str):
     with _RES_LOCK:
         if _RESERVE["short"] > 0: _RESERVE["short"] -= 1
 
-# ============================================================================
-# 외부 호출
-# ============================================================================
+# ─────────────────────────────────────────────────────────────────────────────
+# EXTERNAL STARTERS
+# ─────────────────────────────────────────────────────────────────────────────
 def start_watchdogs():
     threading.Thread(target=_watchdog_loop, name="emergency-stop-watchdog", daemon=True).start()
     if BE_ENABLE:
