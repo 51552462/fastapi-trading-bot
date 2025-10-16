@@ -26,7 +26,7 @@ TP1_PCT = float(os.getenv("TP1_PCT", "0.30"))
 TP2_PCT = float(os.getenv("TP2_PCT", "0.40"))
 TP3_PCT = float(os.getenv("TP3_PCT", "0.30"))
 
-STOP_PCT           = float(os.getenv("STOP_PCT", "0.10"))
+STOP_PCT           = float(os.getenv("STOP_PCT", "0.15"))
 STOP_CHECK_SEC     = float(os.getenv("STOP_CHECK_SEC", "1.0"))
 STOP_COOLDOWN_SEC  = float(os.getenv("STOP_COOLDOWN_SEC", "5.0"))
 
