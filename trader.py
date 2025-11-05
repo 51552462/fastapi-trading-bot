@@ -346,8 +346,8 @@ def enter_position(symbol: str, usdt_amount: float, side: str = "long", leverage
     if TRACE_LOG:
         send_telegram(f"🔎 ENTRY request trace={trace} {symbol} {side} amt={usdt_amount}")
 
-    if _is_busy(key) or _recent_ok(key):
-        if RECON_DEBUG: send_telegram(f"⏸️ skip entry (busy/recent) {key}")
+    if _is_busy(key):
+        if RECON_DEBUG: send_telegram(f"⏸️ skip entry (busy) {key}")
         return
 
     if not _strict_try_reserve(side):
@@ -369,8 +369,10 @@ def enter_position(symbol: str, usdt_amount: float, side: str = "long", leverage
         if RECON_DEBUG: send_telegram(f"📌 pending add [entry] {pkey}")
 
         with _lock_for(key):
-            if _local_has_any(symbol) or _get_remote_any_side(symbol) or _recent_ok(key):
-                _mark_done("entry", pkey, "(exists/recent)"); return
+            # 🔧 변경: recent_ok 단독으로 스킵하지 않음(실제 포지션 존재할 때만 스킵)
+            if _local_has_any(symbol) or _get_remote_any_side(symbol):
+                _mark_done("entry", pkey, "(exists)")
+                return
 
             _set_busy(key)
 
@@ -453,7 +455,7 @@ def take_partial_profit(symbol: str, pct: float, side: str = "long"):
 
         resp = place_reduce_by_size(symbol, cut_size, side)
         if str(resp.get("code", "")) == "00000":
-            send_telegram(f"🤑 TP {int(pct*100)}% {side.UPPER()} {symbol} cut={cut_size}")
+            send_telegram(f"🤑 TP {int(pct*100)}% {side.upper()} {symbol} cut={cut_size}")
         else:
             send_telegram(f"❌ TP 실패 {symbol} {side} → {resp}")
 
@@ -740,8 +742,9 @@ def _reconciler_loop():
             for pkey, item in entry_items:
                 sym, side = item["symbol"], item["side"]
                 key = _key(sym, side)
-                if _local_has_any(sym) or _get_remote_any_side(sym) or _recent_ok(key):
-                    _mark_done("entry", pkey, "(exists/recent)"); continue
+                # 🔧 변경: recent_ok 단독 스킵 제거 — 실제 포지션이 있어야 스킵
+                if _local_has_any(sym) or _get_remote_any_side(sym):
+                    _mark_done("entry", pkey, "(exists)"); continue
                 if _is_busy(key): continue
                 if not _strict_try_reserve(side):
                     if TRACE_LOG:
